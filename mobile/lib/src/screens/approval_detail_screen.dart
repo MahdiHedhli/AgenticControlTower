@@ -573,8 +573,22 @@ class _ApprovalActions extends StatelessWidget {
         _showPolicyProposal(context);
         return;
       case ApprovalMoreActionKind.pauseAgent:
+        onDecision('Pause agent', () async {
+          await viewModel.pauseAgent(approval.session, approval.agentName);
+          return approval;
+        });
+        return;
       case ApprovalMoreActionKind.stopTask:
+        onDecision('Stop task', () async {
+          await viewModel.stopTask(approval.session, approval.agentName);
+          return approval;
+        });
+        return;
       case ApprovalMoreActionKind.stopAgent:
+        onDecision('Stop agent', () async {
+          await viewModel.stopAgent(approval.session, approval.agentName);
+          return approval;
+        });
         return;
     }
   }

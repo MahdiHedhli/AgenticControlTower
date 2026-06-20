@@ -193,6 +193,18 @@ class GatewayAlphaRepository implements AlphaRepository {
   }
 
   @override
+  Future<void> pauseAgent(String sessionId, String agentId) =>
+      approvalsRepository.pauseAgent(sessionId, agentId);
+
+  @override
+  Future<void> stopTask(String sessionId, String agentId) =>
+      approvalsRepository.stopTask(sessionId, agentId);
+
+  @override
+  Future<void> stopAgent(String sessionId, String agentId) =>
+      approvalsRepository.stopAgent(sessionId, agentId);
+
+  @override
   Future<AssistanceSessionAlpha> loadAssistanceSession(String sessionId) {
     return fallback.loadAssistanceSession(sessionId);
   }

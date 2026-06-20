@@ -98,6 +98,15 @@ class MockAlphaRepository implements AlphaRepository {
   }
 
   @override
+  Future<void> pauseAgent(String sessionId, String agentId) async {}
+
+  @override
+  Future<void> stopTask(String sessionId, String agentId) async {}
+
+  @override
+  Future<void> stopAgent(String sessionId, String agentId) async {}
+
+  @override
   Future<AssistanceSessionAlpha> loadAssistanceSession(String sessionId) async {
     return AssistanceSessionAlpha(
       id: sessionId,

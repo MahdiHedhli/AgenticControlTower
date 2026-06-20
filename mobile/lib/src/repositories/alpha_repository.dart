@@ -11,6 +11,9 @@ abstract class AlphaRepository {
   Future<ApprovalAlpha> approveForSession(String approvalId);
   Future<ApprovalAlpha> approveForAgent(String approvalId);
   Future<ApprovalAlpha> deny(String approvalId);
+  Future<void> pauseAgent(String sessionId, String agentId);
+  Future<void> stopTask(String sessionId, String agentId);
+  Future<void> stopAgent(String sessionId, String agentId);
   Future<AssistanceSessionAlpha> loadAssistanceSession(String sessionId);
   Future<TerminalSessionAlpha> loadTerminalSession(String sessionId);
 }

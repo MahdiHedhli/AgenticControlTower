@@ -86,17 +86,79 @@ class ApprovalsRepository {
   /// honest crypto rather than a placeholder.
   Future<String> _signDecision(
     Map<String, dynamic> signedPayload,
-    String approvalId,
-  ) async {
+    String approvalId, {
+    String? reason,
+  }) async {
     final signer = apiClient.signer;
     if (signer is SecureEnclaveDeviceRequestSigner) {
       final bytes = Uint8List.fromList(utf8.encode(canonicalJson(signedPayload)));
-      return signer.signPayload(bytes, reason: 'Approve clearance $approvalId');
+      return signer.signPayload(
+        bytes,
+        reason: reason ?? 'Approve clearance $approvalId',
+      );
     }
     // Legacy/dev (web) signer cannot produce a non-exportable per-decision
     // signature; the transport signature still authenticates the request.
     return 'hmcp-device-request-signature';
   }
+
+  /// Send a signed operator intervention (pause / steer / stop) for a session.
+  /// The plugin drains it and applies it at the agent's next tool boundary.
+  Future<void> intervene(
+    String sessionId, {
+    required String type,
+    required String reason,
+    required String agentId,
+    String? instruction,
+    String? faceIdReason,
+  }) async {
+    final interventionId = 'intv_${DateTime.now().microsecondsSinceEpoch}';
+    final signedPayload = <String, dynamic>{
+      'type': type,
+      'agent_id': agentId,
+      'intervention_id': interventionId,
+    };
+    final signature = await _signDecision(
+      signedPayload,
+      interventionId,
+      reason: faceIdReason ?? reason,
+    );
+    await apiClient.postJson(
+      '/sessions/$sessionId/interventions',
+      body: {
+        'intervention_id': interventionId,
+        'type': type,
+        'reason': reason,
+        if (instruction != null) 'instruction': instruction,
+        'signed_payload': signedPayload,
+        'signature': signature,
+      },
+    );
+  }
+
+  Future<void> pauseAgent(String sessionId, String agentId) => intervene(
+        sessionId,
+        type: 'pause',
+        reason: 'Operator paused the agent',
+        agentId: agentId,
+        faceIdReason: 'Pause agent',
+      );
+
+  Future<void> stopTask(String sessionId, String agentId) => intervene(
+        sessionId,
+        type: 'cancel_task',
+        reason: 'Operator stopped the current task',
+        agentId: agentId,
+        faceIdReason: 'Stop task',
+      );
+
+  Future<void> stopAgent(String sessionId, String agentId) => intervene(
+        sessionId,
+        type: 'kill_agent',
+        reason: 'Operator stopped the agent',
+        agentId: agentId,
+        faceIdReason: 'Stop agent',
+      );
 }
 
 List<ApprovalRequestModel> _approvals(Map<String, dynamic> response) {

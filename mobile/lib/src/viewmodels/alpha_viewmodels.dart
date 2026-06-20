@@ -91,6 +91,15 @@ class ApprovalDetailViewModel {
 
   Future<ApprovalAlpha> deny(String approvalId) => repository.deny(approvalId);
 
+  Future<void> pauseAgent(String sessionId, String agentId) =>
+      repository.pauseAgent(sessionId, agentId);
+
+  Future<void> stopTask(String sessionId, String agentId) =>
+      repository.stopTask(sessionId, agentId);
+
+  Future<void> stopAgent(String sessionId, String agentId) =>
+      repository.stopAgent(sessionId, agentId);
+
   List<ApprovalMoreAction> moreActionsFor(ApprovalAlpha approval) {
     final pending = approval.state == 'pending';
     return [
@@ -157,23 +166,20 @@ class ApprovalDetailViewModel {
       const ApprovalMoreAction(
         kind: ApprovalMoreActionKind.pauseAgent,
         label: 'Pause Agent',
-        description: 'Intervention backend is placeholder-only.',
-        enabled: false,
-        planned: true,
+        description: 'Pause the agent at its next tool boundary.',
+        enabled: true,
       ),
       const ApprovalMoreAction(
         kind: ApprovalMoreActionKind.stopTask,
         label: 'Stop Task',
-        description: 'Intervention backend is placeholder-only.',
-        enabled: false,
-        planned: true,
+        description: 'Stop the agent\'s current task.',
+        enabled: true,
       ),
       const ApprovalMoreAction(
         kind: ApprovalMoreActionKind.stopAgent,
         label: 'Stop Agent',
-        description: 'Intervention backend is placeholder-only.',
-        enabled: false,
-        planned: true,
+        description: 'Stop the agent.',
+        enabled: true,
       ),
     ];
   }

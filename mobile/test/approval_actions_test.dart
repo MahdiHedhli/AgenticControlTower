@@ -3,7 +3,7 @@ import 'package:agentic_control_tower/src/repositories/mock_alpha_repository.dar
 import 'package:agentic_control_tower/src/viewmodels/alpha_viewmodels.dart';
 
 void main() {
-  test('more menu exposes functional and planned approval actions', () async {
+  test('more menu exposes functional approval + intervention actions', () async {
     final viewModel = ApprovalDetailViewModel(const MockAlphaRepository());
     final approval = await viewModel.load('appr-shell');
 
@@ -16,7 +16,10 @@ void main() {
     expect(byKind[ApprovalMoreActionKind.approveForAgent]?.enabled, isTrue);
     expect(byKind[ApprovalMoreActionKind.approveForever]?.enabled, isTrue);
     expect(byKind[ApprovalMoreActionKind.browserAssistance]?.enabled, isTrue);
-    expect(byKind[ApprovalMoreActionKind.pauseAgent]?.planned, isTrue);
+    // Interventions are now live (was: placeholder/planned).
+    expect(byKind[ApprovalMoreActionKind.pauseAgent]?.enabled, isTrue);
+    expect(byKind[ApprovalMoreActionKind.stopTask]?.enabled, isTrue);
+    expect(byKind[ApprovalMoreActionKind.stopAgent]?.enabled, isTrue);
   });
 
   test('scoped approval actions return selected scope', () async {
