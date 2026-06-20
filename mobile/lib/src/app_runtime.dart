@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'clearance/clearance_proof_verifier.dart' hide base64UrlDecodeNoPadding;
 import 'clearance/tower_key.dart';
+import 'security/push_token_channel.dart';
 import 'security/secure_enclave_channel.dart';
 import 'security/secure_enclave_signer.dart';
 import 'api/gateway_api_client.dart';
@@ -41,6 +42,9 @@ class HermesAppRuntime extends ChangeNotifier {
   final GatewayConfigStore _configStore;
   final SecureKeyStore _keyStore;
   final SecureEnclaveChannel _enclave = const SecureEnclaveChannel();
+  final PushTokenChannel _pushToken = const PushTokenChannel();
+  String? _apnsToken;
+  bool _pushHandlerInstalled = false;
   final ClearanceProofVerifier _proofVerifier = const ClearanceProofVerifier();
   final AlphaRepository _mockRepository = const MockAlphaRepository();
 
@@ -153,6 +157,7 @@ class HermesAppRuntime extends ChangeNotifier {
   }
 
   Future<void> initialize() async {
+    _installPushHandler();
     _config = await _configStore.read();
     _deviceId = await _keyStore.readDeviceId();
     _accessToken = await _keyStore.readAccessToken();
@@ -174,8 +179,43 @@ class HermesAppRuntime extends ChangeNotifier {
     }
     if (isPaired && _accessToken != null) {
       await _startEventStream();
+      await _registerPushToken();
     }
     notifyListeners();
+  }
+
+  /// Wire the native APNs token bridge once; uploads whenever a token arrives.
+  void _installPushHandler() {
+    if (_pushHandlerInstalled) {
+      return;
+    }
+    _pushHandlerInstalled = true;
+    _pushToken.onToken((token) {
+      _apnsToken = token;
+      unawaited(_uploadPushToken());
+    });
+  }
+
+  /// Pull the latest APNs token from native and upload it to the gateway for
+  /// this paired device. Best-effort; failures never block the app.
+  Future<void> _registerPushToken() async {
+    _apnsToken ??= await _pushToken.requestToken();
+    await _uploadPushToken();
+  }
+
+  Future<void> _uploadPushToken() async {
+    final token = _apnsToken;
+    if (token == null || token.isEmpty || !isPaired || _accessToken == null) {
+      return;
+    }
+    try {
+      await _signedApiClient().postJson(
+        '/devices/me/push-token',
+        body: {'push_token': token},
+      );
+    } on Object {
+      // best-effort push registration
+    }
   }
 
   Future<void> saveGatewayBaseUrl(String value) async {
@@ -230,6 +270,7 @@ class HermesAppRuntime extends ChangeNotifier {
     _lastPairing = null;
     _connectionStatus = 'Paired with ${completion.node.displayName}';
     await _restartEventStream();
+    await _registerPushToken();
     notifyListeners();
   }
 
