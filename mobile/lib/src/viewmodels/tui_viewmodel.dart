@@ -31,12 +31,17 @@ class TuiViewModel extends ChangeNotifier {
   bool _loading = false;
   bool _gatewayMode = false;
   bool _connected = false;
+  bool _isRelay = false;
+  final List<TuiSessionModel> _relaySessions = [];
   String _statusLabel = 'Terminal idle';
   String? _errorLabel;
 
   bool get loading => _loading;
   bool get gatewayMode => _gatewayMode;
   bool get connected => _connected;
+  // True when watching a read-only agent terminal mirror (relay) session.
+  bool get isRelay => _isRelay;
+  List<TuiSessionModel> get relaySessions => List.unmodifiable(_relaySessions);
   String get statusLabel => _statusLabel;
   String? get errorLabel => _errorLabel;
   TuiSessionModel? get gatewaySession => _gatewaySession;
@@ -72,36 +77,19 @@ class TuiViewModel extends ChangeNotifier {
     }
 
     try {
-      final session = await repository.createSession(
-        agentId: 'agent_mock',
-        sessionContextId: routeContext,
-      );
-      _gatewaySession = session;
-      _gatewayMode = true;
-      _connected = false;
-      _gatewayScrollback.clear();
-      _statusLabel = 'Connecting to ${session.sessionId}';
-      notifyListeners();
-
-      final attach = await repository.createAttachToken(session.sessionId);
-      _connection = streamClient.connect(
-        session.sessionId,
-        attachToken: attach.attachToken,
-      );
-      _subscription = _connection!.frames.listen(
-        _handleFrame,
-        onError: (Object error) {
-          _connected = false;
-          _errorLabel = 'TUI stream error: $error';
-          _statusLabel = 'Terminal stream error';
-          notifyListeners();
-        },
-        onDone: () {
-          _connected = false;
-          _statusLabel = 'Terminal stream detached';
-          notifyListeners();
-        },
-      );
+      // Watch the live agent terminal mirror (read-only relay), not a PTY.
+      final relays = await repository.listRelaySessions();
+      _relaySessions
+        ..clear()
+        ..addAll(relays);
+      if (relays.isEmpty) {
+        await _loadMock(
+          routeContext,
+          'No live agent terminal to mirror yet',
+        );
+        return;
+      }
+      await _attachRelay(relays.first, repository, streamClient);
     } on GatewayApiException catch (error) {
       await _loadMock(routeContext, 'Mock terminal; gateway rejected TUI (${error.statusCode})');
     } on Object catch (error) {
@@ -113,8 +101,73 @@ class TuiViewModel extends ChangeNotifier {
     }
   }
 
+  /// Attach (read-only) to a relay session's output stream.
+  Future<void> _attachRelay(
+    TuiSessionModel session,
+    TuiRepository repository,
+    TuiStreamClient streamClient,
+  ) async {
+    await _subscription?.cancel();
+    _connection?.close();
+    _gatewaySession = session;
+    _gatewayMode = true;
+    _isRelay = true;
+    _connected = false;
+    _gatewayScrollback.clear();
+    _statusLabel = 'Connecting to ${session.agentId} terminal';
+    notifyListeners();
+
+    final attach = await repository.createAttachToken(session.sessionId);
+    _connection = streamClient.connect(
+      session.sessionId,
+      attachToken: attach.attachToken,
+    );
+    _subscription = _connection!.frames.listen(
+      _handleFrame,
+      onError: (Object error) {
+        _connected = false;
+        _errorLabel = 'TUI stream error: $error';
+        _statusLabel = 'Terminal stream error';
+        notifyListeners();
+      },
+      onDone: () {
+        _connected = false;
+        _statusLabel = 'Terminal stream detached';
+        notifyListeners();
+      },
+    );
+  }
+
+  /// Switch which relay session is being watched.
+  Future<void> selectRelaySession(String sessionId) async {
+    final repository = _tuiRepository;
+    final streamClient = _streamClient;
+    if (repository == null || streamClient == null) {
+      return;
+    }
+    final session = _relaySessions.firstWhere(
+      (s) => s.sessionId == sessionId,
+      orElse: () => _relaySessions.first,
+    );
+    _loading = true;
+    notifyListeners();
+    try {
+      await _attachRelay(session, repository, streamClient);
+    } on Object catch (error) {
+      _errorLabel = '$error';
+    } finally {
+      _loading = false;
+      notifyListeners();
+    }
+  }
+
   Future<void> sendText(String text) async {
     if (text.isEmpty) {
+      return;
+    }
+    if (_isRelay) {
+      _statusLabel = 'Read-only: agent terminal mirror';
+      notifyListeners();
       return;
     }
     if (_gatewayMode && _connection != null) {
@@ -127,6 +180,11 @@ class TuiViewModel extends ChangeNotifier {
 
   Future<void> sendPaste(String text) async {
     if (text.isEmpty) {
+      return;
+    }
+    if (_isRelay) {
+      _statusLabel = 'Read-only: agent terminal mirror';
+      notifyListeners();
       return;
     }
     if (_gatewayMode && _connection != null) {

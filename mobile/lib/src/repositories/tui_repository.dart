@@ -47,6 +47,16 @@ class TuiRepository {
         .toList();
   }
 
+  /// Node-owned, read-only relay sessions that mirror a live agent's terminal
+  /// (created by the Hermes bridge). Any tui-capable device may watch them.
+  Future<List<TuiSessionModel>> listRelaySessions() async {
+    final sessions = await listSessions();
+    return sessions
+        .where((session) =>
+            session.userDeviceId == '__relay__' && session.state != 'closed')
+        .toList();
+  }
+
   Future<TuiSessionModel> getSession(String sessionId) async {
     final json = await _apiClient.getJson('/tui/sessions/$sessionId');
     return TuiSessionModel.fromJson(json);
