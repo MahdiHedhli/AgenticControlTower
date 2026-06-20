@@ -81,6 +81,7 @@ from .schemas import (
     Node,
     NodeRegistration,
     Notification,
+    PushTokenUpdateRequest,
     ReturnControlRequest,
     RuntimeApprovalResult,
     RuntimeBrowserAssistanceResult,
@@ -1158,6 +1159,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             intervention_id=intervention_id,
             resulting_state="queued",
         )
+
+    @app.post("/v1/devices/me/push-token")
+    def update_my_push_token(
+        payload: PushTokenUpdateRequest,
+        request: Request,
+        device: VerifiedDevice = signed_device_dependency,
+    ) -> dict[str, Any]:
+        # The app uploads its APNs device token after registering with APNs.
+        # The token itself is never logged (only whether one is present).
+        store.set_device_push_token(device.device_id, payload.push_token)
+        store.append_audit_event(
+            event_type="device_push_token_updated",
+            actor_type="device",
+            actor_id=device.device_id,
+            node_id=resolved_settings.node_id,
+            request_id=_request_id(request),
+            payload_redacted={"has_token": bool(payload.push_token)},
+        )
+        return {
+            "device_id": device.device_id,
+            "push_registered": bool(payload.push_token),
+        }
 
     @app.post(
         "/v1/tui/sessions",

@@ -117,6 +117,16 @@ class IdentityStoreMixin:
             )
         return self.get_device(device_id)
 
+    def set_device_push_token(self, device_id: str, push_token: str | None) -> dict[str, Any]:
+        """Update an already-paired device's APNs push token (registered by the
+        app after it obtains a token from APNs)."""
+        with self.connect() as db:
+            db.execute(
+                "UPDATE devices SET push_token = ? WHERE device_id = ?",
+                (push_token or None, device_id),
+            )
+        return self.get_device(device_id)
+
     def push_targets(self, node_id: str) -> list[str]:
         """Active mobile_signed devices on a node that have a push token."""
         with self.connect() as db:

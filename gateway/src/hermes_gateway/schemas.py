@@ -478,6 +478,10 @@ class RuntimeTuiRelayRequest(StrictModel):
     chunk: str = ""
 
 
+class PushTokenUpdateRequest(StrictModel):
+    push_token: str | None = None
+
+
 class CreateTuiSessionRequest(StrictModel):
     agent_id: str = "agent_mock"
     node_id: str | None = None
