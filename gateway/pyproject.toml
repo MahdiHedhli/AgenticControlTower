@@ -10,6 +10,7 @@ dependencies = [
   "httpx[http2]>=0.28.0",
   "pydantic>=2.13.0",
   "uvicorn[standard]>=0.38.0",
+  "websockets>=15.0",
 ]
 
 [dependency-groups]

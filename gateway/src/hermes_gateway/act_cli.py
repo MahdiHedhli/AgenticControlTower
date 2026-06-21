@@ -376,6 +376,7 @@ def generate_gateway_toml(
     apns_key_id: str | None = None,
     apns_team_id: str | None = None,
     apns_topic: str | None = None,
+    dashboard_url: str = "http://127.0.0.1:9120",
 ) -> str:
     """Render ``gateway.toml`` consumed by ``Settings.from_file``. The safe
     overrides are HARD-BAKED: ``seed_mock_data=false``, an ABSOLUTE database
@@ -395,6 +396,8 @@ def generate_gateway_toml(
         f"database_path = {_toml_str(str(db))}",
         f"gateway_base_url = {_toml_str(f'http://{GATEWAY_HOST}:{GATEWAY_PORT}/v1')}",
         f'# Bound on {GATEWAY_HOST}:{GATEWAY_PORT} by the supervised entrypoint.',
+        "# Loopback Hermes dashboard reverse-proxied under /hermes (gateway-gated).",
+        f"dashboard_url = {_toml_str(dashboard_url)}",
     ]
     if apns_key_path:
         lines.append("")

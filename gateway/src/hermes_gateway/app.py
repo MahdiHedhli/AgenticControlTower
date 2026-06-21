@@ -5,8 +5,10 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, StreamingResponse
 
 from .capabilities import require_device_capability, require_runtime_capability
 from .capability_registry import (
@@ -31,6 +33,13 @@ from .clearance_policy import (
 from .config import Settings
 from .handoff import _require_bound_clearance
 from .handoff import engage_handoff as _engage_handoff
+from .hermes_proxy import (
+    DashboardUnavailable,
+    HermesDashboardProxy,
+    is_html_content_type,
+    rewrite_spa_token,
+    scrub_response_headers,
+)
 from .ids import new_id
 from .local_binding import HermesLocalCaller, verify_hermes_local_request
 from .notification_composer import compose_notification
@@ -158,12 +167,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             pass
         return result
 
+    hermes_proxy = HermesDashboardProxy(resolved_settings.dashboard_url)
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         try:
             yield
         finally:
             await tui_manager.close_all()
+            await hermes_proxy.aclose()
 
     app = FastAPI(
         title="Agentic Control Tower Gateway",
@@ -175,6 +187,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.store = store
     app.state.tui_manager = tui_manager
     app.state.runtime_adapter = runtime_adapter
+    app.state.hermes_proxy = hermes_proxy
     if resolved_settings.cors_allowed_origin_regex:
         app.add_middleware(
             CORSMiddleware,
@@ -2339,6 +2352,109 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not receive_task.done():
                 receive_task.cancel()
 
+    # ------------------------------------------------------------------ #
+    # Hermes dashboard reverse proxy (Phase 4a).
+    #
+    # The paired phone reaches the loopback Hermes agent dashboard ONLY
+    # through these routes, gated by the SAME device/operator auth that gates
+    # /v1/agents. The gateway injects the dashboard's session token
+    # server-side, so the phone never sees or sends it. The target is fixed to
+    # the configured loopback dashboard — a crafted {path} cannot retarget any
+    # other host.
+    # ------------------------------------------------------------------ #
+    _PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
+
+    @app.api_route("/hermes/{path:path}", methods=_PROXY_METHODS)
+    async def hermes_dashboard_proxy(
+        path: str,
+        request: Request,
+        _device: VerifiedDevice = signed_device_dependency,
+    ) -> Response:
+        body = await request.body()
+        secure = request.url.scheme == "https"
+        try:
+            headers = await hermes_proxy.build_upstream_headers(
+                request.headers.items(), secure=secure
+            )
+        except DashboardUnavailable as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY, "Hermes dashboard unavailable"
+            ) from exc
+
+        url = hermes_proxy.upstream_url(path)
+        upstream = hermes_proxy.new_request_client()
+        upstream_req = upstream.build_request(
+            request.method,
+            url,
+            headers=headers,
+            params=request.query_params,
+            content=body or None,
+        )
+        try:
+            upstream_resp = await upstream.send(upstream_req, stream=True)
+        except httpx.HTTPError as exc:
+            await upstream.aclose()
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY, "Hermes dashboard unavailable"
+            ) from exc
+
+        content_type = upstream_resp.headers.get("content-type")
+        # aiter_bytes() yields the DECODED body, so the upstream
+        # content-encoding/length no longer describe what we forward. We also
+        # scrub credential-bearing response headers so the phone never receives
+        # the dashboard token / cookie / authorization.
+        passthrough = scrub_response_headers(upstream_resp.headers)
+
+        # HTML (the SPA index) is buffered so we can rewrite the bootstrap
+        # window.__HERMES_SESSION_TOKEN__ assignment to a non-functional
+        # placeholder — the real dashboard token must never stream to the phone.
+        # Regex across stream chunks is unreliable, so we buffer the whole body.
+        if is_html_content_type(content_type):
+            try:
+                raw = await upstream_resp.aread()
+            finally:
+                await upstream_resp.aclose()
+                await upstream.aclose()
+            sanitized = rewrite_spa_token(raw, known_token=hermes_proxy.current_token)
+            return Response(
+                content=sanitized,
+                status_code=upstream_resp.status_code,
+                headers=passthrough,
+                media_type=content_type,
+            )
+
+        async def _stream() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in upstream_resp.aiter_bytes():
+                    yield chunk
+            finally:
+                await upstream_resp.aclose()
+                await upstream.aclose()
+
+        return StreamingResponse(
+            _stream(),
+            status_code=upstream_resp.status_code,
+            headers=passthrough,
+            media_type=content_type,
+        )
+
+    @app.websocket("/hermes/{path:path}")
+    async def hermes_dashboard_ws(websocket: WebSocket, path: str) -> None:
+        # Device/operator auth via ?access_token= (browsers cannot set WS
+        # headers) — the same access-token mechanism as /v1/events/stream.
+        token = _websocket_token(websocket)
+        if not token or store.verify_access_token(token) is None:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        # Resolve the dashboard token server-side; surface dashboard-down early.
+        try:
+            await hermes_proxy.session_token()
+        except DashboardUnavailable:
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+            return
+        upstream_url = hermes_proxy.ws_upstream_url(path)
+        await _bridge_dashboard_ws(websocket, upstream_url, hermes_proxy.host_header)
+
     return app
 
 
@@ -3055,6 +3171,73 @@ def _paste_risk_warnings(text: str) -> list[str]:
     if has_secret_text(text):
         warnings.append("secret_like_text")
     return warnings
+
+
+async def _bridge_dashboard_ws(
+    client_ws: WebSocket, upstream_url: str, host_header: str
+) -> None:
+    """Pump frames bidirectionally between the phone's WS and the dashboard.
+
+    Covers /api/pty and /api/ws (any sub-path under /hermes). Text and binary
+    frames are bridged verbatim; close is propagated either direction. The
+    dashboard credential rides in ``upstream_url`` as ``?token=`` (loopback
+    mode), and a loopback Origin/Host is forced so the dashboard host guard
+    accepts the upgrade.
+    """
+    import websockets
+    from websockets.exceptions import ConnectionClosed
+
+    origin = f"http://{host_header}"
+    try:
+        upstream = await websockets.connect(
+            upstream_url,
+            additional_headers={"Host": host_header, "Origin": origin},
+            open_timeout=10,
+            max_size=None,
+        )
+    except Exception:
+        await client_ws.close(code=status.WS_1011_INTERNAL_ERROR)
+        return
+
+    await client_ws.accept()
+
+    async def phone_to_dashboard() -> None:
+        try:
+            while True:
+                message = await client_ws.receive()
+                if message["type"] == "websocket.disconnect":
+                    break
+                if (data := message.get("bytes")) is not None:
+                    await upstream.send(data)
+                elif (text := message.get("text")) is not None:
+                    await upstream.send(text)
+        except (WebSocketDisconnect, ConnectionClosed):
+            pass
+
+    async def dashboard_to_phone() -> None:
+        try:
+            async for frame in upstream:
+                if isinstance(frame, bytes):
+                    await client_ws.send_bytes(frame)
+                else:
+                    await client_ws.send_text(frame)
+        except ConnectionClosed:
+            pass
+
+    forward = asyncio.create_task(phone_to_dashboard())
+    backward = asyncio.create_task(dashboard_to_phone())
+    try:
+        _done, pending = await asyncio.wait(
+            {forward, backward}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
+    finally:
+        await upstream.close()
+        try:
+            await client_ws.close()
+        except RuntimeError:
+            pass
 
 
 def _request_id(request: Request) -> str:

@@ -116,6 +116,8 @@ def test_gateway_toml_bakes_safe_overrides(home):
     assert Path(str(act_cli.database_path())).is_absolute()
     assert "8788" in text
     assert "127.0.0.1" in text
+    # Hermes dashboard reverse-proxy target (default loopback :9120).
+    assert 'dashboard_url = "http://127.0.0.1:9120"' in text
     # no apns by default
     assert "apns_key_path" not in text
 
