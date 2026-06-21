@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import tomllib
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import ClassVar
 
@@ -173,9 +174,28 @@ class Settings:
             ),
         )
 
+    @classmethod
+    def from_file(cls, path: str | Path) -> Settings:
+        """Build Settings from a TOML file. File values override dataclass
+        defaults; fields absent from the file keep their defaults. Same field
+        surface as ``from_env``. Unknown keys in the file are ignored."""
+        raw = tomllib.loads(Path(path).read_text())
+        valid_names = {f.name for f in fields(cls)}
+        overrides: dict[str, object] = {}
+        for key, value in raw.items():
+            if key not in valid_names:
+                continue
+            # Normalise list-valued fields to tuples to match defaults.
+            if isinstance(value, list):
+                value = tuple(value)
+            overrides[key] = value
+        return cls(**overrides)
+
     @property
     def database_file(self) -> Path:
-        return Path(self.database_path)
+        # Absolute + symlink-resolved so anything derived from it (e.g. the
+        # singleton lock path) is stable regardless of the process CWD.
+        return Path(self.database_path).expanduser().resolve()
 
 
 def _csv_env(name: str) -> tuple[str, ...]:
