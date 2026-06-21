@@ -5,6 +5,7 @@ import 'screens/agent_detail_screen.dart';
 import 'screens/agents_screen.dart';
 import 'screens/approval_detail_screen.dart';
 import 'screens/browser_assistance_screen.dart';
+import 'screens/dashboard_screen.dart';
 import 'screens/home_screen.dart';
 import 'screens/inbox_screen.dart';
 import 'screens/missions_screen.dart';
@@ -16,6 +17,7 @@ import 'screens/voice_screen.dart';
 class HermesRoutes {
   static const home = '/';
   static const dashboard = home;
+  static const hermesDashboard = '/dashboard';
   static const agents = '/agents';
   static const agentDetail = '/agents/detail';
   static const missions = '/missions';
@@ -31,6 +33,7 @@ class HermesRoutes {
   static Map<String, WidgetBuilder> routes(HermesAppRuntime runtime) => {
         home: (_) =>
             HomeScreen(repository: runtime.alphaRepository, runtime: runtime),
+        hermesDashboard: (_) => DashboardScreen(runtime: runtime),
         agents: (_) => AgentsScreen(repository: runtime.alphaRepository),
         agentDetail: (_) =>
             AgentDetailScreen(repository: runtime.alphaRepository),

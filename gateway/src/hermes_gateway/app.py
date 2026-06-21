@@ -109,7 +109,12 @@ from .schemas import (
     VoiceSession,
 )
 from .security import expires_in, has_secret_text, new_token, now_utc, parse_utc
-from .signing import VerifiedDevice, verify_signed_request
+from .signing import (
+    DEVICE_ID_HEADER,
+    SIGNATURE_HEADER,
+    VerifiedDevice,
+    verify_signed_request,
+)
 from .store import SQLiteStore
 from .tui import (
     LocalPtyManager,
@@ -119,6 +124,11 @@ from .tui import (
 )
 
 DEFAULT_PERMISSIONS = ["read_state", "chat", "approve", "intervene"]
+
+# Cookie a WebView seeds with a gateway access token to authenticate to the
+# /hermes/* proxy (it cannot device-sign each request). Verified the same way
+# as the access-token query param via store.verify_access_token.
+ACT_SESSION_COOKIE = "act_session"
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
@@ -2364,12 +2374,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # ------------------------------------------------------------------ #
     _PROXY_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
 
+    async def _authorize_hermes_request(request: Request) -> None:
+        """Authorize a /hermes/* HTTP request.
+
+        A WebView cannot device-sign every request, so we accept EITHER the
+        usual signed-device auth OR a valid gateway access token presented in
+        the ``act_session`` cookie (seeded by the app). Fail-closed: if neither
+        is valid we raise 401. The signed-device path is preferred and only
+        when its headers are absent do we fall back to the cookie, so a
+        malformed signature still surfaces its own 401/403.
+        """
+        has_device_headers = bool(
+            request.headers.get(DEVICE_ID_HEADER)
+            and request.headers.get(SIGNATURE_HEADER)
+        )
+        if has_device_headers:
+            await require_signed_device(request)
+            return
+        cookie_token = request.cookies.get(ACT_SESSION_COOKIE)
+        if cookie_token and store.verify_access_token(cookie_token) is not None:
+            return
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "device signature or act_session cookie required"
+        )
+
     @app.api_route("/hermes/{path:path}", methods=_PROXY_METHODS)
     async def hermes_dashboard_proxy(
         path: str,
         request: Request,
-        _device: VerifiedDevice = signed_device_dependency,
     ) -> Response:
+        await _authorize_hermes_request(request)
         body = await request.body()
         secure = request.url.scheme == "https"
         try:
@@ -2442,7 +2476,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def hermes_dashboard_ws(websocket: WebSocket, path: str) -> None:
         # Device/operator auth via ?access_token= (browsers cannot set WS
         # headers) — the same access-token mechanism as /v1/events/stream.
-        token = _websocket_token(websocket)
+        # A WebView can't set the query param either once the SPA opens its own
+        # sockets, so we ALSO accept the act_session cookie it seeded.
+        token = _websocket_token(websocket) or websocket.cookies.get(ACT_SESSION_COOKIE)
         if not token or store.verify_access_token(token) is None:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return

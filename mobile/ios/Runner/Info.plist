@@ -4,6 +4,18 @@
 <dict>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
+	<!-- The Dashboard WebView loads the gateway's /hermes/ proxy. The gateway
+	     is reached over loopback / Tailscale private addresses, often via
+	     cleartext http, which WKWebView blocks under App Transport Security by
+	     default (the native http client is exempt, the WebView is not).
+	     NSAllowsLocalNetworking is the minimal exception: it permits loads to
+	     link-local / loopback / private-range hosts without opening arbitrary
+	     public cleartext loads. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Agentic Control Tower uses Face ID to authorize each clearance decision with your Secure Enclave signing key.</string>
 	<key>CFBundleDevelopmentRegion</key>

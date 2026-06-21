@@ -46,6 +46,9 @@ class ScreenShell extends StatelessWidget {
           NavigationDestination(
               icon: Icon(Icons.route_outlined), label: 'Missions'),
           NavigationDestination(
+              icon: Icon(Icons.dashboard_customize_outlined),
+              label: 'Dashboard'),
+          NavigationDestination(
               icon: Icon(Icons.mic_none_outlined), label: 'Voice'),
           NavigationDestination(
               icon: Icon(Icons.inbox_outlined), label: 'Inbox'),
@@ -63,6 +66,7 @@ class ScreenShell extends StatelessWidget {
     HermesRoutes.home,
     HermesRoutes.agents,
     HermesRoutes.missions,
+    HermesRoutes.hermesDashboard,
     HermesRoutes.voice,
     HermesRoutes.inbox,
   ];

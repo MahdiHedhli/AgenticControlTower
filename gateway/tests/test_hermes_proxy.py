@@ -53,6 +53,114 @@ def test_proxy_requires_auth(client):
     assert resp.status_code in (401, 403)
 
 
+def test_cookie_authed_request_is_authorized(client):
+    """A WebView can't device-sign each request, so a valid act_session cookie
+    (a gateway access token) authorizes the /hermes/* proxy too."""
+    captured: list[httpx.Request] = []
+    _install_mock_upstream(client.app, captured)
+    paired = pair_device(client)
+    access_token = paired["tokens"]["access_token"]
+
+    resp = client.get(
+        "/hermes/api/status",
+        cookies={"act_session": access_token},
+    )
+
+    assert resp.status_code == 200
+    assert resp.content == b"upstream-body"
+    assert len(captured) == 1
+    up = captured[0]
+    # Still loopback-confined and the dashboard token is injected server-side.
+    assert up.url.host in ("127.0.0.1", "localhost", "::1")
+    assert up.url.port == 9120
+    assert up.url.path == "/api/status"
+    assert up.headers.get(SESSION_TOKEN_HEADER) == DASHBOARD_TOKEN
+
+
+def test_invalid_cookie_is_rejected(client):
+    """An invalid act_session cookie with no device signature -> 401/403."""
+    captured: list[httpx.Request] = []
+    _install_mock_upstream(client.app, captured)
+
+    resp = client.get(
+        "/hermes/api/status",
+        cookies={"act_session": "not-a-real-token"},
+    )
+    assert resp.status_code in (401, 403)
+    # Never reached upstream.
+    assert captured == []
+
+
+def test_cookie_path_never_leaks_dashboard_token(client):
+    """The cookie auth path must keep the 4a token-scrubbing: the real SPA token
+    is rewritten and credential response headers are dropped before the phone
+    sees them, exactly as on the signed-device path."""
+    html = (
+        b"<!doctype html><html><head>"
+        b'<script>window.__HERMES_SESSION_TOKEN__="REALSECRET";</script>'
+        b"</head><body>ok</body></html>"
+    )
+    _install_custom_upstream(
+        client.app,
+        headers={
+            "content-type": "text/html; charset=utf-8",
+            "set-cookie": "hermes_session=REALSECRET; HttpOnly",
+            SESSION_TOKEN_HEADER: "REALSECRET",
+        },
+        content=html,
+    )
+    paired = pair_device(client)
+    access_token = paired["tokens"]["access_token"]
+
+    resp = client.get("/hermes/", cookies={"act_session": access_token})
+
+    assert resp.status_code == 200
+    body = resp.content
+    assert b"REALSECRET" not in body
+    assert b"proxied-by-act" in body
+    lowered = {k.lower() for k in resp.headers.keys()}
+    assert "set-cookie" not in lowered
+    assert SESSION_TOKEN_HEADER.lower() not in lowered
+
+
+def test_ws_cookie_authed_bridges_frames(client, monkeypatch):
+    """The WS proxy accepts the act_session cookie in addition to ?access_token=,
+    stays loopback-confined and never exposes the dashboard token."""
+    proxy = client.app.state.hermes_proxy
+    proxy._token = DASHBOARD_TOKEN  # noqa: SLF001
+
+    recorder: dict = {}
+    captured_url: dict = {}
+
+    async def fake_connect(url, **kwargs):
+        captured_url["url"] = url
+        return _FakeUpstreamWS(recorder)
+
+    import websockets
+
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+
+    paired = pair_device(client)
+    access_token = paired["tokens"]["access_token"]
+    client.cookies.set("act_session", access_token)
+
+    with client.websocket_connect("/hermes/api/pty") as ws:
+        ws.send_text("hello")
+        assert ws.receive_text() == "echo:hello"
+
+    assert captured_url["url"].startswith("ws://127.0.0.1:9120/api/pty")
+    assert f"token={DASHBOARD_TOKEN}" in captured_url["url"]
+
+
+def test_ws_invalid_cookie_is_rejected(client):
+    from starlette.websockets import WebSocketDisconnect
+
+    client.cookies.set("act_session", "not-a-real-token")
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/hermes/api/pty"):
+            pass
+
+
 def test_authed_request_forwards_with_token_and_prefix(client):
     captured: list[httpx.Request] = []
     _install_mock_upstream(client.app, captured)
