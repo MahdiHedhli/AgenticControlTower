@@ -133,9 +133,29 @@ def test_gateway_toml_apns_records_path_only(home):
 
 def test_act_toml_bridge_config(home):
     text = generate_act_toml()
-    assert "http://127.0.0.1:8788/v1" in text
-    assert "agent_id" in text
-    assert "gated_tools" in text
+    # Full bridge surface the act-clearance plugin reads (keys must match the
+    # plugin's toml_key names exactly).
+    assert "enabled = true" in text
+    assert 'gateway_url = "http://127.0.0.1:8788/v1"' in text
+    assert 'agent_id = "hermes_agent"' in text
+    assert 'agent_name = "Hermes Agent"' in text
+    assert "gated_tools = [" in text
+    assert "question_tools = [" in text
+    assert 'question_risk_family = "read_only"' in text
+    assert 'clearance_risk_family = "external_effect"' in text
+    # Defaults mirror the plugin's built-ins.
+    assert '"terminal"' in text and '"git_push"' in text
+    assert '"clarify"' in text and '"ask_user"' in text
+
+    # Parses as valid TOML with the expected shape.
+    import tomllib
+
+    parsed = tomllib.loads(text)
+    assert parsed["enabled"] is True
+    assert parsed["agent_id"] == "hermes_agent"
+    assert isinstance(parsed["gated_tools"], list)
+    assert "send_email" in parsed["gated_tools"]
+    assert parsed["question_tools"] == ["clarify", "ask_operator", "ask_user"]
 
 
 # --------------------------------------------------------------------------- #

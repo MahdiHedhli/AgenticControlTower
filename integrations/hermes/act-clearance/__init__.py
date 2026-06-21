@@ -17,12 +17,22 @@ gate ``ACT_CLEARANCE_ENABLED`` (default OFF) — every hook is a no-op unless en
 installing the files cannot disrupt a live agent. Pushes are hermes-local (loopback);
 phone reads/decisions stay device-signed. Redaction: tool name + arg KEYS only.
 
-Stdlib only (urllib) so it runs in any Hermes venv.
+Stdlib only (urllib/json/threading/subprocess + tomllib) so it runs in any
+Hermes venv.
+
+Config (Phase 3): every reader resolves with strict precedence ENV > act.toml >
+built-in default. ``~/.hermes/act/act.toml`` is written by ``act install`` and
+loaded once (cached, tolerant). ENV still wins for debugging, so the desktop app
+can bridge with NO env once act.toml exists and has ``enabled = true``. The
+gateway is also kept up via a best-effort self-heal on register().
 
 Env: ACT_CLEARANCE_ENABLED, ACT_GATEWAY_URL (default http://127.0.0.1:8788/v1),
 ACT_CLEARANCE_AGENT_ID (default hermes_agent), ACT_CLEARANCE_AGENT_NAME,
 ACT_CLEARANCE_GATED_TOOLS, ACT_QUESTION_TOOLS (default clarify,ask_operator,ask_user),
-ACT_CLEARANCE_RISK_FAMILY, ACT_CLEARANCE_TIMEOUT, ACT_CLEARANCE_POLL.
+ACT_QUESTION_RISK_FAMILY, ACT_CLEARANCE_RISK_FAMILY, ACT_CLEARANCE_TIMEOUT,
+ACT_CLEARANCE_POLL.
+act.toml keys: enabled, gateway_url, agent_id, agent_name, gated_tools,
+question_tools, question_risk_family, clearance_risk_family.
 """
 
 from __future__ import annotations
@@ -30,12 +40,19 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+try:  # tomllib is stdlib on 3.11+; degrade gracefully on older runtimes.
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - exercised only on <3.11 venvs.
+    tomllib = None  # type: ignore[assignment]
 
 _DEFAULT_GATEWAY = "http://127.0.0.1:8788/v1"
 _DEFAULT_GATED_TOOLS = (
@@ -43,22 +60,81 @@ _DEFAULT_GATED_TOOLS = (
     "write_file,edit_file,delete_file,apply_patch,browser_submit,send_email,git_push"
 )
 _DEFAULT_QUESTION_TOOLS = "clarify,ask_operator,ask_user"
+_DEFAULT_QUESTION_RISK_FAMILY = "read_only"
+_DEFAULT_CLEARANCE_RISK_FAMILY = "external_effect"
+
+# launchd Label of the supervised gateway (must match act_cli.LAUNCHD_LABEL).
+_GATEWAY_LAUNCHD_LABEL = "app.act.gateway"
+
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+# --- config: ENV > act.toml > built-in default ------------------------------
+
+def _act_toml_path() -> Path:
+    return Path.home() / ".hermes" / "act" / "act.toml"
+
+
+_TOML_CACHE: Dict[str, Any] = {"loaded": False, "data": {}}
+
+
+def _act_toml() -> Dict[str, Any]:
+    """Load ``~/.hermes/act/act.toml`` once (cached). Tolerant: a missing file,
+    a parse error, or a missing tomllib all yield ``{}`` and never raise — the
+    plugin must keep working with no file at all."""
+    if _TOML_CACHE["loaded"]:
+        return _TOML_CACHE["data"]
+    data: Dict[str, Any] = {}
+    if tomllib is not None:
+        try:
+            with open(_act_toml_path(), "rb") as fh:
+                loaded = tomllib.load(fh)
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, ValueError):  # missing file / unreadable / parse error
+            data = {}
+        except Exception:  # never let config loading break a hook
+            data = {}
+    _TOML_CACHE["data"] = data
+    _TOML_CACHE["loaded"] = True
+    return data
+
+
+def _cfg(env_name: str, toml_key: str, default: Optional[str]) -> Optional[str]:
+    """Resolve a single config value with strict precedence ENV > act.toml >
+    default. ENV wins whenever it is set non-empty (preserves the legacy
+    debugging escape hatch). Otherwise fall back to the act.toml value for
+    ``toml_key`` if present, else ``default``."""
+    env_val = os.getenv(env_name)
+    if env_val is not None and env_val.strip() != "":
+        return env_val
+    toml_val = _act_toml().get(toml_key)
+    if toml_val is not None:
+        return toml_val if isinstance(toml_val, str) else str(toml_val)
+    return default
 
 
 def _enabled() -> bool:
-    return os.getenv("ACT_CLEARANCE_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+    """Enabled if the ENV gate is truthy (unchanged) OR act.toml has
+    ``enabled = true``. Lets the desktop app bridge with NO env once act.toml
+    exists. (The plugins.enabled config.yaml gate is separate and still
+    required.)"""
+    env_val = os.getenv("ACT_CLEARANCE_ENABLED", "").strip().lower()
+    if env_val in _TRUTHY:
+        return True
+    return _act_toml().get("enabled") is True
 
 
 def _gateway() -> str:
-    return os.getenv("ACT_GATEWAY_URL", _DEFAULT_GATEWAY).rstrip("/")
+    return (_cfg("ACT_GATEWAY_URL", "gateway_url", _DEFAULT_GATEWAY) or _DEFAULT_GATEWAY).rstrip("/")
 
 
 def _agent_id() -> str:
-    return os.getenv("ACT_CLEARANCE_AGENT_ID", "hermes_agent")
+    return _cfg("ACT_CLEARANCE_AGENT_ID", "agent_id", "hermes_agent") or "hermes_agent"
 
 
 def _agent_name() -> str:
-    return os.getenv("ACT_CLEARANCE_AGENT_NAME", "Hermes Agent")
+    return _cfg("ACT_CLEARANCE_AGENT_NAME", "agent_name", "Hermes Agent") or "Hermes Agent"
 
 
 def _control_capabilities() -> List[Dict[str, str]]:
@@ -70,13 +146,38 @@ def _control_capabilities() -> List[Dict[str, str]]:
     ]
 
 
-def _csv(name: str, default: str) -> List[str]:
-    return [t.strip() for t in os.getenv(name, default).split(",") if t.strip()]
+def _tools(env_name: str, toml_key: str, default: str) -> List[str]:
+    """Resolve a tool list with ENV > act.toml > default precedence. The ENV
+    form is a CSV string; the act.toml form may be a TOML array (list) or a CSV
+    string. Returns a clean list of tool names."""
+    env_val = os.getenv(env_name)
+    if env_val is not None and env_val.strip() != "":
+        return [t.strip() for t in env_val.split(",") if t.strip()]
+    toml_val = _act_toml().get(toml_key)
+    if isinstance(toml_val, list):
+        return [str(t).strip() for t in toml_val if str(t).strip()]
+    if isinstance(toml_val, str) and toml_val.strip():
+        return [t.strip() for t in toml_val.split(",") if t.strip()]
+    return [t.strip() for t in default.split(",") if t.strip()]
 
 
-def _is_in(name: str, default: str, tool: str) -> bool:
-    items = _csv(name, default)
+def _is_in(env_name: str, toml_key: str, default: str, tool: str) -> bool:
+    items = _tools(env_name, toml_key, default)
     return "*" in items or tool in items
+
+
+def _question_risk_family() -> str:
+    return (
+        _cfg("ACT_QUESTION_RISK_FAMILY", "question_risk_family", _DEFAULT_QUESTION_RISK_FAMILY)
+        or _DEFAULT_QUESTION_RISK_FAMILY
+    ).strip()
+
+
+def _clearance_risk_family() -> str:
+    return (
+        _cfg("ACT_CLEARANCE_RISK_FAMILY", "clearance_risk_family", _DEFAULT_CLEARANCE_RISK_FAMILY)
+        or _DEFAULT_CLEARANCE_RISK_FAMILY
+    ).strip()
 
 
 def _timeout() -> float:
@@ -295,7 +396,7 @@ def _relay_question(tool_name: str, args: Any, session_id: str) -> Dict[str, str
                 # A question is not a risky action — use a LOW-risk family so the
                 # operator can engage it directly. Non-low-risk handoffs require a
                 # prior bound clearance (engage_handoff) and would 403 on engage.
-                "risk_family": os.getenv("ACT_QUESTION_RISK_FAMILY", "read_only"),
+                "risk_family": _question_risk_family(),
                 "context_redacted": context,
             },
         )
@@ -347,7 +448,7 @@ def _poll_question_answer(request_id: str, timeout_s: float, poll_s: float) -> O
 # --- control: clearance gate (existing, fail-closed) ------------------------
 
 def _relay_clearance(tool_name: str, args: Any, session_id: str) -> Optional[Dict[str, str]]:
-    risk_family = os.getenv("ACT_CLEARANCE_RISK_FAMILY", "external_effect").strip()
+    risk_family = _clearance_risk_family()
     timeout_s = _timeout()
     payload_redacted = _redacted_payload(tool_name, args)
     extensions: Dict[str, Dict[str, Any]] = {}
@@ -542,7 +643,7 @@ def _on_pre_tool_call(
         _current_session["id"] = session_id
 
     # 1) Interactive question: route the agent's question to the phone.
-    if _is_in("ACT_QUESTION_TOOLS", _DEFAULT_QUESTION_TOOLS, tool_name):
+    if _is_in("ACT_QUESTION_TOOLS", "question_tools", _DEFAULT_QUESTION_TOOLS, tool_name):
         return _relay_question(tool_name, args, session_id)
 
     # 2) Monitoring: reflect that the agent is now running this tool (fail-open).
@@ -560,10 +661,58 @@ def _on_pre_tool_call(
         return intervention
 
     # 4) Clearance gate for risky tools (fail-closed).
-    if _is_in("ACT_CLEARANCE_GATED_TOOLS", _DEFAULT_GATED_TOOLS, tool_name):
+    if _is_in("ACT_CLEARANCE_GATED_TOOLS", "gated_tools", _DEFAULT_GATED_TOOLS, tool_name):
         return _relay_clearance(tool_name, args, session_id)
 
     return None
+
+
+# --- self-heal: cheap is-it-up probe + launchctl kickstart -----------------
+
+def _health_url() -> str:
+    """Derive the gateway health endpoint from the configured gateway URL.
+    ``http://127.0.0.1:8788/v1`` -> ``http://127.0.0.1:8788/v1/health``."""
+    return f"{_gateway()}/health"
+
+
+def _gateway_healthy(timeout: float = 1.0) -> bool:
+    """Cheap GET of the gateway health endpoint. Any non-2xx / error -> False."""
+    req = urllib.request.Request(_health_url(), method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        return 200 <= getattr(resp, "status", 0) < 300
+
+
+def _kickstart_gateway() -> None:
+    """``launchctl kickstart -k gui/<uid>/app.act.gateway``. If the LaunchAgent
+    is not installed this fails harmlessly (non-zero exit) — we never check the
+    result."""
+    target = f"gui/{os.getuid()}/{_GATEWAY_LAUNCHD_LABEL}"
+    subprocess.run(  # noqa: S603
+        ["launchctl", "kickstart", "-k", target],
+        capture_output=True,
+        timeout=10,
+    )
+
+
+def _self_heal_gateway() -> None:
+    """Best-effort: if the gateway health probe is NOT healthy, kickstart the
+    LaunchAgent. FULLY error-swallowing — this runs on a background thread and
+    must NEVER raise into the Hermes register/hook path. This is an is-it-up +
+    kickstart, NOT a cold bootstrap."""
+    try:
+        healthy = False
+        try:
+            healthy = _gateway_healthy()
+        except Exception:
+            healthy = False
+        if healthy:
+            return
+        try:
+            _kickstart_gateway()
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def register(ctx) -> None:
@@ -572,6 +721,11 @@ def register(ctx) -> None:
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("on_session_end", _on_session_end)
     ctx.register_hook("transform_terminal_output", _on_transform_terminal_output)
+    # Self-heal: once enabled, ensure the supervised gateway is actually up. This
+    # is a cheap is-it-up + kickstart on a background thread — non-blocking and
+    # fully error-swallowing so it can never raise into the Hermes register path.
+    if _enabled():
+        threading.Thread(target=_self_heal_gateway, daemon=True).start()
     # Make the agent visible immediately (idle) so the fleet shows it before the
     # first tool call. Best-effort; no-op unless enabled.
     threading.Thread(
