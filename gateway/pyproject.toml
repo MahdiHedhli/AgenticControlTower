@@ -3,7 +3,7 @@ name = "agentic-control-tower"
 version = "0.1.0"
 description = "Agentic Control Tower gateway"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
   "cryptography>=46.0.0",
   "fastapi>=0.136.0",
@@ -23,6 +23,7 @@ dev = [
 [project.scripts]
 tower = "hermes_gateway.main:main"
 hermes-mobile-gateway = "hermes_gateway.main:main"
+act = "hermes_gateway.act_cli:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
