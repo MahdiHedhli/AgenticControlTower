@@ -7,19 +7,15 @@ import '../api/tui_protocol.dart';
 import '../api/tui_stream_client.dart';
 import '../models/alpha_models.dart';
 import '../models/core_models.dart';
-import '../repositories/alpha_repository.dart';
 import '../repositories/tui_repository.dart';
 
 class TuiViewModel extends ChangeNotifier {
   TuiViewModel({
-    required AlphaRepository fallbackRepository,
     TuiRepository? tuiRepository,
     TuiStreamClient? streamClient,
-  })  : _fallbackRepository = fallbackRepository,
-        _tuiRepository = tuiRepository,
+  })  : _tuiRepository = tuiRepository,
         _streamClient = streamClient;
 
-  final AlphaRepository _fallbackRepository;
   final TuiRepository? _tuiRepository;
   final TuiStreamClient? _streamClient;
 
@@ -32,15 +28,24 @@ class TuiViewModel extends ChangeNotifier {
   bool _gatewayMode = false;
   bool _connected = false;
   bool _isRelay = false;
+  bool _empty = false;
   final List<TuiSessionModel> _relaySessions = [];
   String _statusLabel = 'Terminal idle';
   String? _errorLabel;
+
+  /// Shown when there is no live agent terminal to mirror, instead of loading
+  /// fabricated mock terminal data.
+  static const noLiveTerminalMessage =
+      'No live agent terminal — run a Hermes task with the ACT bridge to '
+      'mirror it here.';
 
   bool get loading => _loading;
   bool get gatewayMode => _gatewayMode;
   bool get connected => _connected;
   // True when watching a read-only agent terminal mirror (relay) session.
   bool get isRelay => _isRelay;
+  // True when there is no live terminal to show (honest empty state, no mock).
+  bool get empty => _empty;
   List<TuiSessionModel> get relaySessions => List.unmodifiable(_relaySessions);
   String get statusLabel => _statusLabel;
   String? get errorLabel => _errorLabel;
@@ -72,7 +77,10 @@ class TuiViewModel extends ChangeNotifier {
     final repository = _tuiRepository;
     final streamClient = _streamClient;
     if (repository == null || streamClient == null) {
-      await _loadMock(routeContext, 'Mock terminal; pair with gateway for live TUI');
+      // Honest empty state for an unpaired/unconfigured app — never fabricate a
+      // mock terminal, so a paired user can never see fake "work-vm-02" data
+      // even if the stream-client and repository guards ever diverge.
+      _setEmpty('Pair this device with a gateway to mirror agent terminals here.');
       return;
     }
 
@@ -83,17 +91,17 @@ class TuiViewModel extends ChangeNotifier {
         ..clear()
         ..addAll(relays);
       if (relays.isEmpty) {
-        await _loadMock(
-          routeContext,
-          'No live agent terminal to mirror yet',
-        );
+        // Honest empty state — paired users never see fabricated terminal data.
+        _setEmpty(noLiveTerminalMessage);
         return;
       }
       await _attachRelay(relays.first, repository, streamClient);
     } on GatewayApiException catch (error) {
-      await _loadMock(routeContext, 'Mock terminal; gateway rejected TUI (${error.statusCode})');
+      // Real failure talking to the gateway: surface it, do not fake a terminal.
+      _setEmpty('Terminal mirror unavailable (gateway error ${error.statusCode})');
+      _errorLabel = '$error';
     } on Object catch (error) {
-      await _loadMock(routeContext, 'Mock terminal; TUI unavailable');
+      _setEmpty('Terminal mirror unavailable');
       _errorLabel = '$error';
     } finally {
       _loading = false;
@@ -112,6 +120,7 @@ class TuiViewModel extends ChangeNotifier {
     _gatewaySession = session;
     _gatewayMode = true;
     _isRelay = true;
+    _empty = false;
     _connected = false;
     _gatewayScrollback.clear();
     _statusLabel = 'Connecting to ${session.agentId} terminal';
@@ -266,12 +275,18 @@ class TuiViewModel extends ChangeNotifier {
     super.dispose();
   }
 
-  Future<void> _loadMock(String routeContext, String statusLabel) async {
-    _fallbackSession = await _fallbackRepository.loadTerminalSession(routeContext);
+  /// Honest empty state: there is no live terminal to mirror. We clear any
+  /// gateway/fallback session so the UI shows [message] rather than fabricated
+  /// terminal data.
+  void _setEmpty(String message) {
+    _fallbackSession = null;
     _gatewaySession = null;
+    _gatewayScrollback.clear();
     _gatewayMode = false;
+    _isRelay = false;
     _connected = false;
-    _statusLabel = statusLabel;
+    _empty = true;
+    _statusLabel = message;
     _loading = false;
     notifyListeners();
   }

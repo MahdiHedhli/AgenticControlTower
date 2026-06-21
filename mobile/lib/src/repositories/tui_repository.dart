@@ -36,9 +36,12 @@ class TuiRepository {
   }
 
   Future<List<TuiSessionModel>> listSessions({String? state}) async {
+    // Read-only: token auth (signed: false) — no device signature, no biometric
+    // prompt just to VIEW the terminal mirror.
     final json = await _apiClient.getJson(
       '/tui/sessions',
       query: {'state': state},
+      signed: false,
     );
     return (json['sessions'] as List<dynamic>)
         .map((item) => TuiSessionModel.fromJson(
@@ -58,7 +61,11 @@ class TuiRepository {
   }
 
   Future<TuiSessionModel> getSession(String sessionId) async {
-    final json = await _apiClient.getJson('/tui/sessions/$sessionId');
+    // Read-only: token auth (signed: false), same as listSessions.
+    final json = await _apiClient.getJson(
+      '/tui/sessions/$sessionId',
+      signed: false,
+    );
     return TuiSessionModel.fromJson(json);
   }
 

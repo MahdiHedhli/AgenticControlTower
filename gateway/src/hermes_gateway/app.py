@@ -209,6 +209,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def require_signed_device(request: Request) -> VerifiedDevice:
         return await verify_signed_request(request, store=store, settings=resolved_settings)
 
+    async def require_read_auth(request: Request) -> VerifiedDevice:
+        """Read-only auth for the terminal mirror: signed-device OR access token.
+
+        Listing/reading a read-only TUI mirror is no more sensitive than the
+        other operator reads, so it must not force a biometric device signature.
+        We accept EITHER the usual signed-device auth OR a valid gateway access
+        token (the same bearer token the app already holds, presented via the
+        ``Authorization: Bearer`` header). The signed path is preferred: if any
+        device-signature headers are present we route through it so a malformed
+        signature surfaces its own 401/403 rather than silently falling back.
+        Fail-closed: with neither a valid signature nor a valid token we 401.
+        Returns a ``VerifiedDevice`` so downstream per-device scoping is
+        unchanged regardless of which credential was used.
+        """
+        has_device_headers = bool(
+            request.headers.get(DEVICE_ID_HEADER)
+            and request.headers.get(SIGNATURE_HEADER)
+        )
+        if has_device_headers:
+            return await require_signed_device(request)
+        token = _bearer_token(request)
+        device_row = store.verify_access_token(token) if token else None
+        if device_row is not None:
+            return VerifiedDevice(
+                device_id=device_row["device_id"],
+                node_id=device_row["node_id"],
+                permissions=device_row["permissions"],
+                clearance_channel=device_row.get("clearance_channel", "local_terminal"),
+            )
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "device signature or access token required",
+        )
+
     def require_hermes_local_request(request: Request) -> HermesLocalCaller:
         return verify_hermes_local_request(
             request,
@@ -217,6 +251,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     signed_device_dependency = Depends(require_signed_device)
+    read_auth_dependency = Depends(require_read_auth)
     hermes_local_dependency = Depends(require_hermes_local_request)
 
     @app.get("/v1/health", response_model=GatewayHealth)
@@ -1384,7 +1419,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/v1/tui/sessions")
     async def list_tui_sessions(
         state: str | None = None,
-        device: VerifiedDevice = signed_device_dependency,
+        device: VerifiedDevice = read_auth_dependency,
     ) -> dict[str, list[TuiSession]]:
         await tui_manager.cleanup_idle_sessions()
         return {
@@ -1400,7 +1435,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/v1/tui/sessions/{session_id}", response_model=TuiSession)
     async def get_tui_session(
         session_id: str,
-        device: VerifiedDevice = signed_device_dependency,
+        device: VerifiedDevice = read_auth_dependency,
     ) -> TuiSession:
         await tui_manager.cleanup_idle_sessions()
         session = _owned_tui_session(store, session_id, device)
@@ -3278,6 +3313,22 @@ async def _bridge_dashboard_ws(
 
 def _request_id(request: Request) -> str:
     return request.headers.get("X-Request-Id") or new_id("req")
+
+
+def _bearer_token(request: Request) -> str | None:
+    """Extract a gateway access token from the request, if present.
+
+    Accepts the standard ``Authorization: Bearer <token>`` header (what the app
+    sends for token-authed reads) and, as a convenience, an ``access_token``
+    query param. Returns ``None`` when no token is supplied.
+    """
+    header = request.headers.get("Authorization") or request.headers.get("authorization")
+    if header and header.lower().startswith("bearer "):
+        token = header[7:].strip()
+        if token:
+            return token
+    query_token = request.query_params.get("access_token")
+    return query_token or None
 
 
 def _websocket_token(websocket: WebSocket) -> str | None:

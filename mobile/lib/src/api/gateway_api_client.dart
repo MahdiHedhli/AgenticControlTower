@@ -10,11 +10,18 @@ class GatewayApiClient {
   GatewayApiClient({
     required this.config,
     required this.signer,
+    this.accessToken,
     http.Client? httpClient,
   }) : _httpClient = httpClient ?? http.Client();
 
   final GatewayConfig config;
   final DeviceRequestSigner signer;
+
+  /// Gateway access token (bearer) for token-authed reads. When a request is
+  /// sent with `signed: false` and this is set, it is presented as
+  /// `Authorization: Bearer`, letting read-only endpoints authenticate without
+  /// a device signature (and therefore without a biometric prompt).
+  final String? accessToken;
   final http.Client _httpClient;
 
   Future<Map<String, dynamic>> getJson(
@@ -69,6 +76,13 @@ class GatewayApiClient {
       );
       for (final entry in signedHeaders.values.entries) {
         request.headers[entry.key] = entry.value;
+      }
+    } else {
+      // Token-authed (unsigned) request: present the gateway access token so
+      // read-only endpoints authenticate without a device signature.
+      final token = accessToken;
+      if (token != null && token.isNotEmpty) {
+        request.headers['Authorization'] = 'Bearer $token';
       }
     }
 

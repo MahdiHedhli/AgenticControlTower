@@ -24,6 +24,18 @@ class AgentDetailScreen extends StatelessWidget {
       body: FutureBuilder<FleetAgent>(
         future: repository.loadAgent(agentId),
         builder: (context, snapshot) {
+          if (snapshot.hasError) {
+            return Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Text(
+                  'Agent not found — it may be offline or not on this gateway.',
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodyMedium,
+                ),
+              ),
+            );
+          }
           final agent = snapshot.data;
           if (agent == null) {
             return const Center(child: CircularProgressIndicator());

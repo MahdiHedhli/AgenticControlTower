@@ -400,6 +400,7 @@ class HermesAppRuntime extends ChangeNotifier {
           channel: _enclave,
           protection: _clearanceKeyProtection,
         ),
+        accessToken: _accessToken,
       );
     }
     final privateKey = _privateKey;
@@ -416,6 +417,7 @@ class HermesAppRuntime extends ChangeNotifier {
           publicKey: publicKey,
         ),
       ),
+      accessToken: _accessToken,
     );
   }
 

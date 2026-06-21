@@ -36,6 +36,55 @@ void main() {
     expect(session.state, 'active');
   });
 
+  test('listSessions reads with token auth, not a device signature', () async {
+    late http.Request captured;
+    final client = GatewayApiClient(
+      config: GatewayConfig.fromInput('http://127.0.0.1:8787/v1'),
+      signer: const _StaticSigner(),
+      accessToken: 'tok_abc',
+      httpClient: MockClient((request) async {
+        captured = request;
+        return http.Response(
+          jsonEncode({
+            'sessions': [_sessionJson()],
+          }),
+          200,
+        );
+      }),
+    );
+
+    final sessions = await TuiRepository(client).listSessions();
+
+    // Token auth: bearer header present, no device-signature headers (so no
+    // biometric prompt just to VIEW the terminal mirror).
+    expect(captured.method, 'GET');
+    expect(captured.url.path, '/v1/tui/sessions');
+    expect(captured.headers['Authorization'], 'Bearer tok_abc');
+    expect(captured.headers.containsKey('X-HMCP-Signature'), isFalse);
+    expect(captured.headers.containsKey('X-HMCP-Device-Id'), isFalse);
+    expect(sessions.single.sessionId, 'tui_1');
+  });
+
+  test('getSession reads with token auth, not a device signature', () async {
+    late http.Request captured;
+    final client = GatewayApiClient(
+      config: GatewayConfig.fromInput('http://127.0.0.1:8787/v1'),
+      signer: const _StaticSigner(),
+      accessToken: 'tok_abc',
+      httpClient: MockClient((request) async {
+        captured = request;
+        return http.Response(jsonEncode(_sessionJson()), 200);
+      }),
+    );
+
+    await TuiRepository(client).getSession('tui_1');
+
+    expect(captured.method, 'GET');
+    expect(captured.url.path, '/v1/tui/sessions/tui_1');
+    expect(captured.headers['Authorization'], 'Bearer tok_abc');
+    expect(captured.headers.containsKey('X-HMCP-Signature'), isFalse);
+  });
+
   test('close session unwraps control response', () async {
     final client = GatewayApiClient(
       config: GatewayConfig.fromInput('http://127.0.0.1:8787/v1'),

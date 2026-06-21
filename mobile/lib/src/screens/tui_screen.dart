@@ -35,7 +35,6 @@ class _TuiScreenState extends State<TuiScreen> {
     super.initState();
     final runtime = widget.runtime;
     _viewModel = TuiViewModel(
-      fallbackRepository: widget.repository,
       tuiRepository: runtime?.tuiRepository,
       streamClient: runtime?.tuiStreamClient,
     )..addListener(_handleViewModelChanged);
@@ -254,16 +253,21 @@ class _TerminalPane extends StatelessWidget {
         ),
         child: Stack(
           children: [
-            ListView(
-              controller: scrollController,
-              padding: const EdgeInsets.all(14),
-              children: [
-                SelectableText(
-                  text.isEmpty ? '${viewModel.prompt} ' : '$text\n${viewModel.prompt} ',
-                  style: terminalStyle,
-                ),
-              ],
-            ),
+            if (viewModel.empty)
+              _EmptyTerminalState(message: viewModel.statusLabel)
+            else
+              ListView(
+                controller: scrollController,
+                padding: const EdgeInsets.all(14),
+                children: [
+                  SelectableText(
+                    text.isEmpty
+                        ? '${viewModel.prompt} '
+                        : '$text\n${viewModel.prompt} ',
+                    style: terminalStyle,
+                  ),
+                ],
+              ),
             if (viewModel.loading)
               const Positioned(
                 right: 12,
@@ -274,6 +278,41 @@ class _TerminalPane extends StatelessWidget {
                   child: CircularProgressIndicator(strokeWidth: 2),
                 ),
               ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _EmptyTerminalState extends StatelessWidget {
+  const _EmptyTerminalState({required this.message});
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Icons.terminal_outlined,
+              color: Color(0xFF6B7C76),
+              size: 40,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              message,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: Color(0xFFB7CFC4),
+                fontFamily: 'monospace',
+                height: 1.45,
+              ),
+            ),
           ],
         ),
       ),

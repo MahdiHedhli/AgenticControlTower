@@ -121,7 +121,9 @@ class GatewayAlphaRepository implements AlphaRepository {
         return agent;
       }
     }
-    return fallback.loadAgent(agentId);
+    // Honest not-found: a paired user must not see a fabricated mock agent for
+    // an id the gateway does not know about.
+    throw StateError('agent not found on gateway: $agentId');
   }
 
   @override
