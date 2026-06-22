@@ -395,6 +395,12 @@ def generate_gateway_toml(
         f"database_path = {_toml_str(str(db))}",
         f"gateway_base_url = {_toml_str(f'http://{GATEWAY_HOST}:{GATEWAY_PORT}/v1')}",
         f'# Bound on {GATEWAY_HOST}:{GATEWAY_PORT} by the supervised entrypoint.',
+        # Loopback, matching the hard-baked contract above. A tailnet-reachable
+        # deployment either fronts this with `tailscale serve` (what the live
+        # node does) or sets bind_host = "0.0.0.0" here; every endpoint is
+        # device-auth gated either way, but widening the bind is an explicit
+        # operator decision rather than an install-time default.
+        f"bind_host = {_toml_str(GATEWAY_HOST)}",
     ]
     if apns_key_path:
         lines.append("")

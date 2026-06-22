@@ -109,7 +109,9 @@ def main() -> None:
     global _LOCK_HANDLE
     _LOCK_HANDLE = lock_handle
 
-    host = os.getenv("HERMES_GATEWAY_HOST", DEFAULT_HOST)
+    # Env wins; else the configured bind_host (e.g. 0.0.0.0 for a tailnet-reachable
+    # deployment); else the loopback default. Every endpoint is device-auth gated.
+    host = os.getenv("HERMES_GATEWAY_HOST") or settings.bind_host or DEFAULT_HOST
     port = int(os.getenv("HERMES_GATEWAY_PORT", str(DEFAULT_PORT)))
 
     uvicorn.run(
