@@ -118,6 +118,8 @@ def test_gateway_toml_bakes_safe_overrides(home):
     assert "127.0.0.1" in text
     # Hermes dashboard reverse-proxy target (default loopback :9120).
     assert 'dashboard_url = "http://127.0.0.1:9120"' in text
+    # Binds all interfaces so the phone reaches it over the tailnet.
+    assert 'bind_host = "0.0.0.0"' in text
     # no apns by default
     assert "apns_key_path" not in text
 

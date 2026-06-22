@@ -25,6 +25,7 @@ def test_from_file_overrides_defaults(tmp_path: Path) -> None:
                 "seed_mock_data = false",
                 'node_id = "node_supervised"',
                 "pairing_ttl_seconds = 120",
+                'bind_host = "0.0.0.0"',
                 'allowed_hermes_callers = ["hermes-a", "hermes-b"]',
             ]
         )
@@ -36,6 +37,9 @@ def test_from_file_overrides_defaults(tmp_path: Path) -> None:
     assert settings.seed_mock_data is False
     assert settings.node_id == "node_supervised"
     assert settings.pairing_ttl_seconds == 120
+    assert settings.bind_host == "0.0.0.0"
+    # Default stays loopback when not set in the file.
+    assert Settings.bind_host == "127.0.0.1"
     # list TOML values normalise to tuples to match dataclass defaults.
     assert settings.allowed_hermes_callers == ("hermes-a", "hermes-b")
     # Untouched fields keep their defaults.

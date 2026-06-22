@@ -398,6 +398,9 @@ def generate_gateway_toml(
         f'# Bound on {GATEWAY_HOST}:{GATEWAY_PORT} by the supervised entrypoint.',
         "# Loopback Hermes dashboard reverse-proxied under /hermes (gateway-gated).",
         f"dashboard_url = {_toml_str(dashboard_url)}",
+        "# Bind all interfaces so the phone reaches the gateway over the tailnet",
+        "# (every endpoint is device-auth gated).",
+        'bind_host = "0.0.0.0"',
     ]
     if apns_key_path:
         lines.append("")

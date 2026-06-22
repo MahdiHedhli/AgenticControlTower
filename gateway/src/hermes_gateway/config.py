@@ -31,6 +31,10 @@ class Settings:
     # Loopback Hermes agent dashboard reverse-proxied under /hermes. The phone
     # reaches it through the gateway; the gateway holds the dashboard token.
     dashboard_url: str = "http://127.0.0.1:9120"
+    # Interface the supervised gateway binds. Default loopback (secure); a
+    # tailnet-reachable deployment sets 0.0.0.0 (every endpoint is device-auth
+    # gated). Overridable via HERMES_GATEWAY_HOST.
+    bind_host: str = "127.0.0.1"
     gateway_version: str = "0.1.0"
     hermes_version: str | None = None
     database_path: str = ".hermes-mobile-gateway/gateway.sqlite3"
@@ -76,6 +80,7 @@ class Settings:
             node_fingerprint=os.getenv("HERMES_NODE_FINGERPRINT", cls.node_fingerprint),
             gateway_base_url=os.getenv("HERMES_GATEWAY_BASE_URL", cls.gateway_base_url),
             dashboard_url=os.getenv("HERMES_DASHBOARD_URL", cls.dashboard_url),
+            bind_host=os.getenv("HERMES_GATEWAY_HOST", cls.bind_host),
             gateway_version=os.getenv("HERMES_GATEWAY_VERSION", cls.gateway_version),
             hermes_version=os.getenv("HERMES_VERSION"),
             database_path=os.getenv("HERMES_GATEWAY_DB", cls.database_path),
