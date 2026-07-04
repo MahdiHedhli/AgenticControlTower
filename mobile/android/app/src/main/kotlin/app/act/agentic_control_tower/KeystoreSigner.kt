@@ -1,6 +1,7 @@
 package app.act.agentic_control_tower
 
 import android.os.Build
+import android.util.Log
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
@@ -43,6 +44,15 @@ class KeystoreSigner(private val activityProvider: () -> FragmentActivity?) {
     }
 
     private var lastAuthAtMs: Long = 0L
+
+    // Only one BiometricPrompt can be active per activity; androidx.biometric
+    // silently ignores a second authenticate() call while one is showing, which
+    // would leave that call's MethodChannel result (and its Dart future) hanging
+    // forever. Serialize instead: while a prompt is up, queue sign requests and
+    // settle them when the prompt resolves (signing within the fresh auth
+    // window on success, failing them on error). Main-thread only.
+    private var promptActive: Boolean = false
+    private val queuedSigns = ArrayDeque<Pair<ByteArray, MethodChannel.Result>>()
 
     fun handle(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
@@ -123,7 +133,14 @@ class KeystoreSigner(private val activityProvider: () -> FragmentActivity?) {
         val withinWindow =
             allowReuse > 0 && lastAuthAtMs > 0 && (nowMs - lastAuthAtMs) < allowReuse * 1000
         if (withinWindow) {
+            Log.i("KeystoreSigner", "sign: within window, reason=$reason")
             signNow(data, result)
+            return
+        }
+
+        if (promptActive) {
+            Log.i("KeystoreSigner", "sign: prompt active, queueing (depth=${queuedSigns.size + 1}) reason=$reason")
+            queuedSigns.addLast(data to result)
             return
         }
 
@@ -132,18 +149,26 @@ class KeystoreSigner(private val activityProvider: () -> FragmentActivity?) {
             result.error("no_activity", "no foreground activity for biometric prompt", null)
             return
         }
+        Log.i("KeystoreSigner", "sign: showing prompt, reason=$reason")
+        promptActive = true
         activity.runOnUiThread {
             val prompt = BiometricPrompt(
                 activity,
                 ContextCompat.getMainExecutor(activity),
                 object : BiometricPrompt.AuthenticationCallback() {
                     override fun onAuthenticationSucceeded(r: BiometricPrompt.AuthenticationResult) {
+                        Log.i("KeystoreSigner", "prompt success; draining ${queuedSigns.size} queued")
                         lastAuthAtMs = System.currentTimeMillis()
+                        promptActive = false
                         signNow(data, result)
+                        drainQueuedSigns(authSucceeded = true)
                     }
 
                     override fun onAuthenticationError(code: Int, msg: CharSequence) {
+                        Log.i("KeystoreSigner", "prompt error code=$code msg=$msg; failing ${queuedSigns.size} queued")
+                        promptActive = false
                         result.error("auth_failed", msg.toString(), null)
+                        drainQueuedSigns(authSucceeded = false, message = msg.toString())
                     }
                 },
             )
@@ -159,6 +184,18 @@ class KeystoreSigner(private val activityProvider: () -> FragmentActivity?) {
         }
     }
 
+    /** Settle sign requests that arrived while a BiometricPrompt was showing. */
+    private fun drainQueuedSigns(authSucceeded: Boolean, message: String = "") {
+        while (queuedSigns.isNotEmpty()) {
+            val (data, result) = queuedSigns.removeFirst()
+            if (authSucceeded) {
+                signNow(data, result)
+            } else {
+                result.error("auth_failed", message, null)
+            }
+        }
+    }
+
     private fun signNow(data: ByteArray, result: MethodChannel.Result) {
         try {
             val ks = keyStore()
@@ -168,6 +205,7 @@ class KeystoreSigner(private val activityProvider: () -> FragmentActivity?) {
             signature.update(data)
             result.success(b64url(signature.sign()))
         } catch (e: Exception) {
+            Log.w("KeystoreSigner", "signNow failed: ${e.message}")
             result.error("sign_failed", e.message, null)
         }
     }
