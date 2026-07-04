@@ -521,6 +521,11 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
                 "TEXT NOT NULL DEFAULT '{}'",
             )
             self._ensure_column(db, "approval_requests", "decided_at", "TEXT")
+            # BrowserBridge seam (additive): per-surface risk vector + authority
+            # provenance. All nullable so existing rows/consumers are unaffected.
+            self._ensure_column(db, "approval_requests", "risk_vector_json", "TEXT")
+            self._ensure_column(db, "approval_requests", "approved_by", "TEXT")
+            self._ensure_column(db, "approval_requests", "human_approved", "TEXT")
             self._ensure_column(
                 db,
                 "tui_sessions",
@@ -889,11 +894,12 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
                     operator_message, audit_correlation_id, tower_id, contract_version,
                     proof_json, extensions_json, extensions_digest, aircraft, requested_by, summary,
                     full_payload_redacted_json, payload_hash, resource_scope, state,
-                    options_json, requested_at, expires_at
+                    options_json, requested_at, expires_at,
+                    risk_vector_json
                 )
                 VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -926,6 +932,9 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
                     json.dumps(approval.get("options", [])),
                     approval.get("requested_at") or utc_iso(),
                     approval["expires_at"],
+                    json.dumps(approval["risk_vector"])
+                    if approval.get("risk_vector")
+                    else None,
                 ),
             )
         return self.get_approval(approval["approval_id"])
@@ -1099,6 +1108,8 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
         decision_scope: str | None = None,
         decision_actor_device_id: str | None = None,
         decision_metadata: dict[str, Any] | None = None,
+        approved_by: str | None = None,
+        human_approved: bool = False,
     ) -> None:
         decided_at = utc_iso()
         with self.connect() as db:
@@ -1109,7 +1120,9 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
                     decision_scope = ?,
                     decision_actor_device_id = ?,
                     decision_metadata_json = ?,
-                    decided_at = ?
+                    decided_at = ?,
+                    approved_by = ?,
+                    human_approved = ?
                 WHERE approval_id = ?
                 """,
                 (
@@ -1118,6 +1131,8 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
                     decision_actor_device_id,
                     json.dumps(decision_metadata or {}),
                     decided_at,
+                    approved_by,
+                    "1" if human_approved else "0",
                     approval_id,
                 ),
             )
@@ -1148,10 +1163,113 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
         approval["proof"] = json.loads(approval.pop("proof_json", "{}") or "{}") or None
         approval["extensions"] = json.loads(approval.pop("extensions_json", "{}") or "{}")
         approval["contract_version"] = approval.get("contract_version") or "act.clearance.v2"
+        # BrowserBridge seam (additive) deserialization.
+        risk_vector_json = approval.pop("risk_vector_json", None)
+        approval["risk_vector"] = (
+            json.loads(risk_vector_json) if risk_vector_json else None
+        )
+        approval["human_approved"] = approval.get("human_approved") == "1"
+        approval.setdefault("approved_by", None)
         approval.pop("decision_actor_device_id", None)
         approval.pop("payload_hash", None)
         approval.pop("requested_at", None)
         return approval
+
+    def reserve_approval(self, approval_id: str) -> dict[str, Any]:
+        """Two-phase consume, phase 1 (BrowserBridge seam). Atomically move an
+        ``approved`` clearance to ``reserved`` so only one consumer can hold it.
+        Raises KeyError if missing, ValueError if not reservable."""
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE approval_requests SET state = 'reserved'
+                WHERE approval_id = ? AND state = 'approved'
+                """,
+                (approval_id,),
+            )
+            if cursor.rowcount == 0:
+                current = db.execute(
+                    "SELECT state FROM approval_requests WHERE approval_id = ?",
+                    (approval_id,),
+                ).fetchone()
+                if current is None:
+                    raise KeyError(approval_id)
+                raise ValueError(f"approval not reservable from state {current[0]!r}")
+        return self.get_approval(approval_id)
+
+    def commit_approval(self, approval_id: str) -> dict[str, Any]:
+        """Two-phase consume, phase 2 (BrowserBridge seam). Commit only succeeds
+        from ``reserved``, preserving one-time consumption."""
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE approval_requests SET state = 'committed'
+                WHERE approval_id = ? AND state = 'reserved'
+                """,
+                (approval_id,),
+            )
+            if cursor.rowcount == 0:
+                current = db.execute(
+                    "SELECT state FROM approval_requests WHERE approval_id = ?",
+                    (approval_id,),
+                ).fetchone()
+                if current is None:
+                    raise KeyError(approval_id)
+                raise ValueError(f"approval not committable from state {current[0]!r}")
+        return self.get_approval(approval_id)
+
+    def release_approval(self, approval_id: str) -> dict[str, Any]:
+        """Two-phase consume, symmetric inverse of ``commit`` (BrowserBridge
+        seam). Release only succeeds from ``reserved`` -> ``cancelled``,
+        preserving one-time consumption: a released clearance can never
+        afterward be committed or re-reserved (both guard on the prior state),
+        and ``committed`` clearances are left untouched (release -> ValueError)."""
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE approval_requests SET state = 'cancelled'
+                WHERE approval_id = ? AND state = 'reserved'
+                """,
+                (approval_id,),
+            )
+            if cursor.rowcount == 0:
+                current = db.execute(
+                    "SELECT state FROM approval_requests WHERE approval_id = ?",
+                    (approval_id,),
+                ).fetchone()
+                if current is None:
+                    raise KeyError(approval_id)
+                raise ValueError(f"approval not releasable from state {current[0]!r}")
+        return self.get_approval(approval_id)
+
+    def bulk_invalidate_approvals(
+        self, *, session_id: str, reason: str = "panic"
+    ) -> list[str]:
+        """Panic dominance (BrowserBridge seam). Atomically invalidate every
+        pending AND approved-but-unconsumed (approved/reserved) clearance for a
+        session. Committed clearances are already consumed and are left intact.
+        Returns the invalidated approval ids."""
+        decided_at = utc_iso()
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT approval_id FROM approval_requests
+                WHERE session_id = ? AND state IN ('pending', 'approved', 'reserved')
+                """,
+                (session_id,),
+            ).fetchall()
+            ids = [row[0] for row in rows]
+            db.execute(
+                """
+                UPDATE approval_requests
+                SET state = 'cancelled',
+                    decided_at = COALESCE(decided_at, ?),
+                    decision_metadata_json = ?
+                WHERE session_id = ? AND state IN ('pending', 'approved', 'reserved')
+                """,
+                (decided_at, json.dumps({"reason": reason}), session_id),
+            )
+        return ids
 
     def create_notification(self, notification: dict[str, Any]) -> dict[str, Any]:
         notification_id = notification.get("notification_id") or new_id("ntf")
