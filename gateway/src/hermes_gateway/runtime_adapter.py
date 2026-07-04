@@ -768,6 +768,18 @@ class HermesRuntimeAdapter:
             )
         return self.approval_result(approval_id)
 
+    def release_approval(self, approval_id: str) -> RuntimeApprovalResult:
+        """Two-phase consume, symmetric inverse of commit (BrowserBridge seam).
+        Release a reserved clearance back to cancelled so it never dangles.
+        404 if missing, 409 if not reserved; one-time consumption preserved."""
+        try:
+            self.store.release_approval(approval_id)
+        except KeyError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "approval not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        return self.approval_result(approval_id)
+
     def expire_pending_approvals(self) -> None:
         for approval in self.store.list_approvals(state="pending"):
             if parse_utc(approval["expires_at"]) > now_utc():
