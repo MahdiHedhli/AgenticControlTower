@@ -30,6 +30,7 @@ pre-fix failure; the fix commit removed the gate.)
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from hermes_gateway.clearance_contract import (
@@ -151,3 +152,32 @@ def test_hermes_route_derives_short_code_from_canonical_fingerprint(
     approval = _post_hermes_approval(client, short_code=None)
     stored = client.app.state.store.get_approval(approval["approval_id"])
     assert stored["short_code"] == build_short_code(approval["approval_id"], canonical_fp)
+
+
+def test_store_rejects_missing_params_fingerprint(client: TestClient) -> None:
+    """Store hardening: creating an approval WITHOUT a canonical
+    params_fingerprint fails loudly at creation instead of silently
+    substituting content_hash(payload) (the old store fallback), which minted
+    clearances no verifier could reproduce. Call-site survey: every legitimate
+    creation path (runtime adapter, direct /v1/approvals, Hermes route, test
+    seeders) passes the fingerprint explicitly; nothing relied on the fallback.
+    """
+    approval = {
+        "approval_id": "appr_no_fp",
+        "action_id": "act_no_fp",
+        "node_id": "node_test",
+        "agent_id": "agent_mock",
+        "session_id": "sess_mock",
+        "requested_tool": "shell",
+        "risk_level": "high",
+        "risk_family": "destructive",
+        "summary": "Missing fingerprint must be rejected.",
+        "full_payload_redacted": PAYLOAD_REDACTED,
+        "state": "pending",
+        "options": ["approve_once", "deny"],
+        "expires_at": "2099-01-01T00:00:00Z",
+    }
+    with pytest.raises(ValueError, match="params_fingerprint"):
+        client.app.state.store.create_approval(approval)
+    with pytest.raises(KeyError):
+        client.app.state.store.get_approval("appr_no_fp")

@@ -884,6 +884,21 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
 
     def create_approval(self, approval: dict[str, Any]) -> dict[str, Any]:
         payload = approval.get("full_payload_redacted", {})
+        params_fingerprint = approval.get("params_fingerprint")
+        if not params_fingerprint:
+            # Fail CLOSED (act.clearance.v2): the params fingerprint binds the
+            # signed clearance proof to the exact requested params. Silently
+            # backfilling from a payload hash here minted clearances whose
+            # fingerprint no verifier could reproduce — the mismatch only
+            # surfaced downstream at proof verification. Every creation path
+            # must supply the canonical fingerprint explicitly
+            # (clearance_contract.build_params_fingerprint / the contract
+            # fields from build_clearance_contract_fields).
+            raise ValueError(
+                "approval creation requires a canonical params_fingerprint "
+                "(clearance_contract.build_params_fingerprint); refusing to "
+                "backfill from a payload hash"
+            )
         with self.connect() as db:
             db.execute(
                 """
@@ -913,7 +928,7 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
                     approval["risk_level"],
                     approval.get("risk_category"),
                     approval.get("risk_family", "external_effect"),
-                    approval.get("params_fingerprint") or content_hash(payload),
+                    params_fingerprint,
                     approval.get("short_code"),
                     approval.get("operator_message"),
                     approval.get("audit_correlation_id"),
