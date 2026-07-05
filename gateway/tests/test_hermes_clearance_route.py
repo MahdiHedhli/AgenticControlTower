@@ -22,14 +22,14 @@ without the xfail gate; see docstrings):
   an aircraft-style proof verification over the values the CLIENT knows
   (its canonical fingerprint + its requested short code) FAILED.
 
-The tests below assert the POST-fix contract. They are gated with
-``xfail(strict=True)`` so the branch stays green until the fix lands; the fix
-commit removes the gate.
+The tests below assert the post-fix contract: the route delegates to
+runtime_adapter.request_clearance and every contract field flows through.
+(They were committed gated xfail(strict=True) one commit earlier to record the
+pre-fix failure; the fix commit removed the gate.)
 """
 
 from __future__ import annotations
 
-import pytest
 from fastapi.testclient import TestClient
 
 from hermes_gateway.clearance_contract import (
@@ -39,18 +39,6 @@ from hermes_gateway.clearance_contract import (
     extensions_digest,
     tower_public_key_b64,
     verify_clearance_proof,
-)
-
-# Pre-fix gate: these tests demonstrably FAIL at 8cbf226 (run with --runxfail or
-# remove the marker to reproduce). strict=True keeps the branch green pre-fix and
-# forces the marker's removal in the fix commit (XPASS would fail the suite).
-PRE_FIX_GATE = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "hermes_approval_requested hand-builds CreateApprovalRequest and drops "
-        "params_fingerprint/short_code/operator_message/audit_correlation_id/"
-        "extensions — fix pending (delegate to runtime_adapter.request_clearance)"
-    ),
 )
 
 PAYLOAD_REDACTED = {"tool": "shell", "arg_keys": ["command", "cwd"]}
@@ -86,7 +74,6 @@ def _post_hermes_approval(client: TestClient, **overrides) -> dict:
     return response.json()
 
 
-@PRE_FIX_GATE
 def test_hermes_route_forwards_all_clearance_contract_fields(client: TestClient) -> None:
     """The Hermes route must not drop contract fields the schema carries.
 
@@ -112,7 +99,6 @@ def test_hermes_route_forwards_all_clearance_contract_fields(client: TestClient)
     assert stored["extensions"] == EXTENSIONS
 
 
-@PRE_FIX_GATE
 def test_hermes_route_clearance_verifies_with_client_known_material(
     client: TestClient,
 ) -> None:
@@ -148,7 +134,6 @@ def test_hermes_route_clearance_verifies_with_client_known_material(
     )
 
 
-@PRE_FIX_GATE
 def test_hermes_route_derives_short_code_from_canonical_fingerprint(
     client: TestClient,
 ) -> None:

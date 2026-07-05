@@ -947,29 +947,53 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request,
         _caller: HermesLocalCaller = hermes_local_dependency,
     ) -> ApprovalRequest:
-        approval_payload = CreateApprovalRequest(
-            action_id=payload.action_id or new_id("act"),
-            node_id=payload.node_id,
-            agent_id=payload.agent_id,
-            session_id=payload.session_id,
-            requested_tool=payload.requested_tool,
-            capability=payload.capability,
-            risk_level=payload.risk_level,
-            risk_category=payload.risk_category,
-            risk_family=payload.risk_family,
-            summary=payload.summary,
-            full_payload_redacted=payload.payload_redacted,
-            resource_scope=payload.resource_scope,
-            options=_approval_options_from_scopes(payload.suggested_scopes),
-            expires_at=expires_in(payload.expires_in_seconds),
-        )
-        return _create_approval_request_and_notify(
+        # Canonical clearance path: delegate to the runtime adapter (same as
+        # /v1/runtime/approvals) so ALL act.clearance.v2 contract fields —
+        # params_fingerprint, short_code, operator_message,
+        # audit_correlation_id, extensions — flow through and the proof is
+        # signed over the canonical fingerprint (payload_redacted + extensions).
+        require_runtime_capability(
             store=store,
             settings=resolved_settings,
-            request=request,
-            payload=approval_payload,
-            caller=_caller,
+            capability="approvals",
+            request_id=_request_id(request),
+            actor_id=payload.agent_id,
+            node_id=payload.node_id,
+            agent_id=payload.agent_id,
         )
+        result = runtime_adapter.request_clearance(
+            RuntimeClearanceRequest(
+                operation=payload.requested_tool,
+                risk_level=payload.risk_level,
+                summary=payload.summary,
+                payload_redacted=payload.payload_redacted,
+                actor_ref=payload.agent_id,
+                work_ref=payload.session_id,
+                expires_in_seconds=payload.expires_in_seconds,
+                scopes=payload.suggested_scopes,
+                action_ref=payload.action_id,
+                node_ref=payload.node_id,
+                risk_category=payload.risk_category,
+                risk_family=payload.risk_family,
+                capability=payload.capability,
+                operator_message=payload.operator_message,
+                audit_correlation_id=payload.audit_correlation_id,
+                short_code=payload.short_code,
+                params_fingerprint=payload.params_fingerprint,
+                extensions=payload.extensions,
+                aircraft=payload.aircraft,
+                requested_by=payload.requested_by,
+                resource_scope=payload.resource_scope,
+            ),
+            request_id=_request_id(request),
+        )
+        approval: ApprovalRequest = result.raw
+        # Preserve this route's APNs hint behavior (best-effort, never blocks).
+        try:
+            _dispatch_clearance_push(approval.model_dump())
+        except Exception:
+            pass
+        return approval
 
     @app.post("/v1/hermes/tools/approval_status", response_model=ApprovalStatusResponse)
     def hermes_approval_status(
@@ -2655,17 +2679,6 @@ def _create_mobile_notification(
             },
         )
     return Notification.model_validate(notification)
-
-
-def _approval_options_from_scopes(scopes: list[str]) -> list[str]:
-    scope_options = {
-        "once": "approve_once",
-        "session": "approve_for_session",
-        "agent": "approve_for_agent",
-        "permanent": "approve_permanent",
-    }
-    options = [scope_options[scope] for scope in scopes if scope in scope_options]
-    return [*options, "deny"] if options else ["deny"]
 
 
 def _expire_pairing_if_needed(store: SQLiteStore, pairing: dict[str, Any]) -> dict[str, Any]:
