@@ -27,6 +27,7 @@ ACT_CLEARANCE_RISK_FAMILY, ACT_CLEARANCE_TIMEOUT, ACT_CLEARANCE_POLL.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -109,6 +110,71 @@ def _post(path: str, payload: Dict[str, Any], timeout: float = 10.0) -> Dict[str
 
 def _get(path: str, timeout: float = 10.0) -> Dict[str, Any]:
     return _request("GET", path, None, timeout)
+
+
+# --- clearance contract (act.clearance.v2, mirrors ACT gateway) --------------
+#
+# Stdlib mirror of hermes_gateway.security.canonical_json/content_hash and
+# hermes_gateway.clearance_contract.build_params_fingerprint/build_short_code.
+# Kept byte-identical by a parity test in the ACT repo
+# (gateway/tests/test_act_clearance_plugin.py) — change BOTH sides together.
+
+_CONTRACT_VERSION = "act.clearance.v2"
+_PROOF_ALGORITHM = "Ed25519"
+_PROOF_CANONICALIZATION = "ACT-CLEARANCE-PROOF-V1"
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _content_hash(value: Any) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _params_fingerprint(payload_redacted: Dict[str, Any], extensions: Optional[Dict[str, Any]]) -> str:
+    return _content_hash({"payload_redacted": payload_redacted, "extensions": extensions or {}})
+
+
+def _derived_short_code(approval_id: str, params_fingerprint: str) -> str:
+    return hashlib.sha256(f"{approval_id}:{params_fingerprint}".encode()).hexdigest()[:10].upper()
+
+
+def _clearance_violation(
+    status: Dict[str, Any],
+    approval_id: str,
+    expected_fingerprint: str,
+) -> Optional[str]:
+    """Verify an 'approved' clearance envelope before treating it as allow.
+
+    Fail-closed binding checks the plugin can do with stdlib only: the returned
+    clearance must be bound to the EXACT params this plugin submitted
+    (canonical params_fingerprint), carry the short code derived from that
+    fingerprint (the plugin never requests a custom short code), and carry a
+    structurally valid tower proof for the expected contract. Full Ed25519
+    signature verification is performed by the signed-device surface (the
+    phone); a gateway that lies about these fields cannot make this plugin
+    execute a tool whose params it did not fingerprint itself.
+    """
+    fingerprint = status.get("params_fingerprint")
+    if fingerprint != expected_fingerprint:
+        return (
+            "params_fingerprint mismatch: clearance is not bound to the "
+            f"requested params (got {fingerprint!r})"
+        )
+    short_code = status.get("short_code")
+    if short_code != _derived_short_code(approval_id, expected_fingerprint):
+        return f"short_code mismatch: {short_code!r} is not derived from the canonical fingerprint"
+    if status.get("contract_version") != _CONTRACT_VERSION:
+        return f"unexpected contract_version {status.get('contract_version')!r}"
+    proof = status.get("proof")
+    if not isinstance(proof, dict) or not proof.get("signature"):
+        return "missing clearance proof"
+    if proof.get("algorithm") != _PROOF_ALGORITHM:
+        return f"unexpected proof algorithm {proof.get('algorithm')!r}"
+    if proof.get("canonicalization") != _PROOF_CANONICALIZATION:
+        return f"unexpected proof canonicalization {proof.get('canonicalization')!r}"
+    return None
 
 
 # --- redaction --------------------------------------------------------------
@@ -283,6 +349,15 @@ def _poll_question_answer(request_id: str, timeout_s: float, poll_s: float) -> O
 def _relay_clearance(tool_name: str, args: Any, session_id: str) -> Optional[Dict[str, str]]:
     risk_family = os.getenv("ACT_CLEARANCE_RISK_FAMILY", "external_effect").strip()
     timeout_s = _timeout()
+    payload_redacted = _redacted_payload(tool_name, args)
+    extensions: Dict[str, Dict[str, Any]] = {}
+    # Canonical fingerprint over the exact params being cleared (mirrors ACT's
+    # build_params_fingerprint). The gateway recomputes it server-side; we
+    # verify the returned clearance is bound to this exact value (fail-closed).
+    expected_fingerprint = _params_fingerprint(payload_redacted, extensions)
+    # short_code is intentionally NOT client-supplied: the plugin verifies the
+    # server-derived code sha256(approval_id:fingerprint)[:10], which binds the
+    # code the operator sees to the fingerprint we computed.
     try:
         created = _post(
             "/hermes/tools/approval_requested",
@@ -291,11 +366,14 @@ def _relay_clearance(tool_name: str, args: Any, session_id: str) -> Optional[Dic
                 "risk_level": "high",
                 "risk_family": risk_family,
                 "summary": f"Hermes agent requests to run '{tool_name}'.",
-                "payload_redacted": _redacted_payload(tool_name, args),
+                "payload_redacted": payload_redacted,
                 "agent_id": _agent_id(),
                 "session_id": session_id or "hermes_session",
                 "expires_in_seconds": int(timeout_s) + 30,
                 "suggested_scopes": ["once"],
+                "params_fingerprint": expected_fingerprint,
+                "extensions": extensions,
+                "operator_message": f"Hermes agent requests to run '{tool_name}'.",
             },
         )
     except (urllib.error.URLError, OSError, ValueError) as exc:
@@ -315,7 +393,10 @@ def _relay_clearance(tool_name: str, args: Any, session_id: str) -> Optional[Dic
             continue
         state = status.get("state")
         if state == "approved":
-            return None  # allow
+            violation = _clearance_violation(status, approval_id, expected_fingerprint)
+            if violation is not None:
+                return _block(f"clearance verification failed (fail-closed): {violation}")
+            return None  # allow — verified clearance
         if state in {"denied", "expired", "cancelled"}:
             return _block(f"operator {state} this action on their phone")
         time.sleep(poll_s)
