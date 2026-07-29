@@ -33,6 +33,7 @@ from .clearance_policy import (
     risk_family_from_request,
 )
 from .config import Settings
+from .grants import mint_grant_for_decision
 from .handoff import _require_bound_clearance
 from .handoff import engage_handoff as _engage_handoff
 from .ids import new_id
@@ -2832,6 +2833,20 @@ def _transition_approval(
         approved_by=approved_by,
         human_approved=human_approved,
     )
+    # Standing grants: a decision carrying a scope other than "once" is the
+    # operator saying "and don't ask me again for this". Persist that as an
+    # explicit, hard-expiring, revocable grant instead of leaving
+    # decision_scope as a write nothing ever reads.
+    grant: dict[str, Any] | None = None
+    if target_state == "approved":
+        grant = mint_grant_for_decision(
+            store=store,
+            settings=settings,
+            approval=approval,
+            scope=scope,
+            request_id=request_id,
+            decided_by_device_id=principal.device_id,
+        )
     event_type = {
         "approved": "approval_decision",
         "denied": "approval_decision",
@@ -2851,6 +2866,7 @@ def _transition_approval(
             "decision": decision,
             "scope": scope,
             "state": target_state,
+            "grant_id": grant["grant_id"] if grant else None,
             **decision_metadata(channel_decision),
         },
     )

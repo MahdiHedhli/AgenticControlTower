@@ -175,6 +175,118 @@ def test_once_scope_does_not_create_a_standing_grant(client: TestClient) -> None
     assert second["state"] == "pending"
 
 
+def audit_events(client: TestClient, paired: dict, event_type: str) -> list[dict]:
+    response = signed_request(
+        client,
+        "GET",
+        f"/v1/audit/events?event_type={event_type}",
+        private_key=paired["private_key"],
+        device_id=paired["device"]["device_id"],
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["audit_events"]
+
+
+# --------------------------------------------------------------------------
+# WS3 — write side: a scoped decision mints an auditable, hard-expiring grant
+# --------------------------------------------------------------------------
+
+
+def test_scoped_decision_emits_capability_grant_created(client: TestClient) -> None:
+    paired = pair_device(client)
+    approval = create_approval(client, action_id="act_mint", requested_tool="git_diff")
+    decide(client, paired, approval, scope="session")
+
+    events = audit_events(client, paired, "capability_grant_created")
+    assert len(events) == 1
+    payload = events[0]["payload_redacted"]
+    assert payload["scope"] == "session"
+    assert payload["requested_tool"] == "git_diff"
+    assert payload["source_approval_id"] == approval["approval_id"]
+    assert payload["params_fingerprint"] == approval["params_fingerprint"]
+    assert payload["expires_at"], "every grant must carry a hard expiry"
+    assert payload["ttl_seconds"] == 4 * 60 * 60
+
+
+def test_agent_and_permanent_grants_carry_their_own_expiry(client: TestClient) -> None:
+    paired = pair_device(client)
+    decide(
+        client,
+        paired,
+        create_approval(client, action_id="act_ttl_agent", requested_tool="tool_a"),
+        scope="agent",
+    )
+    decide(
+        client,
+        paired,
+        create_approval(client, action_id="act_ttl_perm", requested_tool="tool_b"),
+        scope="permanent",
+    )
+
+    ttls = {
+        event["payload_redacted"]["scope"]: event["payload_redacted"]["ttl_seconds"]
+        for event in audit_events(client, paired, "capability_grant_created")
+    }
+    assert ttls == {"agent": 24 * 60 * 60, "permanent": 30 * 24 * 60 * 60}
+    # "permanent" is a renewable standing order, never an unbounded one.
+    for event in audit_events(client, paired, "capability_grant_created"):
+        assert event["payload_redacted"]["expires_at"]
+
+
+def test_once_scope_mints_no_grant(client: TestClient) -> None:
+    paired = pair_device(client)
+    approval = create_approval(client, action_id="act_no_mint", requested_tool="git_diff")
+    decide(client, paired, approval, scope="once")
+
+    assert audit_events(client, paired, "capability_grant_created") == []
+    assert audit_events(client, paired, "capability_grant_refused") == []
+
+
+def test_destructive_risk_family_refuses_to_mint_a_grant(client: TestClient) -> None:
+    """Never-auto-satisfy families do not even get a dead grant row."""
+    paired = pair_device(client)
+    approval = create_approval(
+        client,
+        action_id="act_destructive",
+        requested_tool="rm_rf",
+        risk_family="destructive",
+        risk_level="high",
+    )
+    decide(client, paired, approval, scope="permanent")
+
+    assert audit_events(client, paired, "capability_grant_created") == []
+    refusals = audit_events(client, paired, "capability_grant_refused")
+    assert len(refusals) == 1
+    assert refusals[0]["payload_redacted"]["reason"] == "risk_family_excluded"
+
+
+def test_channel_mandating_risk_vector_refuses_to_mint_a_grant(
+    client: TestClient,
+) -> None:
+    """A class that mandates a mobile-signed decision must always prompt."""
+    paired = pair_device(client)
+    approval = create_approval(
+        client,
+        action_id="act_channel",
+        requested_tool="submit_form",
+        risk_vector={"submit_risk_class": "critical"},
+    )
+    decide(client, paired, approval, scope="agent")
+
+    assert audit_events(client, paired, "capability_grant_created") == []
+    refusals = audit_events(client, paired, "capability_grant_refused")
+    assert len(refusals) == 1
+    assert refusals[0]["payload_redacted"]["reason"] == "channel_requirement"
+
+
+def test_denied_decision_never_mints_a_grant(client: TestClient) -> None:
+    paired = pair_device(client)
+    approval = create_approval(client, action_id="act_denied", requested_tool="git_diff")
+    decide(client, paired, approval, scope="session", decision="deny")
+
+    assert audit_events(client, paired, "capability_grant_created") == []
+
+
 def test_auto_satisfied_approval_is_recorded_not_skipped(client: TestClient) -> None:
     """Every attempted action must still leave an approval record and an audit
     trail — auto-satisfying may never mean "no record"."""

@@ -248,14 +248,20 @@ def _alert_capability_registry(
     )
 
 
+# Canonical risk ladder. Public so other policy modules (standing grants) can
+# derive their thresholds from it instead of hardcoding a parallel list that
+# would silently drift when a family is added.
+RISK_FAMILY_RANKS: dict[str, int] = {
+    "observe": 0,
+    "read_only": 1,
+    "routine": 2,
+    "external_effect": 3,
+    "destructive": 4,
+    "credential_or_secret": 5,
+    "safety_critical": 6,
+    "irreversible": 7,
+}
+
+
 def _risk_rank(risk_family: str) -> int:
-    return {
-        "observe": 0,
-        "read_only": 1,
-        "routine": 2,
-        "external_effect": 3,
-        "destructive": 4,
-        "credential_or_secret": 5,
-        "safety_critical": 6,
-        "irreversible": 7,
-    }.get(risk_family, 3)
+    return RISK_FAMILY_RANKS.get(risk_family, 3)

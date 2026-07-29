@@ -55,6 +55,20 @@ class Settings:
     apns_team_id: str | None = None
     apns_topic: str = "app.act.agenticControlTower"
     apns_environment: str = "production"  # "production" or "sandbox"
+    # Standing approval grants ("approve for this session" / "allow forever").
+    # Every grant carries a HARD expiry — there is no unbounded standing
+    # authorization, not even at scope=permanent. Defaults are deliberately
+    # short enough that a forgotten grant lapses on its own:
+    #   session   —  4h, roughly one working session
+    #   agent     — 24h, a day of repeated invocations by one agent
+    #   permanent — 30d, "allow forever" as a renewable standing order
+    # ACT_STANDING_GRANTS_ENABLED=0 is the operator kill switch: with grants off
+    # the gateway neither mints nor consumes them, so every request prompts
+    # again regardless of what was granted earlier.
+    standing_grants_enabled: bool = True
+    grant_ttl_session_seconds: int = 4 * 60 * 60
+    grant_ttl_agent_seconds: int = 24 * 60 * 60
+    grant_ttl_permanent_seconds: int = 30 * 24 * 60 * 60
     # Seed demo agents/sessions for an empty dashboard. Disable in real
     # deployments so the fleet shows only real (bridge-fed) agents.
     seed_mock_data: bool = True
@@ -140,6 +154,23 @@ class Settings:
             apns_topic=os.getenv("APNS_TOPIC", cls.apns_topic),
             apns_environment=os.getenv("APNS_ENVIRONMENT", cls.apns_environment),
             seed_mock_data=_bool_env("ACT_SEED_MOCK_DATA", cls.seed_mock_data),
+            standing_grants_enabled=_bool_env(
+                "ACT_STANDING_GRANTS_ENABLED", cls.standing_grants_enabled
+            ),
+            grant_ttl_session_seconds=int(
+                os.getenv(
+                    "ACT_GRANT_TTL_SESSION_SECONDS", str(cls.grant_ttl_session_seconds)
+                )
+            ),
+            grant_ttl_agent_seconds=int(
+                os.getenv("ACT_GRANT_TTL_AGENT_SECONDS", str(cls.grant_ttl_agent_seconds))
+            ),
+            grant_ttl_permanent_seconds=int(
+                os.getenv(
+                    "ACT_GRANT_TTL_PERMANENT_SECONDS",
+                    str(cls.grant_ttl_permanent_seconds),
+                )
+            ),
         )
 
     @property
