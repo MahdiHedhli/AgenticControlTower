@@ -815,3 +815,28 @@ def test_expired_grant_is_absent_from_the_live_listing(client: TestClient) -> No
     assert [item["grant_id"] for item in list_grants(client, paired, "?include_inactive=true")] == [
         grant_id
     ]
+
+
+def test_auto_satisfied_clearance_can_be_reserved_and_committed(
+    client: TestClient,
+) -> None:
+    """A cleared request has to be usable by the consumer that asked for it.
+    The two-phase consume seam (reserve -> commit) must accept an
+    auto-satisfied clearance exactly like a human-approved one — otherwise the
+    grant would clear requests nothing could execute."""
+    paired = pair_device(client)
+    first = create_approval(client, action_id="act_2pc_1", requested_tool="git_show")
+    decide(client, paired, first, scope="session")
+
+    second = create_approval(client, action_id="act_2pc_2", requested_tool="git_show")
+    assert second["state"] == "approved"
+
+    reserved = client.post(f"/v1/runtime/approvals/{second['approval_id']}/reserve")
+    assert reserved.status_code == 200, reserved.text
+    assert reserved.json()["state"] == "reserved"
+
+    committed = client.post(f"/v1/runtime/approvals/{second['approval_id']}/commit")
+    assert committed.status_code == 200, committed.text
+    assert committed.json()["state"] == "committed"
+    # One-time consumption still holds.
+    assert client.post(f"/v1/runtime/approvals/{second['approval_id']}/reserve").status_code == 409

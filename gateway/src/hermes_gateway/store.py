@@ -11,7 +11,6 @@ from .security import content_hash, expires_in, hash_token, now_utc, parse_utc, 
 from .storage.identity import IdentityStoreMixin
 from .storage.observability import ObservabilityStoreMixin
 
-
 # Standing-grant scopes, narrowest first. "once" is absent on purpose: it is
 # the no-standing-authority scope and never mints a grant.
 GRANT_SCOPE_SPECIFICITY: dict[str, int] = {
