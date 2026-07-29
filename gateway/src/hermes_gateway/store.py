@@ -12,6 +12,15 @@ from .storage.identity import IdentityStoreMixin
 from .storage.observability import ObservabilityStoreMixin
 
 
+# Standing-grant scopes, narrowest first. "once" is absent on purpose: it is
+# the no-standing-authority scope and never mints a grant.
+GRANT_SCOPE_SPECIFICITY: dict[str, int] = {
+    "session": 0,
+    "agent": 1,
+    "permanent": 2,
+}
+
+
 def _ensure_column(
     db: sqlite3.Connection,
     table_name: str,
@@ -384,6 +393,36 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
                     expires_at TEXT
                 );
 
+                -- Standing approval grants ("approve for this session" /
+                -- "allow forever"). Deliberately NOT capability_grants: that
+                -- table gates whole API surfaces (approvals/tui/tua/voice/...)
+                -- through has_active_capability_grant, whose matcher ignores
+                -- any column it does not know about. Adding per-tool clearance
+                -- rows there would make surface gates match rows they were
+                -- never designed for. A separate table keeps the two authority
+                -- kinds from leaking into each other.
+                CREATE TABLE IF NOT EXISTS approval_grants (
+                    grant_id TEXT PRIMARY KEY,
+                    node_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    session_id TEXT,
+                    requested_tool TEXT NOT NULL,
+                    capability TEXT,
+                    params_fingerprint TEXT,
+                    risk_family TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    source_approval_id TEXT NOT NULL,
+                    granted_by_device_id TEXT,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    revoked_at TEXT,
+                    revoked_by TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_approval_grants_lookup
+                    ON approval_grants (node_id, requested_tool, state);
+
                 CREATE TABLE IF NOT EXISTS capability_risk_registry (
                     entry_id TEXT PRIMARY KEY,
                     node_id TEXT NOT NULL,
@@ -562,6 +601,22 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
                 "risk_family",
                 "TEXT NOT NULL DEFAULT 'external_effect'",
             )
+            # Standing approval grants (additive). The CREATE TABLE above is
+            # already idempotent for fresh databases; these keep an existing
+            # production database safe if the table predates a column. Every
+            # column is nullable or carries a DEFAULT, so ALTER TABLE ... ADD
+            # COLUMN never rewrites or invalidates existing rows.
+            self._ensure_column(db, "approval_grants", "capability", "TEXT")
+            self._ensure_column(db, "approval_grants", "params_fingerprint", "TEXT")
+            self._ensure_column(
+                db,
+                "approval_grants",
+                "risk_family",
+                "TEXT NOT NULL DEFAULT 'external_effect'",
+            )
+            self._ensure_column(db, "approval_grants", "granted_by_device_id", "TEXT")
+            self._ensure_column(db, "approval_grants", "revoked_at", "TEXT")
+            self._ensure_column(db, "approval_grants", "revoked_by", "TEXT")
 
     def _ensure_column(
         self, db: sqlite3.Connection, table_name: str, column_name: str, definition: str
@@ -2259,6 +2314,186 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
                 continue
             return True
         return False
+
+    # ------------------------------------------------------------------
+    # Standing approval grants
+    # ------------------------------------------------------------------
+
+    def create_approval_grant(self, grant: dict[str, Any]) -> dict[str, Any]:
+        """Persist a standing grant. ``expires_at`` is mandatory — an unbounded
+        standing authorization is never acceptable, not even for scope
+        ``permanent``."""
+        expires_at = grant.get("expires_at")
+        if not expires_at:
+            raise ValueError(
+                "approval grants require a hard expires_at; refusing to mint an "
+                "unbounded standing authorization"
+            )
+        scope = grant["scope"]
+        if scope not in GRANT_SCOPE_SPECIFICITY:
+            raise ValueError(f"unsupported grant scope: {scope}")
+        grant_id = grant.get("grant_id") or new_id("grant")
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO approval_grants (
+                    grant_id, node_id, agent_id, session_id, requested_tool, capability,
+                    params_fingerprint, risk_family, scope, state, source_approval_id,
+                    granted_by_device_id, created_at, expires_at, revoked_at, revoked_by
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                """,
+                (
+                    grant_id,
+                    grant["node_id"],
+                    grant["agent_id"],
+                    grant.get("session_id"),
+                    grant["requested_tool"],
+                    grant.get("capability"),
+                    grant.get("params_fingerprint"),
+                    grant.get("risk_family", "external_effect"),
+                    scope,
+                    grant.get("state", "active"),
+                    grant["source_approval_id"],
+                    grant.get("granted_by_device_id"),
+                    grant.get("created_at") or utc_iso(),
+                    expires_at,
+                ),
+            )
+        return self.get_approval_grant(grant_id)
+
+    def get_approval_grant(self, grant_id: str) -> dict[str, Any]:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM approval_grants WHERE grant_id = ?",
+                (grant_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(grant_id)
+        return dict(row)
+
+    def list_approval_grants(
+        self,
+        *,
+        node_id: str | None = None,
+        agent_id: str | None = None,
+        state: str | None = None,
+        include_expired: bool = True,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM approval_grants"
+        args: list[Any] = []
+        where: list[str] = []
+        if node_id:
+            where.append("node_id = ?")
+            args.append(node_id)
+        if agent_id:
+            where.append("agent_id = ?")
+            args.append(agent_id)
+        if state:
+            where.append("state = ?")
+            args.append(state)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY created_at DESC"
+        with self.connect() as db:
+            rows = [dict(row) for row in db.execute(sql, tuple(args)).fetchall()]
+        if include_expired:
+            return rows
+        now = now_utc()
+        return [row for row in rows if parse_utc(row["expires_at"]) > now]
+
+    def revoke_approval_grant(
+        self,
+        grant_id: str,
+        *,
+        revoked_by: str,
+    ) -> dict[str, Any]:
+        """Withdraw a standing grant. Idempotent-safe: raises KeyError when the
+        grant does not exist, ValueError when it is already revoked."""
+        grant = self.get_approval_grant(grant_id)
+        if grant["state"] != "active":
+            raise ValueError(f"grant is not active: {grant['state']}")
+        with self.connect() as db:
+            db.execute(
+                """
+                UPDATE approval_grants
+                SET state = 'revoked', revoked_at = ?, revoked_by = ?
+                WHERE grant_id = ?
+                """,
+                (utc_iso(), revoked_by, grant_id),
+            )
+        return self.get_approval_grant(grant_id)
+
+    def find_matching_grant(
+        self,
+        *,
+        node_id: str,
+        agent_id: str,
+        session_id: str,
+        requested_tool: str,
+        params_fingerprint: str,
+        risk_family: str,
+    ) -> dict[str, Any] | None:
+        """Narrowest live standing grant covering this request, or ``None``.
+
+        Match rules (deliberately asymmetric — see docs):
+
+        * ``session`` — node + agent + session + tool + **params_fingerprint**.
+          Strict on purpose: "approve for this session" on one command must not
+          clear a *different* command in that session.
+        * ``agent``   — node + agent + tool. No fingerprint: the whole point is
+          to cover repeated invocations with differing parameters.
+        * ``permanent`` — node + tool. No agent, no session, no fingerprint.
+
+        ``risk_family`` must match exactly in every case. A grant minted while a
+        tool was classified ``routine`` must not silently keep clearing it after
+        the tool is reclassified — that direction of drift re-prompts.
+
+        Only ``state = 'active'`` and unexpired rows are considered. Ties are
+        broken narrowest-first (session > agent > permanent), then newest-first.
+        """
+        with self.connect() as db:
+            rows = [
+                dict(row)
+                for row in db.execute(
+                    """
+                    SELECT * FROM approval_grants
+                    WHERE state = 'active'
+                      AND node_id = ?
+                      AND requested_tool = ?
+                      AND risk_family = ?
+                    """,
+                    (node_id, requested_tool, risk_family),
+                ).fetchall()
+            ]
+        now = now_utc()
+        candidates: list[dict[str, Any]] = []
+        for grant in rows:
+            if parse_utc(grant["expires_at"]) <= now:
+                continue
+            scope = grant["scope"]
+            if scope == "session":
+                if grant["agent_id"] != agent_id:
+                    continue
+                if grant["session_id"] != session_id:
+                    continue
+                if grant["params_fingerprint"] != params_fingerprint:
+                    continue
+            elif scope == "agent":
+                if grant["agent_id"] != agent_id:
+                    continue
+            elif scope == "permanent":
+                pass
+            else:
+                continue
+            candidates.append(grant)
+        if not candidates:
+            return None
+        # Stable sort, applied newest-first then narrowest-first, so the result
+        # is "narrowest scope, and within that the most recent grant".
+        candidates.sort(key=lambda grant: grant["created_at"], reverse=True)
+        candidates.sort(key=lambda grant: GRANT_SCOPE_SPECIFICITY[grant["scope"]])
+        return candidates[0]
 
     def _assistance_request_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
         request = dict(row)
