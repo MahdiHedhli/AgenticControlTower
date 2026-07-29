@@ -470,6 +470,37 @@ class LocalTerminalApprovalDecisionRequest(StrictModel):
     scope: ApprovalScope = "once"
 
 
+# Standing approval grants. "once" is absent from the scope literal on purpose:
+# it is the scope that mints no grant, so a grant can never carry it.
+ApprovalGrantScope = Literal["session", "agent", "permanent"]
+ApprovalGrantState = Literal["active", "revoked"]
+
+
+class ApprovalGrant(BaseModel):
+    """A standing "don't ask me again" authorization.
+
+    ``expires_at`` is non-optional: every grant carries a hard expiry, so there
+    is no shape of this record that represents unbounded standing authority.
+    """
+
+    grant_id: str
+    node_id: str
+    agent_id: str
+    session_id: str | None = None
+    requested_tool: str
+    capability: str | None = None
+    params_fingerprint: str | None = None
+    risk_family: RiskFamily = "external_effect"
+    scope: ApprovalGrantScope
+    state: ApprovalGrantState
+    source_approval_id: str
+    granted_by_device_id: str | None = None
+    created_at: datetime
+    expires_at: datetime
+    revoked_at: datetime | None = None
+    revoked_by: str | None = None
+
+
 class UpdateAgentTrustContextRequest(StrictModel):
     deployment_trust_context: DeploymentTrustContext
 

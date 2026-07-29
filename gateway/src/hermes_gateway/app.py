@@ -58,6 +58,7 @@ from .schemas import (
     Agent,
     ApprovalDecisionRequest,
     ApprovalDecisionResponse,
+    ApprovalGrant,
     ApprovalPolicyProposal,
     ApprovalRequest,
     ApprovalResponse,
@@ -1185,6 +1186,97 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             decision=None,
             scope=None,
         )
+
+    # Standing approval grants. Same auth posture as deciding an approval —
+    # a signed device plus the "approvals" capability gate — because a standing
+    # grant IS approval authority. Deliberately not stricter than granting:
+    # revocation is the safety valve, and a valve the granting device cannot
+    # reach is not a valve.
+    @app.get("/v1/approval-grants")
+    def list_approval_grants(
+        request: Request,
+        node_id: str | None = None,
+        agent_id: str | None = None,
+        include_inactive: bool = False,
+        device: VerifiedDevice = signed_device_dependency,
+    ) -> dict[str, list[ApprovalGrant]]:
+        require_device_capability(
+            store=store,
+            settings=resolved_settings,
+            device=device,
+            capability="approvals",
+            request_id=_request_id(request),
+            node_id=node_id or resolved_settings.node_id,
+            agent_id=agent_id,
+        )
+        # Default is the live set — what is actually clearing requests right
+        # now. Lapsed and revoked rows are history, available on request.
+        grants = store.list_approval_grants(
+            node_id=node_id,
+            agent_id=agent_id,
+            state=None if include_inactive else "active",
+            include_expired=include_inactive,
+        )
+        return {
+            "approval_grants": [ApprovalGrant.model_validate(grant) for grant in grants]
+        }
+
+    @app.post("/v1/approval-grants/{grant_id}/revoke", response_model=ApprovalGrant)
+    def revoke_approval_grant(
+        grant_id: str,
+        request: Request,
+        device: VerifiedDevice = signed_device_dependency,
+    ) -> ApprovalGrant:
+        try:
+            grant = store.get_approval_grant(grant_id)
+        except KeyError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "grant not found") from exc
+        require_device_capability(
+            store=store,
+            settings=resolved_settings,
+            device=device,
+            capability="approvals",
+            request_id=_request_id(request),
+            node_id=grant["node_id"],
+            agent_id=grant["agent_id"],
+        )
+        try:
+            revoked = store.revoke_approval_grant(grant_id, revoked_by=device.device_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "grant is not active"
+            ) from exc
+        # Withdrawing authority is as auditable as granting it.
+        store.append_audit_event(
+            event_type="capability_grant_revoked",
+            actor_type="device",
+            actor_id=device.device_id,
+            node_id=revoked["node_id"],
+            agent_id=revoked["agent_id"],
+            session_id=revoked.get("session_id"),
+            approval_id=revoked["source_approval_id"],
+            request_id=_request_id(request),
+            payload_redacted={
+                "grant_id": revoked["grant_id"],
+                "scope": revoked["scope"],
+                "requested_tool": revoked["requested_tool"],
+                "risk_family": revoked["risk_family"],
+                "source_approval_id": revoked["source_approval_id"],
+                "revoked_at": revoked["revoked_at"],
+            },
+        )
+        store.create_event(
+            node_id=revoked["node_id"],
+            agent_id=revoked["agent_id"],
+            session_id=revoked.get("session_id"),
+            event_type="capability_grant.revoked",
+            payload={
+                "grant_id": revoked["grant_id"],
+                "scope": revoked["scope"],
+                "requested_tool": revoked["requested_tool"],
+            },
+        )
+        return ApprovalGrant.model_validate(revoked)
 
     @app.post(
         "/v1/local-terminal/approvals/{approval_id}/decisions",

@@ -623,3 +623,195 @@ def test_auto_satisfied_request_is_audited_after_being_requested(
     assert satisfied[0]["payload_redacted"]["human_approved"] is False
     assert satisfied[0]["actor_type"] == "gateway"
     assert satisfied[0]["actor_id"] == "standing_grant"
+
+
+# --------------------------------------------------------------------------
+# WS5 — listing and revocation over HTTP
+# --------------------------------------------------------------------------
+
+
+def list_grants(client: TestClient, paired: dict, query: str = "") -> list[dict]:
+    response = signed_request(
+        client,
+        "GET",
+        f"/v1/approval-grants{query}",
+        private_key=paired["private_key"],
+        device_id=paired["device"]["device_id"],
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["approval_grants"]
+
+
+def revoke_grant(client: TestClient, paired: dict, grant_id: str) -> Any:
+    return signed_request(
+        client,
+        "POST",
+        f"/v1/approval-grants/{grant_id}/revoke",
+        private_key=paired["private_key"],
+        device_id=paired["device"]["device_id"],
+        json_body={},
+    )
+
+
+def test_listing_shows_the_live_grant_with_scope_expiry_and_source(
+    client: TestClient,
+) -> None:
+    paired = pair_device(client)
+    approval = create_approval(client, action_id="act_list_1", requested_tool="git_diff")
+    decide(client, paired, approval, scope="agent")
+
+    grants = list_grants(client, paired)
+    assert len(grants) == 1
+    grant = grants[0]
+    assert grant["scope"] == "agent"
+    assert grant["state"] == "active"
+    assert grant["requested_tool"] == "git_diff"
+    assert grant["risk_family"] == GRANTABLE_RISK_FAMILY
+    assert grant["source_approval_id"] == approval["approval_id"]
+    assert grant["expires_at"], "a listed grant must show its hard expiry"
+    assert grant["granted_by_device_id"] == paired["device"]["device_id"]
+
+
+def test_listing_requires_a_signed_device(client: TestClient) -> None:
+    """Same posture as the neighbouring approval routes — never anonymous."""
+    assert client.get("/v1/approval-grants").status_code == 401
+
+
+def test_listing_requires_the_approvals_capability(client: TestClient) -> None:
+    read_only = pair_device(client, requested_permissions=["read_state"])
+    response = signed_request(
+        client,
+        "GET",
+        "/v1/approval-grants",
+        private_key=read_only["private_key"],
+        device_id=read_only["device"]["device_id"],
+    )
+    assert response.status_code == 403
+
+
+def test_revocation_requires_the_approvals_capability(client: TestClient) -> None:
+    paired = pair_device(client)
+    decide(
+        client,
+        paired,
+        create_approval(client, action_id="act_perm_guard", requested_tool="git_diff"),
+        scope="agent",
+    )
+    grant_id = list_grants(client, paired)[0]["grant_id"]
+
+    read_only = pair_device(client, requested_permissions=["read_state"])
+    assert revoke_grant(client, read_only, grant_id).status_code == 403
+    # ...and the grant is untouched.
+    assert list_grants(client, paired)[0]["state"] == "active"
+
+
+def test_revocation_takes_effect_immediately(client: TestClient) -> None:
+    """The point of revocation: the very next request prompts again."""
+    paired = pair_device(client)
+    first = create_approval(client, action_id="act_revoke_1", requested_tool="git_clean")
+    decide(client, paired, first, scope="agent")
+
+    second = create_approval(client, action_id="act_revoke_2", requested_tool="git_clean")
+    assert second["state"] == "approved", "sanity: the grant clears before revocation"
+
+    grant_id = list_grants(client, paired)[0]["grant_id"]
+    response = revoke_grant(client, paired, grant_id)
+    assert response.status_code == 200, response.text
+    revoked = response.json()
+    assert revoked["state"] == "revoked"
+    assert revoked["revoked_at"]
+    assert revoked["revoked_by"] == paired["device"]["device_id"]
+
+    third = create_approval(client, action_id="act_revoke_3", requested_tool="git_clean")
+    assert third["state"] == "pending"
+
+
+def test_revoked_grant_leaves_the_live_listing_but_stays_in_history(
+    client: TestClient,
+) -> None:
+    paired = pair_device(client)
+    decide(
+        client,
+        paired,
+        create_approval(client, action_id="act_hist", requested_tool="git_gc"),
+        scope="permanent",
+    )
+    grant_id = list_grants(client, paired)[0]["grant_id"]
+    assert revoke_grant(client, paired, grant_id).status_code == 200
+
+    assert list_grants(client, paired) == []
+    history = list_grants(client, paired, "?include_inactive=true")
+    assert [item["grant_id"] for item in history] == [grant_id]
+    assert history[0]["state"] == "revoked"
+
+
+def test_revocation_is_audited(client: TestClient) -> None:
+    paired = pair_device(client)
+    approval = create_approval(client, action_id="act_rev_audit", requested_tool="git_gc")
+    decide(client, paired, approval, scope="agent")
+    grant_id = list_grants(client, paired)[0]["grant_id"]
+    assert revoke_grant(client, paired, grant_id).status_code == 200
+
+    events = audit_events(client, paired, "capability_grant_revoked")
+    assert len(events) == 1
+    payload = events[0]["payload_redacted"]
+    assert payload["grant_id"] == grant_id
+    assert payload["scope"] == "agent"
+    assert payload["source_approval_id"] == approval["approval_id"]
+    assert events[0]["actor_id"] == paired["device"]["device_id"]
+
+
+def test_revoking_twice_conflicts_and_unknown_grant_is_404(client: TestClient) -> None:
+    paired = pair_device(client)
+    decide(
+        client,
+        paired,
+        create_approval(client, action_id="act_rev_twice", requested_tool="git_gc"),
+        scope="agent",
+    )
+    grant_id = list_grants(client, paired)[0]["grant_id"]
+
+    assert revoke_grant(client, paired, grant_id).status_code == 200
+    assert revoke_grant(client, paired, grant_id).status_code == 409
+    assert revoke_grant(client, paired, "grant_does_not_exist").status_code == 404
+
+
+def test_listing_can_filter_by_agent(client: TestClient) -> None:
+    paired = pair_device(client)
+    decide(
+        client,
+        paired,
+        create_approval(
+            client, action_id="act_f_a", agent_id="agent_a", requested_tool="git_gc"
+        ),
+        scope="agent",
+    )
+    decide(
+        client,
+        paired,
+        create_approval(
+            client, action_id="act_f_b", agent_id="agent_b", requested_tool="git_gc"
+        ),
+        scope="agent",
+    )
+
+    assert len(list_grants(client, paired)) == 2
+    only_b = list_grants(client, paired, "?agent_id=agent_b")
+    assert [item["agent_id"] for item in only_b] == ["agent_b"]
+
+
+def test_expired_grant_is_absent_from_the_live_listing(client: TestClient) -> None:
+    paired = pair_device(client)
+    decide(
+        client,
+        paired,
+        create_approval(client, action_id="act_exp_list", requested_tool="git_gc"),
+        scope="agent",
+    )
+    grant_id = list_grants(client, paired)[0]["grant_id"]
+    rewind_grant_expiry(client, grant_id)
+
+    assert list_grants(client, paired) == []
+    assert [item["grant_id"] for item in list_grants(client, paired, "?include_inactive=true")] == [
+        grant_id
+    ]
