@@ -19,7 +19,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from .capability_registry import RISK_FAMILY_RANKS
-from .clearance_policy import required_channels_for_risk_vector
+from .clearance_policy import (
+    required_channels_for_request,
+    required_channels_for_risk_family,
+)
 from .config import Settings
 from .security import expires_in
 from .store import SQLiteStore
@@ -31,12 +34,28 @@ STANDING_GRANT_AUTHORITY = "standing_grant"
 #: Scopes that mint a standing grant. ``once`` is absent by design.
 GRANTABLE_SCOPES: frozenset[str] = frozenset({"session", "agent", "permanent"})
 
-#: Risk families that may never be satisfied by a standing grant, derived from
-#: the canonical ladder in capability_registry rather than duplicated, so a
-#: newly added high family is excluded automatically.
+#: Risk families excluded by the *risk-ladder* floor, derived from the canonical
+#: ladder in capability_registry rather than duplicated, so a newly added high
+#: family is excluded automatically.
+#:
+#: NOT the whole exclusion set. The channel policy excludes more (every family in
+#: ``MOBILE_MANDATORY_RISK_FAMILIES`` — notably ``external_effect``, which ranks
+#: *below* this floor yet still requires a human on a mobile-signed channel).
+#: :func:`standing_grant_block_reason` is the only complete answer; see
+#: :data:`GRANT_UNGRANTABLE_RISK_FAMILIES` for the derived union.
 _EXCLUSION_FLOOR = RISK_FAMILY_RANKS["destructive"]
 GRANT_EXCLUDED_RISK_FAMILIES: frozenset[str] = frozenset(
     family for family, rank in RISK_FAMILY_RANKS.items() if rank >= _EXCLUSION_FLOOR
+)
+
+#: Every family a standing grant can never satisfy, both halves of the policy
+#: combined. Derived, never enumerated: a family added to either the risk ladder
+#: above the floor or to MOBILE_MANDATORY_RISK_FAMILIES lands here for free.
+GRANT_UNGRANTABLE_RISK_FAMILIES: frozenset[str] = frozenset(
+    family
+    for family in RISK_FAMILY_RANKS
+    if family in GRANT_EXCLUDED_RISK_FAMILIES
+    or required_channels_for_risk_family(family)
 )
 
 
@@ -85,9 +104,16 @@ def standing_grant_block_reason(
         return "standing_grants_disabled"
     if risk_family_blocks_standing_grant(risk_family):
         return "risk_family_excluded"
-    if required_channels_for_risk_vector(risk_vector):
-        # This risk class mandates a specific (mobile-signed) decision channel.
-        # A standing grant is not that channel, so it must always prompt.
+    if required_channels_for_request(
+        risk_family=risk_family,
+        risk_vector=risk_vector,
+    ):
+        # The channel policy mandates a specific (mobile-signed, human) decision
+        # channel for this request — because of its risk family, its per-surface
+        # risk vector, or both. A stored grant is not a human on a channel, so it
+        # must always prompt. Routed through the canonical combined entry point so
+        # this gate enforces the WHOLE policy, not one half of it: adding a family
+        # to MOBILE_MANDATORY_RISK_FAMILIES blocks auto-satisfy here with no edit.
         return "channel_requirement"
     return None
 

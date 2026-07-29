@@ -17,6 +17,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from conftest import pair_device, signed_request
+from hermes_gateway import clearance_policy
 from hermes_gateway.app import create_app
 from hermes_gateway.clearance_contract import (
     ClearanceProofMaterial,
@@ -25,12 +26,23 @@ from hermes_gateway.clearance_contract import (
     tower_public_key_b64,
     verify_clearance_proof,
 )
+from hermes_gateway.clearance_policy import (
+    LOW_RISK_FAMILIES,
+    MOBILE_MANDATORY_RISK_FAMILIES,
+    required_channels_for_request,
+)
 from hermes_gateway.config import Settings
+from hermes_gateway.grants import (
+    GRANT_UNGRANTABLE_RISK_FAMILIES,
+    standing_grant_block_reason,
+)
 
-# The gate scenarios deliberately use a risk family OUTSIDE the never-auto-satisfy
-# set (destructive / credential_or_secret / safety_critical / irreversible), which
-# is exercised separately by the fail-closed negatives.
-GRANTABLE_RISK_FAMILY = "external_effect"
+# The gate scenarios deliberately use a risk family a standing grant MAY satisfy.
+# That is only the low-risk tier: every family in MOBILE_MANDATORY_RISK_FAMILIES
+# (external_effect / destructive / credential_or_secret / safety_critical /
+# irreversible) requires a human on a mobile-signed channel and can never be
+# auto-satisfied — exercised separately by the fail-closed negatives.
+GRANTABLE_RISK_FAMILY = "routine"
 
 
 def create_approval(
@@ -840,3 +852,193 @@ def test_auto_satisfied_clearance_can_be_reserved_and_committed(
     assert committed.json()["state"] == "committed"
     # One-time consumption still holds.
     assert client.post(f"/v1/runtime/approvals/{second['approval_id']}/reserve").status_code == 409
+
+
+# --------------------------------------------------------------------------
+# WS6 — the fail-closed gate must enforce the WHOLE channel policy, not the
+# risk_vector half of it.
+#
+# Regression: standing_grant_block_reason consulted only
+# required_channels_for_risk_vector, so ``external_effect`` — which ranks BELOW
+# the destructive exclusion floor yet is in MOBILE_MANDATORY_RISK_FAMILIES —
+# slipped through both halves and came back approved / approved_by=standing_grant
+# / human_approved=False, bypassing a policy that says a human on a mobile-signed
+# channel must decide it.
+# --------------------------------------------------------------------------
+
+
+def plant_grant(
+    client: TestClient,
+    *,
+    scope: str,
+    risk_family: str,
+    requested_tool: str,
+    agent_id: str | None = "agent_mock",
+    session_id: str | None = None,
+    params_fingerprint: str | None = None,
+) -> dict:
+    """Insert a live grant straight into the store.
+
+    Deliberately bypasses the write side: the mint gate now refuses these, so a
+    row like this can only arrive by predating a policy change or by a
+    hand-edited database — exactly the case the read side must survive.
+    """
+    return client.app.state.store.create_approval_grant(
+        {
+            "node_id": "node_test",
+            "agent_id": agent_id or "agent_mock",
+            "session_id": session_id,
+            "requested_tool": requested_tool,
+            "params_fingerprint": params_fingerprint,
+            "risk_family": risk_family,
+            "scope": scope,
+            "state": "active",
+            "source_approval_id": "appr_planted",
+            "expires_at": "2099-01-01T00:00:00Z",
+        }
+    )
+
+
+def test_external_effect_is_never_auto_satisfied_by_a_live_agent_grant(
+    client: TestClient,
+) -> None:
+    """The reviewer's probe. A live agent-scope grant matching an
+    ``external_effect`` request must NOT clear it: the request stays pending, no
+    auto-satisfaction is recorded, and the refusal is audited."""
+    paired = pair_device(client)
+    plant_grant(
+        client,
+        scope="agent",
+        risk_family="external_effect",
+        requested_tool="send_email",
+    )
+
+    approval = create_approval(
+        client,
+        action_id="act_ext_agent",
+        requested_tool="send_email",
+        risk_family="external_effect",
+        risk_level="high",
+    )
+
+    assert approval["state"] == "pending"
+    assert approval.get("approved_by") != "standing_grant"
+    assert not approval.get("human_approved")
+    assert audit_events(client, paired, "approval_auto_satisfied") == []
+    refusals = audit_events(client, paired, "approval_auto_satisfy_refused")
+    assert len(refusals) == 1
+    assert refusals[0]["payload_redacted"]["reason"] == "channel_requirement"
+    assert refusals[0]["payload_redacted"]["risk_family"] == "external_effect"
+
+
+def test_external_effect_is_never_auto_satisfied_by_a_live_permanent_grant(
+    client: TestClient,
+) -> None:
+    """Same for the broadest scope — ``permanent`` keys on node + tool only, so
+    it is the widest hole an unenforced half of the policy would open."""
+    paired = pair_device(client)
+    plant_grant(
+        client,
+        scope="permanent",
+        risk_family="external_effect",
+        requested_tool="post_webhook",
+    )
+
+    approval = create_approval(
+        client,
+        action_id="act_ext_perm",
+        agent_id="agent_other",
+        requested_tool="post_webhook",
+        risk_family="external_effect",
+        risk_level="high",
+    )
+
+    assert approval["state"] == "pending"
+    assert audit_events(client, paired, "approval_auto_satisfied") == []
+    refusals = audit_events(client, paired, "approval_auto_satisfy_refused")
+    assert len(refusals) == 1
+    assert refusals[0]["payload_redacted"]["reason"] == "channel_requirement"
+
+
+def test_external_effect_decision_refuses_to_mint_a_grant(client: TestClient) -> None:
+    """Write side of the same gate: "allow forever" on an ``external_effect``
+    action must not persist standing authority in the first place."""
+    paired = pair_device(client)
+    approval = create_approval(
+        client,
+        action_id="act_ext_mint",
+        requested_tool="send_email",
+        risk_family="external_effect",
+        risk_level="high",
+    )
+    decide(client, paired, approval, scope="permanent")
+
+    assert audit_events(client, paired, "capability_grant_created") == []
+    refusals = audit_events(client, paired, "capability_grant_refused")
+    assert len(refusals) == 1
+    assert refusals[0]["payload_redacted"]["reason"] == "channel_requirement"
+
+
+def test_every_mobile_mandatory_family_blocks_a_standing_grant() -> None:
+    """No family that requires a human on a mobile-signed channel may be
+    auto-satisfiable, and an unrecognised family still blocks."""
+    settings = Settings(
+        node_id="node_test",
+        node_display_name="Test",
+        node_fingerprint="fp",
+        gateway_base_url="http://127.0.0.1:8787/v1",
+        database_path=":memory:",
+    )
+    for family in MOBILE_MANDATORY_RISK_FAMILIES:
+        reason = standing_grant_block_reason(
+            settings=settings, risk_family=family, risk_vector=None
+        )
+        assert reason is not None, family
+        assert required_channels_for_request(risk_family=family) == ("mobile_signed",)
+    assert MOBILE_MANDATORY_RISK_FAMILIES <= set(GRANT_UNGRANTABLE_RISK_FAMILIES)
+    assert (
+        standing_grant_block_reason(
+            settings=settings, risk_family="not_a_family", risk_vector=None
+        )
+        is not None
+    )
+    # The low tier stays grantable, otherwise the feature is dead rather than safe.
+    for family in LOW_RISK_FAMILIES:
+        assert (
+            standing_grant_block_reason(
+                settings=settings, risk_family=family, risk_vector=None
+            )
+            is None
+        ), family
+
+
+def test_gate_tracks_the_mobile_mandatory_set_without_editing_grants(
+    monkeypatch: Any,
+) -> None:
+    """Derived, not enumerated: adding a family to MOBILE_MANDATORY_RISK_FAMILIES
+    must block auto-satisfy with no edit to grants.py. ``routine`` is grantable
+    today; moved into the mobile-mandatory set it must stop being grantable."""
+    settings = Settings(
+        node_id="node_test",
+        node_display_name="Test",
+        node_fingerprint="fp",
+        gateway_base_url="http://127.0.0.1:8787/v1",
+        database_path=":memory:",
+    )
+    assert (
+        standing_grant_block_reason(
+            settings=settings, risk_family="routine", risk_vector=None
+        )
+        is None
+    )
+    monkeypatch.setattr(
+        clearance_policy,
+        "MOBILE_MANDATORY_RISK_FAMILIES",
+        clearance_policy.MOBILE_MANDATORY_RISK_FAMILIES | {"routine"},
+    )
+    assert (
+        standing_grant_block_reason(
+            settings=settings, risk_family="routine", risk_vector=None
+        )
+        == "channel_requirement"
+    )

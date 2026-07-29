@@ -327,6 +327,70 @@ def required_channels_for_risk_vector(
     return None
 
 
+def required_channels_for_risk_family(
+    risk_family: str | None,
+) -> tuple[str, ...] | None:
+    """Channels permitted to decide a request in this risk family.
+
+    The *other* half of the channel policy from
+    :func:`required_channels_for_risk_vector`, derived from the canonical
+    :data:`MOBILE_MANDATORY_RISK_FAMILIES` set rather than a parallel hardcoded
+    list, so a family added there is enforced everywhere with no further edits.
+
+    ``None`` means the family mandates no particular channel. An *unrecognised*
+    family fails closed onto the mobile channel: an unclassified action is a
+    classification gap, and the safe reading of a gap is "a human decides".
+    """
+    family = risk_family or ""
+    if family not in ALL_RISK_FAMILIES:
+        return MOBILE_MANDATORY_CHANNELS
+    if family in MOBILE_MANDATORY_RISK_FAMILIES:
+        return MOBILE_MANDATORY_CHANNELS
+    return None
+
+
+#: Canonical channel ordering, so a combined requirement is deterministic.
+_CHANNEL_PRECEDENCE = ("mobile_signed", "local_terminal")
+
+
+def required_channels_for_request(
+    *,
+    risk_family: str | None = None,
+    risk_vector: dict[str, Any] | None = None,
+) -> tuple[str, ...] | None:
+    """**The** canonical answer to "must a human on a specific (mobile-signed)
+    channel decide this request?" — covering BOTH halves of the channel policy.
+
+    The channel policy has two independent inputs: the request's ``risk_family``
+    (:data:`MOBILE_MANDATORY_RISK_FAMILIES`) and the BrowserBridge per-surface
+    ``risk_vector`` (:data:`HIGH_RISK_CLASS_VALUES`). Consulting one and not the
+    other is a hole, so every caller — the clearance decision path in ``app`` and
+    the standing-grant fail-closed gate in ``grants`` — routes through this one
+    function and the two can never drift apart again.
+
+    Returns the channels allowed to decide, or ``None`` when nothing is mandated.
+    """
+    halves = [
+        required
+        for required in (
+            required_channels_for_risk_family(risk_family),
+            required_channels_for_risk_vector(risk_vector),
+        )
+        if required
+    ]
+    if not halves:
+        return None
+    allowed = set(_CHANNEL_PRECEDENCE)
+    for required in halves:
+        allowed &= set(required)
+    if not allowed:
+        # Two halves demanding disjoint channels must not produce an empty
+        # tuple: channel_satisfies reads a falsy requirement as "no requirement"
+        # and would fail *open*. Fall back to the strictest channel instead.
+        return MOBILE_MANDATORY_CHANNELS
+    return tuple(channel for channel in _CHANNEL_PRECEDENCE if channel in allowed)
+
+
 def channel_satisfies(
     channel: str | None, required: tuple[str, ...] | None
 ) -> bool:

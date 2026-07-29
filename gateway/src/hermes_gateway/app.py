@@ -29,7 +29,7 @@ from .clearance_policy import (
     decision_metadata,
     enforce_clearance_channel,
     evaluate_clearance_channel,
-    required_channels_for_risk_vector,
+    required_channels_for_request,
     risk_family_from_request,
 )
 from .config import Settings
@@ -2921,12 +2921,15 @@ def _transition_approval(
     except KeyError:
         device_channel = None
 
-    # Change 5 — channel policy / risk tiering: a high-risk per-surface class can
-    # mandate the mobile-signed channel. Fail-closed if the deciding channel does
-    # not satisfy it. No risk_vector ⇒ no requirement ⇒ unchanged behavior.
+    # Change 5 — channel policy / risk tiering: the risk family and/or a high-risk
+    # per-surface class can mandate the mobile-signed channel. Fail-closed if the
+    # deciding channel does not satisfy it. Routed through the canonical combined
+    # entry point (the same one the standing-grant gate uses) so the decision path
+    # and the auto-satisfy path enforce one identical policy.
     if target_state == "approved":
-        required_channels = required_channels_for_risk_vector(
-            approval.get("risk_vector")
+        required_channels = required_channels_for_request(
+            risk_family=approval.get("risk_family"),
+            risk_vector=approval.get("risk_vector"),
         )
         if not channel_satisfies(device_channel, required_channels):
             store.append_audit_event(

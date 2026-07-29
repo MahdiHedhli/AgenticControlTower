@@ -271,6 +271,38 @@ def test_aircraft_and_loopback_caller_cannot_set_trust_context(tmp_path: Path) -
         ] == "untrusted_host"
 
 
+def test_config_cannot_downgrade_a_mobile_mandatory_family(tmp_path: Path) -> None:
+    """The channel policy has one canonical answer for both of its inputs.
+
+    ``MOBILE_MANDATORY_RISK_FAMILIES`` is that canonical policy: configuration may
+    tighten it but must never relax it. An operator-supplied risk-channel map that
+    hands ``external_effect`` to the local terminal is therefore still refused —
+    the decision path consults ``required_channels_for_request`` (the same entry
+    point the standing-grant gate uses), not just the configurable tier map.
+    """
+    downgraded = dict(Settings.default_clearance_risk_channel_map)
+    downgraded["external_effect"] = ("mobile_signed", "local_terminal")
+    settings = _settings(
+        tmp_path,
+        clearance_enabled_channels=("mobile_signed", "local_terminal"),
+        clearance_local_terminal_enabled=True,
+        clearance_risk_channel_map=downgraded,
+    )
+    with TestClient(create_app(settings), client=("127.0.0.1", 50000)) as client:
+        _set_agent_trust(client, "trusted_host")
+        approval = _create_approval(
+            client, risk_family="external_effect", risk_level="high"
+        )
+
+        response = _local_decision(client, approval["approval_id"], decision="approve")
+
+        assert response.status_code == 403
+        stored = client.app.state.store.get_approval(approval["approval_id"])
+        assert stored["state"] == "pending"
+        rejections = _audit_payloads(client, "approval_channel_rejected")
+        assert rejections and rejections[0]["required_channels"] == ["mobile_signed"]
+
+
 def _policy_client(tmp_path: Path, *, local_enabled: bool) -> TestClient:
     return TestClient(
         create_app(
