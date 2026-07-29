@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../app_runtime.dart';
 import '../models/core_models.dart';
+import '../operator_error.dart';
 import '../routes.dart';
 import '../widgets/alpha_components.dart';
 import '../widgets/screen_shell.dart';
@@ -116,7 +117,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
         return;
       }
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error.toString())),
+        SnackBar(
+          content: Text(operatorErrorMessage(error, context: 'settings')),
+        ),
       );
     } finally {
       if (mounted) {
@@ -276,8 +279,9 @@ class _PairingPanel extends StatelessWidget {
                         label: 'Start',
                         icon: Icons.qr_code_2_outlined,
                         primary: true,
-                        onPressed:
-                            busy ? () {} : () => runAction(runtime.startPairing),
+                        onPressed: busy
+                            ? () {}
+                            : () => runAction(runtime.startPairing),
                       ),
               ),
               const SizedBox(width: 10),
@@ -289,8 +293,8 @@ class _PairingPanel extends StatelessWidget {
                         primary: true,
                         onPressed: busy
                             ? () {}
-                            : () =>
-                                runAction(() => runtime.completePairing(pairing)),
+                            : () => runAction(
+                                () => runtime.completePairing(pairing)),
                       )
                     : OutlinedButton.icon(
                         onPressed: null,

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../app_runtime.dart';
 import '../models/core_models.dart';
+import '../operator_error.dart';
 import '../repositories/alpha_repository.dart';
 import '../routes.dart';
 import '../widgets/alpha_components.dart';
@@ -88,9 +89,8 @@ class _VoiceScreenState extends State<VoiceScreen> {
                   children: [
                     Expanded(
                       child: FilledButton.icon(
-                        onPressed: _busy || _session != null
-                            ? null
-                            : _createSession,
+                        onPressed:
+                            _busy || _session != null ? null : _createSession,
                         icon: const Icon(Icons.radio_button_checked),
                         label: const Text('Start Voice Session'),
                       ),
@@ -98,9 +98,8 @@ class _VoiceScreenState extends State<VoiceScreen> {
                     const SizedBox(width: 10),
                     Expanded(
                       child: OutlinedButton.icon(
-                        onPressed: _busy || _session == null
-                            ? null
-                            : _closeSession,
+                        onPressed:
+                            _busy || _session == null ? null : _closeSession,
                         icon: const Icon(Icons.stop_circle_outlined),
                         label: const Text('Close'),
                       ),
@@ -121,8 +120,7 @@ class _VoiceScreenState extends State<VoiceScreen> {
                 SizedBox(
                   width: double.infinity,
                   child: OutlinedButton.icon(
-                    onPressed:
-                        _busy || _session == null ? null : _sendMessage,
+                    onPressed: _busy || _session == null ? null : _sendMessage,
                     icon: const Icon(Icons.send_outlined),
                     label: const Text('Send Voice Message'),
                   ),
@@ -142,7 +140,8 @@ class _VoiceScreenState extends State<VoiceScreen> {
               children: [
                 DetailRow(
                     label: 'Audio',
-                    value: 'Live capture and streaming are intentionally deferred.'),
+                    value:
+                        'Live capture and streaming are intentionally deferred.'),
                 DetailRow(
                     label: 'Approvals',
                     value: 'Voice approval will require confirmation phrase.'),
@@ -236,7 +235,7 @@ class _VoiceScreenState extends State<VoiceScreen> {
       }
     } on Object catch (error) {
       if (mounted) {
-        setState(() => _status = error.toString());
+        setState(() => _status = operatorErrorMessage(error, context: 'voice'));
       }
     } finally {
       if (mounted) {

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../app_runtime.dart';
 import '../models/alpha_models.dart';
 import '../models/core_models.dart';
+import '../operator_error.dart';
 import '../repositories/alpha_repository.dart';
 import '../routes.dart';
 import '../viewmodels/alpha_viewmodels.dart';
@@ -214,7 +215,9 @@ class _TuaScreenState extends State<TuaScreen> {
     } on Object catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(error.toString())),
+          SnackBar(
+            content: Text(operatorErrorMessage(error, context: 'tui')),
+          ),
         );
       }
     } finally {

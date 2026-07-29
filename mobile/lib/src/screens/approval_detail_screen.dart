@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../app_runtime.dart';
 import '../models/alpha_models.dart';
+import '../operator_error.dart';
 import '../repositories/alpha_repository.dart';
 import '../routes.dart';
 import '../viewmodels/alpha_viewmodels.dart';
@@ -91,7 +92,9 @@ class _ApprovalDetailScreenState extends State<ApprovalDetailScreen> {
         future: _approval,
         builder: (context, snapshot) {
           if (snapshot.hasError) {
-            return _ApprovalError(error: snapshot.error.toString());
+            return _ApprovalError(
+                error: operatorErrorMessage(snapshot.error!,
+                    context: 'approval-detail'));
           }
           final approval = snapshot.data;
           if (approval == null) {
@@ -195,7 +198,9 @@ class _ApprovalDetailScreenState extends State<ApprovalDetailScreen> {
         return;
       }
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error.toString())),
+        SnackBar(
+          content: Text(operatorErrorMessage(error, context: 'approval')),
+        ),
       );
     } finally {
       if (mounted) {
@@ -248,7 +253,9 @@ class _ApprovalDetailScreenState extends State<ApprovalDetailScreen> {
     } on Object catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(error.toString())),
+          SnackBar(
+            content: Text(operatorErrorMessage(error, context: 'approval')),
+          ),
         );
       }
     } finally {
@@ -284,7 +291,9 @@ class _ApprovalDetailScreenState extends State<ApprovalDetailScreen> {
     } on Object catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(error.toString())),
+          SnackBar(
+            content: Text(operatorErrorMessage(error, context: 'approval')),
+          ),
         );
       }
     } finally {
@@ -313,7 +322,9 @@ class _ApprovalDetailScreenState extends State<ApprovalDetailScreen> {
     } on Object catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(error.toString())),
+          SnackBar(
+            content: Text(operatorErrorMessage(error, context: 'approval')),
+          ),
         );
       }
     } finally {

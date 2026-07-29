@@ -92,9 +92,31 @@ class SecureEnclaveChannel {
   final MethodChannel _channel;
 
   /// True only where a real Secure Enclave is present (physical iOS device).
+  ///
+  /// Deliberately false on the Simulator: the native side gates this on a
+  /// compile-time `targetEnvironment(simulator)` check, because Apple's
+  /// `SecureEnclave.isAvailable` reports true there even though no enclave
+  /// exists. Use this for *hardware* claims, never to decide whether the native
+  /// signer can be used — that is [isSupported].
   Future<bool> isAvailable() async {
     try {
       return (await _channel.invokeMethod<bool>('isAvailable')) ?? false;
+    } on MissingPluginException {
+      return false;
+    } on PlatformException {
+      return false;
+    }
+  }
+
+  /// True where the native P-256 signer module exists at all (iOS device *and*
+  /// Simulator), regardless of hardware backing. This is the routing predicate
+  /// for pairing: on a device it yields an enclave-backed key, on the Simulator
+  /// an honestly-labelled `software_p256_dev` key, and on platforms without the
+  /// native module (web/Android) it is false so the caller falls back to the
+  /// software Ed25519 path.
+  Future<bool> isSupported() async {
+    try {
+      return (await _channel.invokeMethod<bool>('isSupported')) ?? false;
     } on MissingPluginException {
       return false;
     } on PlatformException {

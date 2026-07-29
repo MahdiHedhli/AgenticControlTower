@@ -15,6 +15,7 @@ import 'api/gateway_event_stream_client.dart';
 import 'api/tui_stream_client.dart';
 import 'config/gateway_config.dart';
 import 'models/core_models.dart';
+import 'operator_error.dart';
 import 'repositories/agents_repository.dart';
 import 'repositories/alpha_repository.dart';
 import 'repositories/approval_responses_repository.dart';
@@ -235,7 +236,8 @@ class HermesAppRuntime extends ChangeNotifier {
       _connectionStatus =
           'Connected: ${response['node_id']} ${response['status']}';
     } on Object catch (error) {
-      _connectionStatus = 'Connection failed: $error';
+      _connectionStatus = 'Connection failed. '
+          '${operatorErrorMessage(error, context: 'checkHealth')}';
     }
     notifyListeners();
   }
@@ -253,7 +255,12 @@ class HermesAppRuntime extends ChangeNotifier {
   Future<void> completePairing(PairingSessionModel session) async {
     final towerKeyB64 =
         base64UrlNoPadding(await deriveTowerPublicKey(session.nodeFingerprint));
-    final completion = await (await _enclave.isAvailable()
+    // Route on whether the native P-256 signer module exists, not on whether a
+    // Secure Enclave backs it. On a device that is the enclave; on the Simulator
+    // it is the native module's honest `software_p256_dev` key, which keeps the
+    // whole mobile_signed P-256 channel exercised instead of silently dropping
+    // to the legacy exportable Ed25519 path.
+    final completion = await (await _enclave.isSupported()
         ? _completePairingWithEnclave(session, towerKeyB64)
         : _completePairingWithSoftwareKey(session, towerKeyB64));
 
@@ -274,9 +281,13 @@ class HermesAppRuntime extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Secure-Enclave path: generate a non-exportable P-256 key, prove key
-  /// possession by signing the pairing challenge inside the enclave, and enrol as
-  /// a `p256` mobile_signed device. No private key is ever stored by the app.
+  /// Native P-256 path: generate a key in the native signer, prove key
+  /// possession by signing the pairing challenge with it, and enrol as a `p256`
+  /// mobile_signed device. No private key is ever stored by the app.
+  ///
+  /// On a device the key is non-exportable and lives inside the Secure Enclave.
+  /// On the Simulator the native module reports `software_p256_dev` /
+  /// `hardwareBacked: false`, and that honest label is what surfaces in Settings.
   Future<PairingCompletionModel> _completePairingWithEnclave(
     PairingSessionModel session,
     String towerKeyB64,
@@ -470,7 +481,8 @@ class HermesAppRuntime extends ChangeNotifier {
     ).connect(after: _lastEventCursor).listen(
       _handleGatewayEvent,
       onError: (Object error) {
-        _eventStreamStatus = 'Live stream error: $error';
+        _eventStreamStatus = 'Live stream error. '
+            '${operatorErrorMessage(error, context: 'eventStream')}';
         _eventStreamConnected = false;
         notifyListeners();
       },

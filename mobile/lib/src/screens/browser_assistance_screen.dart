@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../app_runtime.dart';
 import '../models/core_models.dart';
+import '../operator_error.dart';
 import '../routes.dart';
 import '../widgets/alpha_components.dart';
 import '../widgets/screen_shell.dart';
@@ -77,7 +78,9 @@ class _BrowserAssistanceScreenState extends State<BrowserAssistanceScreen> {
               ),
               const SectionHeader(title: 'Sessions'),
               if (snapshot.hasError)
-                AlphaPanel(child: Text(snapshot.error.toString()))
+                AlphaPanel(
+                    child: Text(operatorErrorMessage(snapshot.error!,
+                        context: 'browser-assistance')))
               else if (snapshot.connectionState == ConnectionState.waiting)
                 const Center(child: CircularProgressIndicator())
               else if (sessions.isEmpty)

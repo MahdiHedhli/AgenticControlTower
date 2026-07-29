@@ -30,10 +30,32 @@ final class SecureEnclaveSigner {
   // again — so each clearance decision still requires a fresh presence check.
   private var cachedContext: LAContext?
   private var cachedContextAt: Date?
+  // Whether the cached context has already passed a presence check. Only the
+  // Simulator's software path consults this (see handleSign): real hardware lets
+  // LocalAuthentication enforce the reuse window itself.
+  private var cachedContextAuthenticated = false
   private let cacheLock = NSLock()
   // 1-byte marker stored ahead of the key blob: 0x01 = enclave, 0x00 = software.
   private let enclaveMarker: UInt8 = 0x01
   private let softwareMarker: UInt8 = 0x00
+
+  /// The single source of truth for "can this build actually use the Secure Enclave".
+  ///
+  /// `SecureEnclave.isAvailable` returns **true on the iOS Simulator**, where the
+  /// enclave does not exist: key generation then fails with LocalAuthentication
+  /// -1020 ("This call is not supported on iOS Simulator") and — worse — status
+  /// reporting would claim `secure_enclave_p256` / `hardwareBacked: true` on a
+  /// machine with no hardware key protection at all. The compile-time
+  /// `targetEnvironment(simulator)` check makes that impossible.
+  ///
+  /// Every enclave-capability decision in this file goes through this property.
+  private static var secureEnclaveUsable: Bool {
+    #if targetEnvironment(simulator)
+      return false
+    #else
+      return SecureEnclave.isAvailable
+    #endif
+  }
 
   static func register(with registry: FlutterPluginRegistry) {
     guard let registrar = registry.registrar(forPlugin: "SecureEnclaveSigner") else { return }
@@ -48,7 +70,12 @@ final class SecureEnclaveSigner {
   func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     switch call.method {
     case "isAvailable":
-      result(SecureEnclave.isAvailable)
+      result(Self.secureEnclaveUsable)
+    case "isSupported":
+      // The native P-256 signer module is present. True wherever this code runs
+      // (iOS device and Simulator alike) — it says nothing about hardware
+      // backing; ask `isAvailable`/`status` for that.
+      result(true)
     case "status":
       handleStatus(result)
     case "generateKey":
@@ -65,7 +92,7 @@ final class SecureEnclaveSigner {
   // MARK: - Status
 
   private func handleStatus(_ result: @escaping FlutterResult) {
-    let available = SecureEnclave.isAvailable
+    let available = Self.secureEnclaveUsable
     let stored = loadKey()
     let isEnclave = stored?.isEnclave ?? available
     let context = LAContext()
@@ -101,28 +128,33 @@ final class SecureEnclaveSigner {
       return
     }
 
+    // The two generation paths are mutually exclusive at COMPILE time, not at
+    // runtime. A device build contains only the enclave path: there is no
+    // software-key code to fall back to, so a Secure Enclave failure on real
+    // hardware stays a hard failure and can never silently downgrade the
+    // clearance channel to an exportable key.
     do {
-      let publicKeyB64: String
-      if SecureEnclave.isAvailable {
-        let key = try SecureEnclave.P256.Signing.PrivateKey(accessControl: access)
-        try persist(blob: key.dataRepresentation, isEnclave: true)
-        publicKeyB64 = base64url(key.publicKey.x963Representation)
-        result([
-          "publicKey": publicKeyB64,
-          "backend": "secure_enclave_p256",
-          "hardwareBacked": true,
-        ])
-      } else {
-        // Simulator / no-SE: honest software fallback, never reported as hardware.
+      #if targetEnvironment(simulator)
+        // Simulator has no Secure Enclave. Honest software fallback so the
+        // mobile_signed P-256 channel can be exercised end to end; always
+        // reported as software / not hardware-backed.
+        _ = access
         let key = P256.Signing.PrivateKey()
         try persist(blob: key.rawRepresentation, isEnclave: false)
-        publicKeyB64 = base64url(key.publicKey.x963Representation)
         result([
-          "publicKey": publicKeyB64,
+          "publicKey": base64url(key.publicKey.x963Representation),
           "backend": "software_p256_dev",
           "hardwareBacked": false,
         ])
-      }
+      #else
+        let key = try SecureEnclave.P256.Signing.PrivateKey(accessControl: access)
+        try persist(blob: key.dataRepresentation, isEnclave: true)
+        result([
+          "publicKey": base64url(key.publicKey.x963Representation),
+          "backend": "secure_enclave_p256",
+          "hardwareBacked": true,
+        ])
+      #endif
     } catch {
       result(FlutterError(code: "generate_failed", message: "\(error)", details: nil))
     }
@@ -148,7 +180,8 @@ final class SecureEnclaveSigner {
       return
     }
 
-    let context = authenticationContext(reason: reason, allowReuse: allowReuse)
+    let (context, presenceEstablished) = authenticationContext(
+      reason: reason, allowReuse: allowReuse)
 
     // Sign off the main thread; the enclave/biometric evaluation can block.
     DispatchQueue.global(qos: .userInitiated).async {
@@ -160,7 +193,23 @@ final class SecureEnclaveSigner {
           signatureDer = try key.signature(for: data).derRepresentation
         } else {
           // Software fallback still drives an auth prompt so the gate is exercised.
-          try self.evaluatePresence(context: context, reason: reason)
+          //
+          // On the Simulator LocalAuthentication ignores
+          // `touchIDAuthenticationAllowableReuseDuration`, so a reused context
+          // would re-prompt for EVERY signed request and overlapping evaluations
+          // cancel each other with LAError -4 ("Canceled by another
+          // authentication"). Honour the reuse window here so reuse behaves as it
+          // does on real hardware. A clearance decision passes allowReuse == 0,
+          // which never yields a reused context — so decisions always prompt.
+          #if targetEnvironment(simulator)
+            if !presenceEstablished {
+              try self.evaluatePresence(context: context, reason: reason)
+              self.markPresenceEstablished(for: context)
+            }
+          #else
+            _ = presenceEstablished
+            try self.evaluatePresence(context: context, reason: reason)
+          #endif
           let key = try P256.Signing.PrivateKey(rawRepresentation: stored.blob)
           signatureDer = try key.signature(for: data).derRepresentation
         }
@@ -179,14 +228,19 @@ final class SecureEnclaveSigner {
   /// Return a context to authenticate the signature. When [allowReuse] > 0 a
   /// recently authenticated context is reused within its window (single prompt
   /// for a decision's two signatures); otherwise a fresh context is created.
-  private func authenticationContext(reason: String, allowReuse: Double) -> LAContext {
+  ///
+  /// `presenceEstablished` is true only when this returned a cached context that
+  /// has already passed a presence check inside its reuse window.
+  private func authenticationContext(reason: String, allowReuse: Double) -> (
+    context: LAContext, presenceEstablished: Bool
+  ) {
     cacheLock.lock()
     defer { cacheLock.unlock() }
     if allowReuse > 0,
       let cached = cachedContext,
       let at = cachedContextAt,
       Date().timeIntervalSince(at) < allowReuse {
-      return cached
+      return (cached, cachedContextAuthenticated)
     }
     let context = LAContext()
     context.localizedReason = reason
@@ -198,7 +252,18 @@ final class SecureEnclaveSigner {
       cachedContext = nil
       cachedContextAt = nil
     }
-    return context
+    cachedContextAuthenticated = false
+    return (context, false)
+  }
+
+  /// Record that [context] has passed a presence check, so a reuse-window hit
+  /// does not have to prompt again.
+  private func markPresenceEstablished(for context: LAContext) {
+    cacheLock.lock()
+    defer { cacheLock.unlock() }
+    if cachedContext === context {
+      cachedContextAuthenticated = true
+    }
   }
 
   private func evaluatePresence(context: LAContext, reason: String) throws {
@@ -225,6 +290,7 @@ final class SecureEnclaveSigner {
     cacheLock.lock()
     cachedContext = nil
     cachedContextAt = nil
+    cachedContextAuthenticated = false
     cacheLock.unlock()
     result(nil)
   }
