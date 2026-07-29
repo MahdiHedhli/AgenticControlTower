@@ -13,6 +13,11 @@ from .clearance_contract import (
 )
 from .clearance_policy import risk_family_from_request
 from .config import Settings
+from .grants import (
+    record_auto_satisfaction,
+    record_auto_satisfy_refusal,
+    standing_grant_for_request,
+)
 from .handoff import engage_handoff as _engage_handoff
 from .ids import new_id
 from .notification_composer import compose_notification
@@ -621,6 +626,21 @@ class HermesRuntimeAdapter:
             risk_family=risk_family,
             requested_tool=payload.requested_tool,
         )
+        # Standing grants (read side). Same lookup and same fail-closed gate as
+        # the /v1/approvals path — a guard enforced on one creation path only is
+        # not a guard. This payload carries no risk_vector, so the channel
+        # requirement can only be imposed by the risk family here.
+        standing = standing_grant_for_request(
+            store=self.store,
+            settings=self.settings,
+            node_id=node_id,
+            agent_id=payload.agent_id,
+            session_id=payload.session_id,
+            requested_tool=payload.requested_tool,
+            params_fingerprint=contract_fields["params_fingerprint"],
+            risk_family=risk_family,
+            risk_vector=None,
+        )
         approval = self.store.create_approval(
             {
                 "approval_id": approval_id,
@@ -641,7 +661,7 @@ class HermesRuntimeAdapter:
                 "summary": payload.summary,
                 "full_payload_redacted": payload.payload_redacted,
                 "resource_scope": payload.resource_scope,
-                "state": "pending",
+                "state": standing.initial_state,
                 "options": _approval_options_from_scopes(payload.suggested_scopes),
                 "expires_at": expires_at,
             }
@@ -650,7 +670,10 @@ class HermesRuntimeAdapter:
             node_id=node_id,
             agent_id=payload.agent_id,
             session_id=payload.session_id,
-            status="waiting_approval",
+            # An auto-satisfied request never blocks on a human, so parking the
+            # agent in waiting_approval would strand the fleet view on a state
+            # no decision will ever leave.
+            status="waiting_approval" if not standing.auto_satisfied else "running",
             current_tool=payload.requested_tool,
         )
         self.store.append_audit_event(
@@ -691,11 +714,25 @@ class HermesRuntimeAdapter:
             event_type="approval.requested",
             payload={
                 "approval_id": approval_id,
-                "state": "pending",
+                "state": approval["state"],
                 "risk_level": payload.risk_level,
                 "risk_family": approval["risk_family"],
             },
         )
+        if standing.grant is not None:
+            approval = record_auto_satisfaction(
+                store=self.store,
+                approval=approval,
+                grant=standing.grant,
+                request_id=request_id,
+            )
+        elif standing.refusal is not None:
+            record_auto_satisfy_refusal(
+                store=self.store,
+                approval=approval,
+                reason=standing.refusal,
+                request_id=request_id,
+            )
         return ApprovalRequest.model_validate(approval)
 
     def approval_result(self, approval_id: str) -> RuntimeApprovalResult:

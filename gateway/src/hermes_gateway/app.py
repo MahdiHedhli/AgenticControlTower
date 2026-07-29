@@ -33,7 +33,12 @@ from .clearance_policy import (
     risk_family_from_request,
 )
 from .config import Settings
-from .grants import mint_grant_for_decision
+from .grants import (
+    mint_grant_for_decision,
+    record_auto_satisfaction,
+    record_auto_satisfy_refusal,
+    standing_grant_for_request,
+)
 from .handoff import _require_bound_clearance
 from .handoff import engage_handoff as _engage_handoff
 from .ids import new_id
@@ -137,6 +142,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """Best-effort APNs hint to the operator's phone for a new clearance.
         Hint only — no secrets / no raw aircraft text (ADR-0005)."""
         if not push_dispatcher.configured:
+            return
+        if approval.get("state") != "pending":
+            # Nothing to decide: a standing grant already cleared this request.
+            # "Clearance required" would be false, and the grant creation is
+            # what the operator was asked about.
             return
         try:
             node_id = approval.get("node_id") or resolved_settings.node_id
@@ -2550,6 +2560,23 @@ def _create_approval_request(
         requested_tool=payload.requested_tool,
     )
     requested_by = f"local:{caller.host or 'unknown'}"
+    risk_vector = payload.risk_vector.model_dump() if payload.risk_vector else None
+    # Standing grants (read side): a live grant from an earlier "approve for
+    # this session / agent / forever" clears this request without prompting.
+    # Looked up BEFORE creation so the row is written in its final state, but the
+    # row is always written — an auto-satisfied action is still an attempted
+    # action and must appear in the trail.
+    standing = standing_grant_for_request(
+        store=store,
+        settings=settings,
+        node_id=node_id,
+        agent_id=payload.agent_id,
+        session_id=payload.session_id,
+        requested_tool=payload.requested_tool,
+        params_fingerprint=contract_fields["params_fingerprint"],
+        risk_family=risk_family,
+        risk_vector=risk_vector,
+    )
     approval = store.create_approval(
         {
             "approval_id": approval_id,
@@ -2562,9 +2589,7 @@ def _create_approval_request(
             "risk_level": payload.risk_level,
             "risk_category": payload.risk_category or "unknown_action",
             "risk_family": risk_family,
-            "risk_vector": payload.risk_vector.model_dump()
-            if payload.risk_vector
-            else None,
+            "risk_vector": risk_vector,
             **contract_fields,
             "operator_message": operator_message,
             "audit_correlation_id": payload.audit_correlation_id,
@@ -2573,7 +2598,7 @@ def _create_approval_request(
             "summary": payload.summary,
             "full_payload_redacted": payload.full_payload_redacted,
             "resource_scope": payload.resource_scope,
-            "state": "pending",
+            "state": standing.initial_state,
             "options": payload.options or ["deny"],
             "expires_at": payload.expires_at.isoformat().replace("+00:00", "Z"),
         }
@@ -2616,11 +2641,25 @@ def _create_approval_request(
         event_type="approval.requested",
         payload={
             "approval_id": approval_id,
-            "state": "pending",
+            "state": approval["state"],
             "risk_level": payload.risk_level,
             "risk_family": approval["risk_family"],
         },
     )
+    if standing.grant is not None:
+        approval = record_auto_satisfaction(
+            store=store,
+            approval=approval,
+            grant=standing.grant,
+            request_id=_request_id(request),
+        )
+    elif standing.refusal is not None:
+        record_auto_satisfy_refusal(
+            store=store,
+            approval=approval,
+            reason=standing.refusal,
+            request_id=_request_id(request),
+        )
     return ApprovalRequest.model_validate(approval)
 
 

@@ -67,7 +67,14 @@ ApprovalScope = Literal["once", "session", "agent", "permanent"]
 ClearanceChannel = Literal["mobile_signed", "local_terminal"]
 DeploymentTrustContext = Literal["trusted_host", "untrusted_host", "adversarial_host"]
 # Authority provenance: the typed actor class behind an approval decision.
-ApprovalAuthority = Literal["human_mobile", "human_local", "test_operator"]
+# "standing_grant" is the only NON-human class: a request cleared by an earlier
+# scoped decision ("approve for this session / agent / forever"). It is a
+# separate literal rather than a reuse of a human class precisely so that
+# approved_by stays a truthful answer to "who decided this?" — and it always
+# travels with human_approved=False.
+ApprovalAuthority = Literal[
+    "human_mobile", "human_local", "test_operator", "standing_grant"
+]
 NotificationCategory = Literal[
     "approval_required",
     "security_alert",
