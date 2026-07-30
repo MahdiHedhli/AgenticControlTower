@@ -2641,7 +2641,30 @@ def _ensure_local_node(store: SQLiteStore, settings: Settings) -> None:
 
     Together with the guard in ``initialize()`` and the already-guarded
     ``seed_mock_data`` (which returns early once agents exist), booting against a
-    populated database performs ZERO writes — including after a registration.
+    populated, **already-migrated** database whose rows live under
+    ``settings.node_id`` performs zero writes — including after a registration.
+
+    KNOWN GAPS (verified outstanding; the sentence above is scoped, not absolute):
+
+    1. A MIGRATING BOOT STILL WRITES, and that is the next boot after this ships.
+       ``initialize()`` writes when the schema is not current. Measured against a
+       fixture built by the currently-deployed code, the first boot on this branch
+       creates the ``approval_grants`` table and its index (change counter +2), and
+       under an ordinary ``BEGIN IMMEDIATE`` holder that boot dies at
+       ``store.initialize()`` with "database is locked" after the busy timeout. It
+       is a one-shot migration, but the one shot is a hard-startup-failure path on
+       a perfectly healthy database.
+    2. ``seed_mock_data`` IS STILL A BOOT WRITE, on a different guard. It is on by
+       default (``seed_mock_data: bool = True``, ``ACT_SEED_MOCK_DATA``) and skips
+       only when ``list_agents(node_id=settings.node_id)`` is non-empty. Both that
+       guard and the one below key on ``settings.node_id``, while
+       ``/v1/nodes/register`` deliberately stores under ``payload.node_id`` — so a
+       populated database whose rows live under another node id (or a renamed
+       ``HERMES_NODE_ID``) reaches it. Measured: boot writes nodes + agents +
+       sessions rows, and under a write-lock holder dies here in ``upsert_node``.
+    3. Zero writes does not imply immunity to "database is locked" — see the
+       KNOWN GAP note in ``store.initialize()``: in rollback-journal mode an
+       EXCLUSIVE holder blocks readers, so even a write-free boot can fail.
     """
     try:
         store.get_node(settings.node_id)

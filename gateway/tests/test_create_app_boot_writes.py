@@ -23,8 +23,24 @@ and the two fought forever. Measured out of process: change counter +1 per boot
 and ``'2.4.1-bridge' -> None``.
 
 The discipline these tests pin: boot owns that the row EXISTS and owns no columns,
-so booting against a populated database performs ZERO writes — including after a
-registration has set the bridge-owned fields — while an absent row is still seeded.
+so booting against a populated, already-migrated database whose rows live under
+``settings.node_id`` performs zero writes — including after a registration has set
+the bridge-owned fields — while an absent row is still seeded.
+
+SCOPE OF THESE TESTS (do not over-read a green run). They are in-process and use a
+current-schema fixture, so three verified gaps are OUTSIDE what they cover; see the
+KNOWN GAPS blocks on ``_ensure_local_node`` and ``SQLiteStore.initialize``:
+  1. A schema-migrating boot DOES write (this branch's ``approval_grants`` table is
+     created on the first boot against a currently-deployed database), and dies
+     under a held write lock.
+  2. ``seed_mock_data`` is a second boot write, guarded on
+     ``list_agents(node_id=settings.node_id)``; a populated database whose rows sit
+     under a different node id still writes nodes/agents/sessions at boot.
+  3. Zero writes does not imply immunity to "database is locked": in
+     rollback-journal mode a page-cache spill escalates a competing writer to
+     EXCLUSIVE, which blocks readers, and a write-free boot then fails at
+     ``store.initialize()``. ``test_store_startup_locking`` holds only RESERVED,
+     so that case is unpinned here.
 """
 
 from __future__ import annotations

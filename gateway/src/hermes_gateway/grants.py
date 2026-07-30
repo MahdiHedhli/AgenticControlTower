@@ -11,6 +11,15 @@ Two halves:
 Every fail-closed guard lives here so both request-creation call sites
 (``app._create_approval_request`` and ``runtime_adapter.request_approval``) get
 exactly the same policy — a guard that only one path enforces is not a guard.
+
+KNOWN GAP, operationally the important one: revoking a DEVICE does not revoke the
+standing grants it minted. ``revoke_device`` flips ``status`` and kills auth
+tokens, but the device row survives and this module resolves it without a status
+filter, so an unpaired device's grants keep auto-approving until they expire (up
+to the permanent TTL) or are revoked one by one via
+``POST /v1/approval-grants/<id>/revoke``. Details and the second, narrower
+channel-resolution divergence are documented on
+:func:`grant_channel_authority_block_reason`.
 """
 
 from __future__ import annotations
@@ -166,13 +175,16 @@ def grant_channel_authority_block_reason(
     """The AUTHORITY half of the gate: does the granting device's channel actually
     have the standing to decide *this* request?
 
-    A standing grant is a **prior human decision**, so it carries exactly the
-    channel authority of the device that minted it and no more. The question asked
-    here is therefore the *same* question the live decision path asks of a phone
-    tapping "approve" — :func:`evaluate_clearance_channel_for`, i.e.
-    ``ClearanceChannelPolicy.evaluate`` on the effective operator policy plus the
-    agent's deployment trust context — only with the *granting* device's channel
-    substituted for the deciding device's.
+    A standing grant is a **prior human decision**, so it should carry the channel
+    authority of the device that minted it and no more. The question asked here is
+    the *channel* question the live decision path asks of a phone tapping "approve"
+    — :func:`evaluate_clearance_channel_for`, i.e. ``ClearanceChannelPolicy.evaluate``
+    on the effective operator policy plus the agent's deployment trust context —
+    with the *granting* device's channel substituted for the deciding device's.
+
+    It is NOT the whole question the live path asks. See "KNOWN GAPS" below: this
+    function reproduces the live path's channel evaluation only, not its device
+    *eligibility* checks, so the two can disagree about the same device.
 
     Why the family-level half above cannot answer this: it projects the policy onto
     the single question "is this family mobile-mandatory". An operator who restricts
@@ -189,17 +201,52 @@ def grant_channel_authority_block_reason(
     auto-satisfy families the policy lets ``mobile_signed`` decide and may NOT
     auto-satisfy a family restricted to ``local_terminal`` (and vice-versa).
 
-    Fail-closed in every unresolvable case: no granting device recorded, the device
-    row gone (deleted/never existed), a device whose channel cannot be resolved, or
-    a policy that will not validate. "We cannot tell whose authority this was" is
-    never an answer that permits auto-satisfy.
+    Fail-closed when the granting authority is *unresolvable*: no granting device
+    recorded, the device row gone (deleted/never existed), a device whose channel
+    cannot be resolved, or a policy that will not validate. "We cannot tell whose
+    authority this was" is never an answer that permits auto-satisfy.
+
+    KNOWN GAPS (verified outstanding, not fixed here — do not read the paragraphs
+    above as covering these):
+
+    1. REVOKED GRANTING DEVICE STILL CARRIES AUTHORITY. ``store.get_device`` is a
+       bare ``SELECT * FROM devices WHERE device_id = ?`` with no ``status``
+       predicate (``storage/identity.py``), and ``revoke_device`` only flips
+       ``status`` to ``'revoked'`` — the row survives with its recorded
+       ``clearance_channel``. The live decision path rejects a non-active device
+       with 403 ``device is not active`` (``signing.py``, ``device["status"] !=
+       "active"``) *before* it ever reaches channel evaluation; this function never
+       asks. Precondition: operator unpairs a device (``DELETE /v1/devices/<id>``)
+       that had already minted standing grants. Effect: that device is immediately
+       403 on the live path, yet each of its existing grants — session, agent, and
+       permanent scope alike, including an ``agent``-scope grant consumed in a
+       brand-new session — keeps auto-approving with ``approved_by=standing_grant``
+       and no refusal audited, for up to the full permanent TTL. None of the four
+       unresolvable cases above fires, because the row is present and its channel
+       resolves. Only per-grant revocation (``POST /v1/approval-grants/<id>/revoke``)
+       clears them; device revocation does not cascade. So a grant can outlive the
+       authority that minted it.
+    2. CHANNEL-RESOLUTION DIVERGENCE. The live path reads
+       ``device.get("clearance_channel", "local_terminal")`` (``signing.py``) while
+       this function uses :func:`channel_for_device`, which falls back to
+       ``platform`` when ``clearance_channel`` is empty. Precondition: a device row
+       with ``clearance_channel=''`` and a mobile ``platform``. Effect: the live
+       path 403s ('' is not an eligible channel) while this function resolves
+       ``mobile_signed`` and auto-satisfies. Reaching that state needs a direct DB
+       write today, since the pairing schema types the field as a ``Literal``.
     """
     if not granted_by_device_id:
         return "grant_channel_authority_unresolved"
     try:
+        # KNOWN GAP 1 (see docstring): no status filter here, and none below. A
+        # 'revoked' device row still resolves and still confers channel authority,
+        # so its standing grants keep auto-approving after the operator unpaired it
+        # even though the live path 403s that same device as not active.
         device = store.get_device(granted_by_device_id)
     except KeyError:
         return "grant_channel_authority_unresolved"
+    # KNOWN GAP 2 (see docstring): platform fallback here vs the live path's
+    # 'local_terminal' default, so an empty clearance_channel resolves differently.
     channel = channel_for_device(device)
     if not channel:
         return "grant_channel_authority_unresolved"

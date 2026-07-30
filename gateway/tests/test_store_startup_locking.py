@@ -12,6 +12,17 @@ booting while anything else held the write lock raised
   writer.
 
 The production database is live and non-trivial, so neither is acceptable.
+
+KNOWN GAP — what a green run here does NOT establish. ``write_lock_held`` below
+opens ``BEGIN IMMEDIATE`` and writes one tiny row, so it holds only a RESERVED
+lock, which readers can still read past. Because WAL is deliberately not enabled,
+the database is in rollback-journal mode, where a writer whose page cache spills
+escalates to EXCLUSIVE and then blocks READERS as well. Measured with an ordinary
+competing writer (``BEGIN IMMEDIATE`` plus a ~24 MB insert): a boot that performs
+no writes at all still dies with ``database is locked`` after the 30 s busy timeout
+inside ``initialize()``'s ``executescript``. So these tests pin "startup does not
+NEED the write lock", not "startup cannot fail on lock contention" — the latter is
+false. Widening the fixture to hold EXCLUSIVE would pin it.
 """
 
 from __future__ import annotations

@@ -535,9 +535,23 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
             # gateway booting while anything else was mid-write therefore sat on
             # the busy timeout and then died with "database is locked" on a
             # perfectly healthy database. With the guard, a current database does
-            # no writes at all during initialize() and cannot fail on write-lock
-            # contention; only a database that genuinely needs migrating writes,
-            # and that write now has SQLITE_BUSY_TIMEOUT_SECONDS to land.
+            # no writes at all during this backfill; only a database that
+            # genuinely needs migrating writes, and that write now has
+            # SQLITE_BUSY_TIMEOUT_SECONDS to land.
+            #
+            # KNOWN GAP — performing no writes does NOT make initialize()
+            # immune to "database is locked", and this comment must not be read
+            # as claiming it does. Because WAL is deliberately not enabled
+            # (above), the database stays in rollback-journal mode, where a
+            # writer that spills its page cache escalates RESERVED -> EXCLUSIVE
+            # and EXCLUSIVE blocks READERS too. Measured: an ordinary competing
+            # process doing BEGIN IMMEDIATE plus a ~24 MB insert makes an
+            # otherwise write-free boot die after the 30 s busy timeout with
+            # sqlite3.OperationalError from the executescript() below — a pure
+            # read failing, hard boot failure, change counter unmoved. The
+            # startup-locking tests hold only RESERVED (BEGIN IMMEDIATE plus a
+            # tiny insert, never spilling), which is why they pass; the
+            # EXCLUSIVE/page-spill case is real and unpinned.
             needs_trust_backfill = db.execute(
                 """
                 SELECT 1 FROM agents
