@@ -112,7 +112,7 @@ from .schemas import (
 )
 from .security import expires_in, has_secret_text, new_token, now_utc, parse_utc
 from .signing import VerifiedDevice, verify_signed_request
-from .store import SQLiteStore
+from .store import DEFAULT_NODE_CAPABILITIES, SQLiteStore
 from .tui import (
     LocalPtyManager,
     tui_command_risk_family,
@@ -2586,20 +2586,74 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
+#: Every node column ``_ensure_local_node`` is responsible for, i.e. exactly what
+#: its upsert would write. ``created_at`` and ``last_seen_at`` are absent on
+#: purpose: ``upsert_node`` stamps ``last_seen_at`` with *now* on every call, so
+#: comparing it would always differ and the write would be unconditional again —
+#: which is the defect. A boot timestamp is not worth a write lock; the node's
+#: liveness is already reported by /v1/health and refreshed by
+#: ``POST /v1/nodes/register``, both of which still write.
+_LOCAL_NODE_MANAGED_FIELDS = (
+    "display_name",
+    "environment",
+    "gateway_base_url",
+    "node_fingerprint",
+    "gateway_version",
+    "hermes_version",
+    "health",
+    "tags",
+    "capabilities",
+)
+
+
+def _local_node_row(settings: Settings) -> dict[str, Any]:
+    """The node row this gateway's own identity implies.
+
+    ``capabilities`` is spelled out rather than left to ``upsert_node``'s default
+    so the comparison below can be exact: it has to know what the upsert *would*
+    write, not approximately.
+    """
+    return {
+        "node_id": settings.node_id,
+        "display_name": settings.node_display_name,
+        "environment": settings.node_environment,
+        "gateway_base_url": settings.gateway_base_url,
+        "node_fingerprint": settings.node_fingerprint,
+        "gateway_version": settings.gateway_version,
+        "hermes_version": settings.hermes_version,
+        "health": "online",
+        "tags": ["self-hosted", "tailscale-first"],
+        "capabilities": [dict(capability) for capability in DEFAULT_NODE_CAPABILITIES],
+    }
+
+
 def _ensure_local_node(store: SQLiteStore, settings: Settings) -> None:
-    store.upsert_node(
-        {
-            "node_id": settings.node_id,
-            "display_name": settings.node_display_name,
-            "environment": settings.node_environment,
-            "gateway_base_url": settings.gateway_base_url,
-            "node_fingerprint": settings.node_fingerprint,
-            "gateway_version": settings.gateway_version,
-            "hermes_version": settings.hermes_version,
-            "health": "online",
-            "tags": ["self-hosted", "tailscale-first"],
-        }
-    )
+    """Register this gateway's own node row — writing ONLY when it is absent or
+    actually stale.
+
+    Read before write, the same discipline ``store.initialize()`` now applies to
+    its trust-context backfill, and for the same reason one level up: production
+    boots through this factory (``uvicorn.run("hermes_gateway.app:create_app",
+    factory=True)``), so an exception here is a hard startup failure. The
+    unconditional ``INSERT ... ON CONFLICT DO UPDATE`` asked SQLite for the write
+    lock on EVERY boot, so a gateway restarting while anything else was mid-write
+    blocked for the whole busy timeout and then died with "database is locked" on a
+    perfectly healthy database — measured on a real out-of-process uvicorn boot
+    against an already-migrated, populated fixture.
+
+    Together with the guard in ``initialize()`` and the already-guarded
+    ``seed_mock_data`` (which returns early once agents exist), booting against a
+    current, populated database now performs ZERO writes.
+    """
+    desired = _local_node_row(settings)
+    try:
+        existing = store.get_node(settings.node_id)
+    except KeyError:
+        store.upsert_node(desired)
+        return
+    if all(existing.get(field) == desired[field] for field in _LOCAL_NODE_MANAGED_FIELDS):
+        return
+    store.upsert_node(desired)
 
 
 def _create_approval_request(

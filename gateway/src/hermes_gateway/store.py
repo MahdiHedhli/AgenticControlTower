@@ -30,6 +30,17 @@ from .storage.observability import ObservabilityStoreMixin
 #: the place to change the on-disk format of a live production database.
 SQLITE_BUSY_TIMEOUT_SECONDS = 30.0
 
+#: Capabilities stamped on a node row when the caller supplies none. Named rather
+#: than inlined in :meth:`SQLiteStore.upsert_node` so a read-before-write caller
+#: can compute exactly what the upsert *would* write and skip it when the stored
+#: row already says that — see ``app._ensure_local_node``.
+DEFAULT_NODE_CAPABILITIES: tuple[dict[str, str], ...] = (
+    {"name": "events_websocket", "status": "available"},
+    {"name": "pairing", "status": "available"},
+    {"name": "mobile_notify", "status": "available"},
+    {"name": "approvals", "status": "available"},
+)
+
 # Standing-grant scopes, narrowest first. "once" is absent on purpose: it is
 # the no-standing-authority scope and never mints a grant.
 GRANT_SCOPE_SPECIFICITY: dict[str, int] = {
@@ -676,10 +687,7 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
         created_at = node.get("created_at") or utc_iso()
         last_seen_at = node.get("last_seen_at") or created_at
         capabilities = node.get("capabilities") or [
-            {"name": "events_websocket", "status": "available"},
-            {"name": "pairing", "status": "available"},
-            {"name": "mobile_notify", "status": "available"},
-            {"name": "approvals", "status": "available"},
+            dict(capability) for capability in DEFAULT_NODE_CAPABILITIES
         ]
         with self.connect() as db:
             db.execute(
