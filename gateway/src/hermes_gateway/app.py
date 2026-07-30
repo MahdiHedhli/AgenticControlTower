@@ -2586,32 +2586,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
-#: Every node column ``_ensure_local_node`` is responsible for, i.e. exactly what
-#: its upsert would write. ``created_at`` and ``last_seen_at`` are absent on
-#: purpose: ``upsert_node`` stamps ``last_seen_at`` with *now* on every call, so
-#: comparing it would always differ and the write would be unconditional again —
-#: which is the defect. A boot timestamp is not worth a write lock; the node's
-#: liveness is already reported by /v1/health and refreshed by
-#: ``POST /v1/nodes/register``, both of which still write.
-_LOCAL_NODE_MANAGED_FIELDS = (
-    "display_name",
-    "environment",
-    "gateway_base_url",
-    "node_fingerprint",
-    "gateway_version",
-    "hermes_version",
-    "health",
-    "tags",
-    "capabilities",
-)
-
-
 def _local_node_row(settings: Settings) -> dict[str, Any]:
-    """The node row this gateway's own identity implies.
+    """The node row this gateway's own identity implies, used ONLY to seed a row
+    that does not exist yet.
 
     ``capabilities`` is spelled out rather than left to ``upsert_node``'s default
-    so the comparison below can be exact: it has to know what the upsert *would*
-    write, not approximately.
+    so the seed is explicit about everything it writes.
     """
     return {
         "node_id": settings.node_id,
@@ -2628,32 +2608,45 @@ def _local_node_row(settings: Settings) -> dict[str, Any]:
 
 
 def _ensure_local_node(store: SQLiteStore, settings: Settings) -> None:
-    """Register this gateway's own node row — writing ONLY when it is absent or
-    actually stale.
+    """Seed this gateway's own node row when it is ABSENT. Never otherwise.
 
-    Read before write, the same discipline ``store.initialize()`` now applies to
-    its trust-context backfill, and for the same reason one level up: production
-    boots through this factory (``uvicorn.run("hermes_gateway.app:create_app",
-    factory=True)``), so an exception here is a hard startup failure. The
+    Read before write, the same discipline ``store.initialize()`` applies to its
+    trust-context backfill, and for the same reason one level up: production boots
+    through this factory (``uvicorn.run("hermes_gateway.app:create_app",
+    factory=True)``), so an exception here is a hard startup failure. The original
     unconditional ``INSERT ... ON CONFLICT DO UPDATE`` asked SQLite for the write
     lock on EVERY boot, so a gateway restarting while anything else was mid-write
     blocked for the whole busy timeout and then died with "database is locked" on a
-    perfectly healthy database — measured on a real out-of-process uvicorn boot
-    against an already-migrated, populated fixture.
+    perfectly healthy database.
+
+    Guarding that with a field comparison was not enough, because boot compared
+    fields boot does not OWN. ``POST /v1/nodes/register`` is the bridge's endpoint
+    for the node row and writes the bridge's real ``hermes_version``, its ``tags``
+    and its reachable ``gateway_base_url``. Boot wanted
+    ``settings.hermes_version`` (``os.getenv("HERMES_VERSION")``, i.e. ``None``
+    unless someone exports it), a hardcoded ``["self-hosted", "tailscale-first"]``
+    and the locally configured base URL. Those are permanently unequal to what the
+    bridge wrote, so the comparison could never short-circuit: every boot took the
+    write lock and clobbered ``hermes_version`` back to NULL, the next registration
+    restored it, and the two sides fought forever. Measured out of process on a
+    real uvicorn boot: file-change counter +1 per boot and
+    ``'2.4.1-bridge' -> None``.
+
+    So boot owns exactly one thing — that a row exists at all, because the node row
+    is how the gateway knows its own identity — and owns no columns. Nothing here
+    can fight with ``/v1/nodes/register`` because nothing here runs once that
+    endpoint (or an earlier boot) has created the row. Fields that genuinely need
+    correcting are corrected by the endpoint that owns them: liveness by
+    ``/v1/nodes/register`` and ``/v1/health``, identity by re-registration.
 
     Together with the guard in ``initialize()`` and the already-guarded
     ``seed_mock_data`` (which returns early once agents exist), booting against a
-    current, populated database now performs ZERO writes.
+    populated database performs ZERO writes — including after a registration.
     """
-    desired = _local_node_row(settings)
     try:
-        existing = store.get_node(settings.node_id)
+        store.get_node(settings.node_id)
     except KeyError:
-        store.upsert_node(desired)
-        return
-    if all(existing.get(field) == desired[field] for field in _LOCAL_NODE_MANAGED_FIELDS):
-        return
-    store.upsert_node(desired)
+        store.upsert_node(_local_node_row(settings))
 
 
 def _create_approval_request(

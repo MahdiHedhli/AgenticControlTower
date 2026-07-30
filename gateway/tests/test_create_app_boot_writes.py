@@ -11,14 +11,29 @@ lock, that raised ``sqlite3.OperationalError: database is locked`` from
 ``app.py:_ensure_local_node`` -> ``store.upsert_node`` and the process exited: a
 hard boot failure with the identical symptom, on a perfectly healthy database.
 
-The discipline these tests pin: booting against a current, populated database
-performs ZERO writes, so it cannot contend for the write lock at all — while a
-database that is absent or has genuinely drifted still gets written.
+Guarding that upsert with a field comparison was necessary but not sufficient,
+because boot compared fields boot does not OWN. ``POST /v1/nodes/register`` is the
+bridge's endpoint for the node row and writes the bridge's real ``hermes_version``,
+its ``tags`` and its reachable ``gateway_base_url``; boot wanted
+``settings.hermes_version`` (``os.getenv("HERMES_VERSION")`` — ``None`` unless
+exported), a hardcoded tag list and the locally configured base URL. Permanently
+unequal, so the comparison never short-circuited: every boot took the write lock
+AND clobbered ``hermes_version`` back to NULL, the next registration restored it,
+and the two fought forever. Measured out of process: change counter +1 per boot
+and ``'2.4.1-bridge' -> None``.
+
+The discipline these tests pin: boot owns that the row EXISTS and owns no columns,
+so booting against a populated database performs ZERO writes — including after a
+registration has set the bridge-owned fields — while an absent row is still seeded.
 """
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
+from typing import Any
+
+from fastapi.testclient import TestClient
 
 from hermes_gateway.app import create_app
 from hermes_gateway.config import Settings
@@ -100,21 +115,92 @@ def test_boot_creates_the_local_node_when_it_is_absent(tmp_path: Path) -> None:
     ]
 
 
-def test_boot_rewrites_the_local_node_when_it_has_drifted(tmp_path: Path) -> None:
-    """The other half: a stored row that no longer matches this gateway's identity
-    must still be corrected, or the guard would be silently pinning stale state."""
+#: What the bridge sends to ``POST /v1/nodes/register``: a real Hermes version, its
+#: own tags, and the address the node is actually reachable on. Every one of these
+#: is a field boot used to overwrite with a local-only value.
+BRIDGE_REGISTRATION: dict[str, Any] = {
+    "node_id": "node_boot",
+    "display_name": "Boot Test Tower",
+    "environment": "homelab",
+    "gateway_base_url": "http://100.64.0.7:8787/v1",
+    "node_fingerprint": "boot-test-fingerprint",
+    "gateway_version": "0.1.0",
+    "hermes_version": "2.4.1-bridge",
+    "tags": ["bridge-registered"],
+}
+
+
+def register_from_bridge(settings: Settings) -> dict:
+    """Drive the real endpoint, from loopback so the Hermes-local guard admits it."""
+    with TestClient(create_app(settings), client=("127.0.0.1", 50000)) as client:
+        response = client.post("/v1/nodes/register", json=BRIDGE_REGISTRATION)
+        assert response.status_code == 201, response.text
+        return response.json()
+
+
+def test_boot_after_a_registration_performs_zero_writes(tmp_path: Path) -> None:
+    """THE case the field comparison could not pass. Once the bridge has
+    registered, boot's idea of hermes_version / tags / gateway_base_url differs
+    from the stored row *permanently*, so a comparing boot writes every single time
+    and clobbers the bridge's values on the way past."""
     settings = booted_once(tmp_path)
-    store = SQLiteStore(settings.database_path)
-    with store.connect() as db:
-        db.execute(
-            "UPDATE nodes SET gateway_version = ?, health = ? WHERE node_id = ?",
-            ("0.0.0-stale", "offline", settings.node_id),
-        )
+    registered = register_from_bridge(settings)
+    assert registered["hermes_version"] == "2.4.1-bridge"
+    assert settings.hermes_version is None, (
+        "the premise: HERMES_VERSION is unset in production, so boot can only ever "
+        "want NULL here"
+    )
     before = change_counter(settings.database_path)
 
     create_app(settings)
 
-    node = store.get_node(settings.node_id)
-    assert node["gateway_version"] == settings.gateway_version
-    assert node["health"] == "online"
-    assert change_counter(settings.database_path) > before
+    assert change_counter(settings.database_path) == before
+    node = SQLiteStore(settings.database_path).get_node(settings.node_id)
+    assert node["hermes_version"] == "2.4.1-bridge"
+    assert node["tags"] == ["bridge-registered"]
+    assert node["gateway_base_url"] == "http://100.64.0.7:8787/v1"
+
+
+#: Row-mutating authorizer actions. Scoped to DML on purpose: the authorizer fires
+#: when a statement is PREPARED, and ``initialize()``'s idempotent
+#: ``CREATE TABLE/INDEX IF NOT EXISTS`` script authorizes SQLITE_CREATE_* (plus an
+#: INSERT on ``sqlite_master``) on every boot even though every one of those
+#: statements is a runtime no-op — which is exactly what the change counter, which
+#: only advances on a real write transaction, is here to establish. So: the counter
+#: covers "did the file change", and this covers "did any boot statement try to
+#: touch a ROW", the class of write that caused the fight with /v1/nodes/register.
+ROW_WRITE_ACTIONS: frozenset[int] = frozenset(
+    {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE}
+)
+
+
+def test_boot_attempts_no_row_write_at_all(tmp_path: Path, monkeypatch: Any) -> None:
+    """The change counter proves the file was not modified. This proves the boot
+    never even asked: a tracing authorizer is installed on every connection the
+    gateway opens, so an attempted INSERT/UPDATE/DELETE is recorded whether or not
+    SQLite ends up dirtying a page."""
+    settings = booted_once(tmp_path)
+    register_from_bridge(settings)
+
+    attempted: list[tuple[int, Any, Any]] = []
+    original_connect = SQLiteStore.connect
+
+    def traced_connect(self: SQLiteStore) -> sqlite3.Connection:
+        connection = original_connect(self)
+
+        def authorizer(action: int, arg1: Any, arg2: Any, *_rest: Any) -> int:
+            # sqlite_master rows are the CREATE ... IF NOT EXISTS statements above.
+            if action in ROW_WRITE_ACTIONS and arg1 != "sqlite_master":
+                attempted.append((action, arg1, arg2))
+            return sqlite3.SQLITE_OK
+
+        connection.set_authorizer(authorizer)
+        return connection
+
+    monkeypatch.setattr(SQLiteStore, "connect", traced_connect)
+    before = change_counter(settings.database_path)
+
+    create_app(settings)
+
+    assert attempted == [], attempted
+    assert change_counter(settings.database_path) == before
