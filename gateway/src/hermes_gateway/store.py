@@ -11,6 +11,25 @@ from .security import content_hash, expires_in, hash_token, now_utc, parse_utc, 
 from .storage.identity import IdentityStoreMixin
 from .storage.observability import ObservabilityStoreMixin
 
+#: Busy timeout for every gateway connection, in seconds.
+#:
+#: SQLite's default is 5 s. On a live gateway that is short enough to lose:
+#: whoever asks for the write lock while another writer holds it dies with
+#: "database is locked" rather than waiting, and at startup that is a hard boot
+#: failure on a database that is perfectly healthy. Set at the single connect()
+#: chokepoint so every path shares one discipline instead of each inventing its
+#: own retry.
+#:
+#: Deliberately NOT paired with journal_mode=WAL. WAL would also help (readers
+#: would stop contending with the writer), but switching it is a *persistent*
+#: change to the database file — every other process and tool that opens
+#: ~/.hermes/act/gateway.sqlite3 inherits the new mode and the -wal/-shm
+#: sidecars — and `PRAGMA journal_mode=WAL` can itself return SQLITE_BUSY while
+#: other connections are open, i.e. fail in exactly the situation it is meant to
+#: fix. Nothing in this codebase sets a journal mode today; a defect fix is not
+#: the place to change the on-disk format of a live production database.
+SQLITE_BUSY_TIMEOUT_SECONDS = 30.0
+
 # Standing-grant scopes, narrowest first. "once" is absent on purpose: it is
 # the no-standing-authority scope and never mints a grant.
 GRANT_SCOPE_SPECIFICITY: dict[str, int] = {
@@ -41,9 +60,17 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
     def connect(self) -> sqlite3.Connection:
         if self.database_path != ":memory:":
             Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.database_path)
+        connection = sqlite3.connect(
+            self.database_path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        # Same knob as the timeout above, stated next to the other per-connection
+        # PRAGMA so the discipline is visible and greppable at the one chokepoint
+        # every code path goes through.
+        connection.execute(
+            f"PRAGMA busy_timeout = {int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000)}"
+        )
         return connection
 
     def initialize(self) -> None:
@@ -490,14 +517,33 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
                 "require_classified_capabilities",
                 "INTEGER NOT NULL DEFAULT 0",
             )
-            db.execute(
+            # Read first, write only if a row actually needs it.
+            #
+            # Unconditionally, this UPDATE made EVERY startup take the write
+            # lock, even on a database whose schema was already current. A
+            # gateway booting while anything else was mid-write therefore sat on
+            # the busy timeout and then died with "database is locked" on a
+            # perfectly healthy database. With the guard, a current database does
+            # no writes at all during initialize() and cannot fail on write-lock
+            # contention; only a database that genuinely needs migrating writes,
+            # and that write now has SQLITE_BUSY_TIMEOUT_SECONDS to land.
+            needs_trust_backfill = db.execute(
                 """
-                UPDATE agents
-                SET deployment_trust_context = 'untrusted_host'
+                SELECT 1 FROM agents
                 WHERE deployment_trust_context IS NULL
                    OR deployment_trust_context = ''
+                LIMIT 1
                 """
-            )
+            ).fetchone()
+            if needs_trust_backfill is not None:
+                db.execute(
+                    """
+                    UPDATE agents
+                    SET deployment_trust_context = 'untrusted_host'
+                    WHERE deployment_trust_context IS NULL
+                       OR deployment_trust_context = ''
+                    """
+                )
             _ensure_column(
                 db,
                 "devices",
