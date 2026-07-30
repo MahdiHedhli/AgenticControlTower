@@ -67,7 +67,14 @@ ApprovalScope = Literal["once", "session", "agent", "permanent"]
 ClearanceChannel = Literal["mobile_signed", "local_terminal"]
 DeploymentTrustContext = Literal["trusted_host", "untrusted_host", "adversarial_host"]
 # Authority provenance: the typed actor class behind an approval decision.
-ApprovalAuthority = Literal["human_mobile", "human_local", "test_operator"]
+# "standing_grant" is the only NON-human class: a request cleared by an earlier
+# scoped decision ("approve for this session / agent / forever"). It is a
+# separate literal rather than a reuse of a human class precisely so that
+# approved_by stays a truthful answer to "who decided this?" — and it always
+# travels with human_approved=False.
+ApprovalAuthority = Literal[
+    "human_mobile", "human_local", "test_operator", "standing_grant"
+]
 NotificationCategory = Literal[
     "approval_required",
     "security_alert",
@@ -461,6 +468,37 @@ class ApprovalDecisionResponse(BaseModel):
 class LocalTerminalApprovalDecisionRequest(StrictModel):
     decision: Literal["approve", "deny"]
     scope: ApprovalScope = "once"
+
+
+# Standing approval grants. "once" is absent from the scope literal on purpose:
+# it is the scope that mints no grant, so a grant can never carry it.
+ApprovalGrantScope = Literal["session", "agent", "permanent"]
+ApprovalGrantState = Literal["active", "revoked"]
+
+
+class ApprovalGrant(BaseModel):
+    """A standing "don't ask me again" authorization.
+
+    ``expires_at`` is non-optional: every grant carries a hard expiry, so there
+    is no shape of this record that represents unbounded standing authority.
+    """
+
+    grant_id: str
+    node_id: str
+    agent_id: str
+    session_id: str | None = None
+    requested_tool: str
+    capability: str | None = None
+    params_fingerprint: str | None = None
+    risk_family: RiskFamily = "external_effect"
+    scope: ApprovalGrantScope
+    state: ApprovalGrantState
+    source_approval_id: str
+    granted_by_device_id: str | None = None
+    created_at: datetime
+    expires_at: datetime
+    revoked_at: datetime | None = None
+    revoked_by: str | None = None
 
 
 class UpdateAgentTrustContextRequest(StrictModel):

@@ -11,6 +11,44 @@ from .security import content_hash, expires_in, hash_token, now_utc, parse_utc, 
 from .storage.identity import IdentityStoreMixin
 from .storage.observability import ObservabilityStoreMixin
 
+#: Busy timeout for every gateway connection, in seconds.
+#:
+#: SQLite's default is 5 s. On a live gateway that is short enough to lose:
+#: whoever asks for the write lock while another writer holds it dies with
+#: "database is locked" rather than waiting, and at startup that is a hard boot
+#: failure on a database that is perfectly healthy. Set at the single connect()
+#: chokepoint so every path shares one discipline instead of each inventing its
+#: own retry.
+#:
+#: Deliberately NOT paired with journal_mode=WAL. WAL would also help (readers
+#: would stop contending with the writer), but switching it is a *persistent*
+#: change to the database file — every other process and tool that opens
+#: ~/.hermes/act/gateway.sqlite3 inherits the new mode and the -wal/-shm
+#: sidecars — and `PRAGMA journal_mode=WAL` can itself return SQLITE_BUSY while
+#: other connections are open, i.e. fail in exactly the situation it is meant to
+#: fix. Nothing in this codebase sets a journal mode today; a defect fix is not
+#: the place to change the on-disk format of a live production database.
+SQLITE_BUSY_TIMEOUT_SECONDS = 30.0
+
+#: Capabilities stamped on a node row when the caller supplies none. Named rather
+#: than inlined in :meth:`SQLiteStore.upsert_node` so a read-before-write caller
+#: can compute exactly what the upsert *would* write and skip it when the stored
+#: row already says that — see ``app._ensure_local_node``.
+DEFAULT_NODE_CAPABILITIES: tuple[dict[str, str], ...] = (
+    {"name": "events_websocket", "status": "available"},
+    {"name": "pairing", "status": "available"},
+    {"name": "mobile_notify", "status": "available"},
+    {"name": "approvals", "status": "available"},
+)
+
+# Standing-grant scopes, narrowest first. "once" is absent on purpose: it is
+# the no-standing-authority scope and never mints a grant.
+GRANT_SCOPE_SPECIFICITY: dict[str, int] = {
+    "session": 0,
+    "agent": 1,
+    "permanent": 2,
+}
+
 
 def _ensure_column(
     db: sqlite3.Connection,
@@ -33,9 +71,17 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
     def connect(self) -> sqlite3.Connection:
         if self.database_path != ":memory:":
             Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.database_path)
+        connection = sqlite3.connect(
+            self.database_path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        # Same knob as the timeout above, stated next to the other per-connection
+        # PRAGMA so the discipline is visible and greppable at the one chokepoint
+        # every code path goes through.
+        connection.execute(
+            f"PRAGMA busy_timeout = {int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000)}"
+        )
         return connection
 
     def initialize(self) -> None:
@@ -384,6 +430,36 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
                     expires_at TEXT
                 );
 
+                -- Standing approval grants ("approve for this session" /
+                -- "allow forever"). Deliberately NOT capability_grants: that
+                -- table gates whole API surfaces (approvals/tui/tua/voice/...)
+                -- through has_active_capability_grant, whose matcher ignores
+                -- any column it does not know about. Adding per-tool clearance
+                -- rows there would make surface gates match rows they were
+                -- never designed for. A separate table keeps the two authority
+                -- kinds from leaking into each other.
+                CREATE TABLE IF NOT EXISTS approval_grants (
+                    grant_id TEXT PRIMARY KEY,
+                    node_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    session_id TEXT,
+                    requested_tool TEXT NOT NULL,
+                    capability TEXT,
+                    params_fingerprint TEXT,
+                    risk_family TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    source_approval_id TEXT NOT NULL,
+                    granted_by_device_id TEXT,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    revoked_at TEXT,
+                    revoked_by TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_approval_grants_lookup
+                    ON approval_grants (node_id, requested_tool, state);
+
                 CREATE TABLE IF NOT EXISTS capability_risk_registry (
                     entry_id TEXT PRIMARY KEY,
                     node_id TEXT NOT NULL,
@@ -452,14 +528,47 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
                 "require_classified_capabilities",
                 "INTEGER NOT NULL DEFAULT 0",
             )
-            db.execute(
+            # Read first, write only if a row actually needs it.
+            #
+            # Unconditionally, this UPDATE made EVERY startup take the write
+            # lock, even on a database whose schema was already current. A
+            # gateway booting while anything else was mid-write therefore sat on
+            # the busy timeout and then died with "database is locked" on a
+            # perfectly healthy database. With the guard, a current database does
+            # no writes at all during this backfill; only a database that
+            # genuinely needs migrating writes, and that write now has
+            # SQLITE_BUSY_TIMEOUT_SECONDS to land.
+            #
+            # KNOWN GAP — performing no writes does NOT make initialize()
+            # immune to "database is locked", and this comment must not be read
+            # as claiming it does. Because WAL is deliberately not enabled
+            # (above), the database stays in rollback-journal mode, where a
+            # writer that spills its page cache escalates RESERVED -> EXCLUSIVE
+            # and EXCLUSIVE blocks READERS too. Measured: an ordinary competing
+            # process doing BEGIN IMMEDIATE plus a ~24 MB insert makes an
+            # otherwise write-free boot die after the 30 s busy timeout with
+            # sqlite3.OperationalError from the executescript() below — a pure
+            # read failing, hard boot failure, change counter unmoved. The
+            # startup-locking tests hold only RESERVED (BEGIN IMMEDIATE plus a
+            # tiny insert, never spilling), which is why they pass; the
+            # EXCLUSIVE/page-spill case is real and unpinned.
+            needs_trust_backfill = db.execute(
                 """
-                UPDATE agents
-                SET deployment_trust_context = 'untrusted_host'
+                SELECT 1 FROM agents
                 WHERE deployment_trust_context IS NULL
                    OR deployment_trust_context = ''
+                LIMIT 1
                 """
-            )
+            ).fetchone()
+            if needs_trust_backfill is not None:
+                db.execute(
+                    """
+                    UPDATE agents
+                    SET deployment_trust_context = 'untrusted_host'
+                    WHERE deployment_trust_context IS NULL
+                       OR deployment_trust_context = ''
+                    """
+                )
             _ensure_column(
                 db,
                 "devices",
@@ -562,6 +671,22 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
                 "risk_family",
                 "TEXT NOT NULL DEFAULT 'external_effect'",
             )
+            # Standing approval grants (additive). The CREATE TABLE above is
+            # already idempotent for fresh databases; these keep an existing
+            # production database safe if the table predates a column. Every
+            # column is nullable or carries a DEFAULT, so ALTER TABLE ... ADD
+            # COLUMN never rewrites or invalidates existing rows.
+            self._ensure_column(db, "approval_grants", "capability", "TEXT")
+            self._ensure_column(db, "approval_grants", "params_fingerprint", "TEXT")
+            self._ensure_column(
+                db,
+                "approval_grants",
+                "risk_family",
+                "TEXT NOT NULL DEFAULT 'external_effect'",
+            )
+            self._ensure_column(db, "approval_grants", "granted_by_device_id", "TEXT")
+            self._ensure_column(db, "approval_grants", "revoked_at", "TEXT")
+            self._ensure_column(db, "approval_grants", "revoked_by", "TEXT")
 
     def _ensure_column(
         self, db: sqlite3.Connection, table_name: str, column_name: str, definition: str
@@ -576,10 +701,7 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
         created_at = node.get("created_at") or utc_iso()
         last_seen_at = node.get("last_seen_at") or created_at
         capabilities = node.get("capabilities") or [
-            {"name": "events_websocket", "status": "available"},
-            {"name": "pairing", "status": "available"},
-            {"name": "mobile_notify", "status": "available"},
-            {"name": "approvals", "status": "available"},
+            dict(capability) for capability in DEFAULT_NODE_CAPABILITIES
         ]
         with self.connect() as db:
             db.execute(
@@ -2259,6 +2381,186 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
                 continue
             return True
         return False
+
+    # ------------------------------------------------------------------
+    # Standing approval grants
+    # ------------------------------------------------------------------
+
+    def create_approval_grant(self, grant: dict[str, Any]) -> dict[str, Any]:
+        """Persist a standing grant. ``expires_at`` is mandatory — an unbounded
+        standing authorization is never acceptable, not even for scope
+        ``permanent``."""
+        expires_at = grant.get("expires_at")
+        if not expires_at:
+            raise ValueError(
+                "approval grants require a hard expires_at; refusing to mint an "
+                "unbounded standing authorization"
+            )
+        scope = grant["scope"]
+        if scope not in GRANT_SCOPE_SPECIFICITY:
+            raise ValueError(f"unsupported grant scope: {scope}")
+        grant_id = grant.get("grant_id") or new_id("grant")
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO approval_grants (
+                    grant_id, node_id, agent_id, session_id, requested_tool, capability,
+                    params_fingerprint, risk_family, scope, state, source_approval_id,
+                    granted_by_device_id, created_at, expires_at, revoked_at, revoked_by
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                """,
+                (
+                    grant_id,
+                    grant["node_id"],
+                    grant["agent_id"],
+                    grant.get("session_id"),
+                    grant["requested_tool"],
+                    grant.get("capability"),
+                    grant.get("params_fingerprint"),
+                    grant.get("risk_family", "external_effect"),
+                    scope,
+                    grant.get("state", "active"),
+                    grant["source_approval_id"],
+                    grant.get("granted_by_device_id"),
+                    grant.get("created_at") or utc_iso(),
+                    expires_at,
+                ),
+            )
+        return self.get_approval_grant(grant_id)
+
+    def get_approval_grant(self, grant_id: str) -> dict[str, Any]:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM approval_grants WHERE grant_id = ?",
+                (grant_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(grant_id)
+        return dict(row)
+
+    def list_approval_grants(
+        self,
+        *,
+        node_id: str | None = None,
+        agent_id: str | None = None,
+        state: str | None = None,
+        include_expired: bool = True,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM approval_grants"
+        args: list[Any] = []
+        where: list[str] = []
+        if node_id:
+            where.append("node_id = ?")
+            args.append(node_id)
+        if agent_id:
+            where.append("agent_id = ?")
+            args.append(agent_id)
+        if state:
+            where.append("state = ?")
+            args.append(state)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY created_at DESC"
+        with self.connect() as db:
+            rows = [dict(row) for row in db.execute(sql, tuple(args)).fetchall()]
+        if include_expired:
+            return rows
+        now = now_utc()
+        return [row for row in rows if parse_utc(row["expires_at"]) > now]
+
+    def revoke_approval_grant(
+        self,
+        grant_id: str,
+        *,
+        revoked_by: str,
+    ) -> dict[str, Any]:
+        """Withdraw a standing grant. Idempotent-safe: raises KeyError when the
+        grant does not exist, ValueError when it is already revoked."""
+        grant = self.get_approval_grant(grant_id)
+        if grant["state"] != "active":
+            raise ValueError(f"grant is not active: {grant['state']}")
+        with self.connect() as db:
+            db.execute(
+                """
+                UPDATE approval_grants
+                SET state = 'revoked', revoked_at = ?, revoked_by = ?
+                WHERE grant_id = ?
+                """,
+                (utc_iso(), revoked_by, grant_id),
+            )
+        return self.get_approval_grant(grant_id)
+
+    def find_matching_grant(
+        self,
+        *,
+        node_id: str,
+        agent_id: str,
+        session_id: str,
+        requested_tool: str,
+        params_fingerprint: str,
+        risk_family: str,
+    ) -> dict[str, Any] | None:
+        """Narrowest live standing grant covering this request, or ``None``.
+
+        Match rules (deliberately asymmetric — see docs):
+
+        * ``session`` — node + agent + session + tool + **params_fingerprint**.
+          Strict on purpose: "approve for this session" on one command must not
+          clear a *different* command in that session.
+        * ``agent``   — node + agent + tool. No fingerprint: the whole point is
+          to cover repeated invocations with differing parameters.
+        * ``permanent`` — node + tool. No agent, no session, no fingerprint.
+
+        ``risk_family`` must match exactly in every case. A grant minted while a
+        tool was classified ``routine`` must not silently keep clearing it after
+        the tool is reclassified — that direction of drift re-prompts.
+
+        Only ``state = 'active'`` and unexpired rows are considered. Ties are
+        broken narrowest-first (session > agent > permanent), then newest-first.
+        """
+        with self.connect() as db:
+            rows = [
+                dict(row)
+                for row in db.execute(
+                    """
+                    SELECT * FROM approval_grants
+                    WHERE state = 'active'
+                      AND node_id = ?
+                      AND requested_tool = ?
+                      AND risk_family = ?
+                    """,
+                    (node_id, requested_tool, risk_family),
+                ).fetchall()
+            ]
+        now = now_utc()
+        candidates: list[dict[str, Any]] = []
+        for grant in rows:
+            if parse_utc(grant["expires_at"]) <= now:
+                continue
+            scope = grant["scope"]
+            if scope == "session":
+                if grant["agent_id"] != agent_id:
+                    continue
+                if grant["session_id"] != session_id:
+                    continue
+                if grant["params_fingerprint"] != params_fingerprint:
+                    continue
+            elif scope == "agent":
+                if grant["agent_id"] != agent_id:
+                    continue
+            elif scope == "permanent":
+                pass
+            else:
+                continue
+            candidates.append(grant)
+        if not candidates:
+            return None
+        # Stable sort, applied newest-first then narrowest-first, so the result
+        # is "narrowest scope, and within that the most recent grant".
+        candidates.sort(key=lambda grant: grant["created_at"], reverse=True)
+        candidates.sort(key=lambda grant: GRANT_SCOPE_SPECIFICITY[grant["scope"]])
+        return candidates[0]
 
     def _assistance_request_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
         request = dict(row)

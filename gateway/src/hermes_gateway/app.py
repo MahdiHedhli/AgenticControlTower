@@ -29,10 +29,16 @@ from .clearance_policy import (
     decision_metadata,
     enforce_clearance_channel,
     evaluate_clearance_channel,
-    required_channels_for_risk_vector,
+    required_channels_for_request,
     risk_family_from_request,
 )
 from .config import Settings
+from .grants import (
+    mint_grant_for_decision,
+    record_auto_satisfaction,
+    record_auto_satisfy_refusal,
+    standing_grant_for_request,
+)
 from .handoff import _require_bound_clearance
 from .handoff import engage_handoff as _engage_handoff
 from .ids import new_id
@@ -52,6 +58,7 @@ from .schemas import (
     Agent,
     ApprovalDecisionRequest,
     ApprovalDecisionResponse,
+    ApprovalGrant,
     ApprovalPolicyProposal,
     ApprovalRequest,
     ApprovalResponse,
@@ -105,7 +112,7 @@ from .schemas import (
 )
 from .security import expires_in, has_secret_text, new_token, now_utc, parse_utc
 from .signing import VerifiedDevice, verify_signed_request
-from .store import SQLiteStore
+from .store import DEFAULT_NODE_CAPABILITIES, SQLiteStore
 from .tui import (
     LocalPtyManager,
     tui_command_risk_family,
@@ -136,6 +143,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """Best-effort APNs hint to the operator's phone for a new clearance.
         Hint only — no secrets / no raw aircraft text (ADR-0005)."""
         if not push_dispatcher.configured:
+            return
+        if approval.get("state") != "pending":
+            # Nothing to decide: a standing grant already cleared this request.
+            # "Clearance required" would be false, and the grant creation is
+            # what the operator was asked about.
             return
         try:
             node_id = approval.get("node_id") or resolved_settings.node_id
@@ -1174,6 +1186,97 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             decision=None,
             scope=None,
         )
+
+    # Standing approval grants. Same auth posture as deciding an approval —
+    # a signed device plus the "approvals" capability gate — because a standing
+    # grant IS approval authority. Deliberately not stricter than granting:
+    # revocation is the safety valve, and a valve the granting device cannot
+    # reach is not a valve.
+    @app.get("/v1/approval-grants")
+    def list_approval_grants(
+        request: Request,
+        node_id: str | None = None,
+        agent_id: str | None = None,
+        include_inactive: bool = False,
+        device: VerifiedDevice = signed_device_dependency,
+    ) -> dict[str, list[ApprovalGrant]]:
+        require_device_capability(
+            store=store,
+            settings=resolved_settings,
+            device=device,
+            capability="approvals",
+            request_id=_request_id(request),
+            node_id=node_id or resolved_settings.node_id,
+            agent_id=agent_id,
+        )
+        # Default is the live set — what is actually clearing requests right
+        # now. Lapsed and revoked rows are history, available on request.
+        grants = store.list_approval_grants(
+            node_id=node_id,
+            agent_id=agent_id,
+            state=None if include_inactive else "active",
+            include_expired=include_inactive,
+        )
+        return {
+            "approval_grants": [ApprovalGrant.model_validate(grant) for grant in grants]
+        }
+
+    @app.post("/v1/approval-grants/{grant_id}/revoke", response_model=ApprovalGrant)
+    def revoke_approval_grant(
+        grant_id: str,
+        request: Request,
+        device: VerifiedDevice = signed_device_dependency,
+    ) -> ApprovalGrant:
+        try:
+            grant = store.get_approval_grant(grant_id)
+        except KeyError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "grant not found") from exc
+        require_device_capability(
+            store=store,
+            settings=resolved_settings,
+            device=device,
+            capability="approvals",
+            request_id=_request_id(request),
+            node_id=grant["node_id"],
+            agent_id=grant["agent_id"],
+        )
+        try:
+            revoked = store.revoke_approval_grant(grant_id, revoked_by=device.device_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "grant is not active"
+            ) from exc
+        # Withdrawing authority is as auditable as granting it.
+        store.append_audit_event(
+            event_type="capability_grant_revoked",
+            actor_type="device",
+            actor_id=device.device_id,
+            node_id=revoked["node_id"],
+            agent_id=revoked["agent_id"],
+            session_id=revoked.get("session_id"),
+            approval_id=revoked["source_approval_id"],
+            request_id=_request_id(request),
+            payload_redacted={
+                "grant_id": revoked["grant_id"],
+                "scope": revoked["scope"],
+                "requested_tool": revoked["requested_tool"],
+                "risk_family": revoked["risk_family"],
+                "source_approval_id": revoked["source_approval_id"],
+                "revoked_at": revoked["revoked_at"],
+            },
+        )
+        store.create_event(
+            node_id=revoked["node_id"],
+            agent_id=revoked["agent_id"],
+            session_id=revoked.get("session_id"),
+            event_type="capability_grant.revoked",
+            payload={
+                "grant_id": revoked["grant_id"],
+                "scope": revoked["scope"],
+                "requested_tool": revoked["requested_tool"],
+            },
+        )
+        return ApprovalGrant.model_validate(revoked)
 
     @app.post(
         "/v1/local-terminal/approvals/{approval_id}/decisions",
@@ -2483,20 +2586,90 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
+def _local_node_row(settings: Settings) -> dict[str, Any]:
+    """The node row this gateway's own identity implies, used ONLY to seed a row
+    that does not exist yet.
+
+    ``capabilities`` is spelled out rather than left to ``upsert_node``'s default
+    so the seed is explicit about everything it writes.
+    """
+    return {
+        "node_id": settings.node_id,
+        "display_name": settings.node_display_name,
+        "environment": settings.node_environment,
+        "gateway_base_url": settings.gateway_base_url,
+        "node_fingerprint": settings.node_fingerprint,
+        "gateway_version": settings.gateway_version,
+        "hermes_version": settings.hermes_version,
+        "health": "online",
+        "tags": ["self-hosted", "tailscale-first"],
+        "capabilities": [dict(capability) for capability in DEFAULT_NODE_CAPABILITIES],
+    }
+
+
 def _ensure_local_node(store: SQLiteStore, settings: Settings) -> None:
-    store.upsert_node(
-        {
-            "node_id": settings.node_id,
-            "display_name": settings.node_display_name,
-            "environment": settings.node_environment,
-            "gateway_base_url": settings.gateway_base_url,
-            "node_fingerprint": settings.node_fingerprint,
-            "gateway_version": settings.gateway_version,
-            "hermes_version": settings.hermes_version,
-            "health": "online",
-            "tags": ["self-hosted", "tailscale-first"],
-        }
-    )
+    """Seed this gateway's own node row when it is ABSENT. Never otherwise.
+
+    Read before write, the same discipline ``store.initialize()`` applies to its
+    trust-context backfill, and for the same reason one level up: production boots
+    through this factory (``uvicorn.run("hermes_gateway.app:create_app",
+    factory=True)``), so an exception here is a hard startup failure. The original
+    unconditional ``INSERT ... ON CONFLICT DO UPDATE`` asked SQLite for the write
+    lock on EVERY boot, so a gateway restarting while anything else was mid-write
+    blocked for the whole busy timeout and then died with "database is locked" on a
+    perfectly healthy database.
+
+    Guarding that with a field comparison was not enough, because boot compared
+    fields boot does not OWN. ``POST /v1/nodes/register`` is the bridge's endpoint
+    for the node row and writes the bridge's real ``hermes_version``, its ``tags``
+    and its reachable ``gateway_base_url``. Boot wanted
+    ``settings.hermes_version`` (``os.getenv("HERMES_VERSION")``, i.e. ``None``
+    unless someone exports it), a hardcoded ``["self-hosted", "tailscale-first"]``
+    and the locally configured base URL. Those are permanently unequal to what the
+    bridge wrote, so the comparison could never short-circuit: every boot took the
+    write lock and clobbered ``hermes_version`` back to NULL, the next registration
+    restored it, and the two sides fought forever. Measured out of process on a
+    real uvicorn boot: file-change counter +1 per boot and
+    ``'2.4.1-bridge' -> None``.
+
+    So boot owns exactly one thing — that a row exists at all, because the node row
+    is how the gateway knows its own identity — and owns no columns. Nothing here
+    can fight with ``/v1/nodes/register`` because nothing here runs once that
+    endpoint (or an earlier boot) has created the row. Fields that genuinely need
+    correcting are corrected by the endpoint that owns them: liveness by
+    ``/v1/nodes/register`` and ``/v1/health``, identity by re-registration.
+
+    Together with the guard in ``initialize()`` and the already-guarded
+    ``seed_mock_data`` (which returns early once agents exist), booting against a
+    populated, **already-migrated** database whose rows live under
+    ``settings.node_id`` performs zero writes — including after a registration.
+
+    KNOWN GAPS (verified outstanding; the sentence above is scoped, not absolute):
+
+    1. A MIGRATING BOOT STILL WRITES, and that is the next boot after this ships.
+       ``initialize()`` writes when the schema is not current. Measured against a
+       fixture built by the currently-deployed code, the first boot on this branch
+       creates the ``approval_grants`` table and its index (change counter +2), and
+       under an ordinary ``BEGIN IMMEDIATE`` holder that boot dies at
+       ``store.initialize()`` with "database is locked" after the busy timeout. It
+       is a one-shot migration, but the one shot is a hard-startup-failure path on
+       a perfectly healthy database.
+    2. ``seed_mock_data`` IS STILL A BOOT WRITE, on a different guard. It is on by
+       default (``seed_mock_data: bool = True``, ``ACT_SEED_MOCK_DATA``) and skips
+       only when ``list_agents(node_id=settings.node_id)`` is non-empty. Both that
+       guard and the one below key on ``settings.node_id``, while
+       ``/v1/nodes/register`` deliberately stores under ``payload.node_id`` — so a
+       populated database whose rows live under another node id (or a renamed
+       ``HERMES_NODE_ID``) reaches it. Measured: boot writes nodes + agents +
+       sessions rows, and under a write-lock holder dies here in ``upsert_node``.
+    3. Zero writes does not imply immunity to "database is locked" — see the
+       KNOWN GAP note in ``store.initialize()``: in rollback-journal mode an
+       EXCLUSIVE holder blocks readers, so even a write-free boot can fail.
+    """
+    try:
+        store.get_node(settings.node_id)
+    except KeyError:
+        store.upsert_node(_local_node_row(settings))
 
 
 def _create_approval_request(
@@ -2549,6 +2722,23 @@ def _create_approval_request(
         requested_tool=payload.requested_tool,
     )
     requested_by = f"local:{caller.host or 'unknown'}"
+    risk_vector = payload.risk_vector.model_dump() if payload.risk_vector else None
+    # Standing grants (read side): a live grant from an earlier "approve for
+    # this session / agent / forever" clears this request without prompting.
+    # Looked up BEFORE creation so the row is written in its final state, but the
+    # row is always written — an auto-satisfied action is still an attempted
+    # action and must appear in the trail.
+    standing = standing_grant_for_request(
+        store=store,
+        settings=settings,
+        node_id=node_id,
+        agent_id=payload.agent_id,
+        session_id=payload.session_id,
+        requested_tool=payload.requested_tool,
+        params_fingerprint=contract_fields["params_fingerprint"],
+        risk_family=risk_family,
+        risk_vector=risk_vector,
+    )
     approval = store.create_approval(
         {
             "approval_id": approval_id,
@@ -2561,9 +2751,7 @@ def _create_approval_request(
             "risk_level": payload.risk_level,
             "risk_category": payload.risk_category or "unknown_action",
             "risk_family": risk_family,
-            "risk_vector": payload.risk_vector.model_dump()
-            if payload.risk_vector
-            else None,
+            "risk_vector": risk_vector,
             **contract_fields,
             "operator_message": operator_message,
             "audit_correlation_id": payload.audit_correlation_id,
@@ -2572,7 +2760,7 @@ def _create_approval_request(
             "summary": payload.summary,
             "full_payload_redacted": payload.full_payload_redacted,
             "resource_scope": payload.resource_scope,
-            "state": "pending",
+            "state": standing.initial_state,
             "options": payload.options or ["deny"],
             "expires_at": payload.expires_at.isoformat().replace("+00:00", "Z"),
         }
@@ -2615,11 +2803,25 @@ def _create_approval_request(
         event_type="approval.requested",
         payload={
             "approval_id": approval_id,
-            "state": "pending",
+            "state": approval["state"],
             "risk_level": payload.risk_level,
             "risk_family": approval["risk_family"],
         },
     )
+    if standing.grant is not None:
+        approval = record_auto_satisfaction(
+            store=store,
+            approval=approval,
+            grant=standing.grant,
+            request_id=_request_id(request),
+        )
+    elif standing.refusal is not None:
+        record_auto_satisfy_refusal(
+            store=store,
+            approval=approval,
+            reason=standing.refusal,
+            request_id=_request_id(request),
+        )
     return ApprovalRequest.model_validate(approval)
 
 
@@ -2789,12 +2991,24 @@ def _transition_approval(
     except KeyError:
         device_channel = None
 
-    # Change 5 — channel policy / risk tiering: a high-risk per-surface class can
-    # mandate the mobile-signed channel. Fail-closed if the deciding channel does
-    # not satisfy it. No risk_vector ⇒ no requirement ⇒ unchanged behavior.
+    # Change 5 — channel policy / risk tiering: the risk family and/or a high-risk
+    # per-surface class can mandate the mobile-signed channel. Fail-closed if the
+    # deciding channel does not satisfy it. Routed through the canonical combined
+    # entry point (the same one the standing-grant gate uses) so the decision path
+    # and the auto-satisfy path enforce one identical policy.
     if target_state == "approved":
-        required_channels = required_channels_for_risk_vector(
-            approval.get("risk_vector")
+        required_channels = required_channels_for_request(
+            risk_family=approval.get("risk_family"),
+            risk_vector=approval.get("risk_vector"),
+            # Deliberately NOT passed ``settings`` here, unlike the standing-grant
+            # gate. On this path the operator's risk_channel_map is already fully
+            # enforced upstream by ``enforce_clearance_channel`` ->
+            # ``ClearanceChannelPolicy.evaluate``, which rejects a device whose
+            # channel is not in the map's eligible list for the family. What this
+            # check adds is the part evaluate cannot express: the static
+            # MOBILE_MANDATORY_RISK_FAMILIES *floor* config must not downgrade.
+            # Threading settings in as well would be unreachable code — no input
+            # exists for which it could change the outcome.
         )
         if not channel_satisfies(device_channel, required_channels):
             store.append_audit_event(
@@ -2832,6 +3046,20 @@ def _transition_approval(
         approved_by=approved_by,
         human_approved=human_approved,
     )
+    # Standing grants: a decision carrying a scope other than "once" is the
+    # operator saying "and don't ask me again for this". Persist that as an
+    # explicit, hard-expiring, revocable grant instead of leaving
+    # decision_scope as a write nothing ever reads.
+    grant: dict[str, Any] | None = None
+    if target_state == "approved":
+        grant = mint_grant_for_decision(
+            store=store,
+            settings=settings,
+            approval=approval,
+            scope=scope,
+            request_id=request_id,
+            decided_by_device_id=principal.device_id,
+        )
     event_type = {
         "approved": "approval_decision",
         "denied": "approval_decision",
@@ -2851,6 +3079,7 @@ def _transition_approval(
             "decision": decision,
             "scope": scope,
             "state": target_state,
+            "grant_id": grant["grant_id"] if grant else None,
             **decision_metadata(channel_decision),
         },
     )

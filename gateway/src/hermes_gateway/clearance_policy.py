@@ -235,16 +235,44 @@ def evaluate_clearance_channel(
     approval: dict,
     channel: str,
 ) -> ChannelPolicyDecision:
-    policy = ClearanceChannelPolicy.from_settings(settings)
-    deployment_trust_context = deployment_trust_context_for_agent(
+    return evaluate_clearance_channel_for(
         store=store,
         settings=settings,
         node_id=approval["node_id"],
         agent_id=approval["agent_id"],
+        risk_family=approval.get("risk_family"),
+        channel=channel,
+    )
+
+
+def evaluate_clearance_channel_for(
+    *,
+    store: SQLiteStore,
+    settings: Settings,
+    node_id: str,
+    agent_id: str,
+    risk_family: str | None,
+    channel: str,
+) -> ChannelPolicyDecision:
+    """"May a decision on this channel clear a request with this risk family?"
+
+    THE implementation of that question — :func:`evaluate_clearance_channel` is
+    the approval-row-shaped wrapper over it, and the standing-grant channel
+    authority check asks it about the *granting* device. Split out only so callers
+    that hold the fields but not an approval row (a grant lookup happens before
+    the approval row exists) do not have to rebuild the policy and the trust
+    context themselves and drift from the live decision path.
+    """
+    policy = ClearanceChannelPolicy.from_settings(settings)
+    deployment_trust_context = deployment_trust_context_for_agent(
+        store=store,
+        settings=settings,
+        node_id=node_id,
+        agent_id=agent_id,
     )
     return policy.evaluate(
         channel=channel,
-        risk_family=approval.get("risk_family") or "external_effect",
+        risk_family=risk_family or "external_effect",
         deployment_trust_context=deployment_trust_context,
     )
 
@@ -325,6 +353,150 @@ def required_channels_for_risk_vector(
         if isinstance(value, str) and value.lower() in HIGH_RISK_CLASS_VALUES:
             return MOBILE_MANDATORY_CHANNELS
     return None
+
+
+def policy_mobile_mandatory_families(
+    policy: ClearanceChannelPolicy,
+) -> frozenset[str]:
+    """Families the *operator's* risk-channel map restricts to the mobile channel.
+
+    A family whose eligible-channel list contains nothing outside
+    :data:`MOBILE_MANDATORY_CHANNELS` can only be decided by a human on that
+    channel, so it is mobile-mandatory in this deployment whether or not it also
+    appears in the static set.
+
+    Read off ``risk_channel_map`` alone, and deliberately NOT intersected with
+    ``enabled_channels``: the default deployment enables only ``mobile_signed``,
+    so intersecting would make *every* family mobile-mandatory and standing
+    grants would be dead rather than safe. "Which channel may decide this family"
+    is a property of the map; "which channels exist on this host" is the separate
+    question :meth:`ClearanceChannelPolicy.evaluate` already answers.
+    """
+    mandatory = set(MOBILE_MANDATORY_CHANNELS)
+    return frozenset(
+        family
+        for family, channels in policy.risk_channel_map.items()
+        if family in ALL_RISK_FAMILIES and channels and set(channels) <= mandatory
+    )
+
+
+def effective_mobile_mandatory_families(
+    *,
+    settings: Settings | None = None,
+    policy: ClearanceChannelPolicy | None = None,
+) -> frozenset[str]:
+    """**The** effective answer to "which families demand a human on the mobile
+    channel here" — static floor UNION operator configuration.
+
+    The gateway runs on ``ClearanceChannelPolicy.from_settings(settings)``, whose
+    ``risk_channel_map`` is operator-supplied via
+    ``ACT_CLEARANCE_RISK_CHANNEL_MAP``. Consulting the module constant alone made
+    the policy and the thing actually enforced two sources of truth that could
+    drift, so there is exactly one function and it takes the strictest reading of
+    both inputs:
+
+    * :data:`MOBILE_MANDATORY_RISK_FAMILIES` is a **floor** — configuration may
+      not downgrade a family out of it (``test_config_cannot_downgrade_a_mobile_mandatory_family``);
+    * the operator's ``risk_channel_map`` may **add** to it — a family the
+      operator restricted to ``mobile_signed`` is honoured everywhere, including
+      the standing-grant gate.
+
+    Config can add, never remove. With neither argument supplied only the floor is
+    known, which is why callers that *have* settings must pass them.
+    """
+    floor = frozenset(MOBILE_MANDATORY_RISK_FAMILIES)
+    if policy is None and settings is not None:
+        try:
+            policy = ClearanceChannelPolicy.from_settings(settings)
+        except ValueError:
+            # An operator policy that will not even validate must not silently
+            # relax the gate. Treat every family as mobile-mandatory until it is
+            # fixed; a gateway carrying such a config cannot boot anyway, because
+            # create_app validates the same policy before serving.
+            return frozenset(ALL_RISK_FAMILIES)
+    if policy is None:
+        return floor
+    return floor | policy_mobile_mandatory_families(policy)
+
+
+def required_channels_for_risk_family(
+    risk_family: str | None,
+    *,
+    settings: Settings | None = None,
+    policy: ClearanceChannelPolicy | None = None,
+) -> tuple[str, ...] | None:
+    """Channels permitted to decide a request in this risk family.
+
+    The *other* half of the channel policy from
+    :func:`required_channels_for_risk_vector`, derived from
+    :func:`effective_mobile_mandatory_families` — the canonical
+    :data:`MOBILE_MANDATORY_RISK_FAMILIES` floor combined with the operator's
+    configured map — rather than a parallel hardcoded list, so a family added to
+    either source is enforced everywhere with no further edits.
+
+    ``None`` means the family mandates no particular channel. An *unrecognised*
+    family fails closed onto the mobile channel: an unclassified action is a
+    classification gap, and the safe reading of a gap is "a human decides".
+    """
+    family = risk_family or ""
+    if family not in ALL_RISK_FAMILIES:
+        return MOBILE_MANDATORY_CHANNELS
+    if family in effective_mobile_mandatory_families(
+        settings=settings, policy=policy
+    ):
+        return MOBILE_MANDATORY_CHANNELS
+    return None
+
+
+#: Canonical channel ordering, so a combined requirement is deterministic.
+_CHANNEL_PRECEDENCE = ("mobile_signed", "local_terminal")
+
+
+def required_channels_for_request(
+    *,
+    risk_family: str | None = None,
+    risk_vector: dict[str, Any] | None = None,
+    settings: Settings | None = None,
+    policy: ClearanceChannelPolicy | None = None,
+) -> tuple[str, ...] | None:
+    """**The** canonical answer to "must a human on a specific (mobile-signed)
+    channel decide this request?" — covering BOTH halves of the channel policy.
+
+    The channel policy has two independent inputs: the request's ``risk_family``
+    (the EFFECTIVE mobile-mandatory set — see
+    :func:`effective_mobile_mandatory_families`) and the BrowserBridge per-surface
+    ``risk_vector`` (:data:`HIGH_RISK_CLASS_VALUES`). Consulting one and not the
+    other is a hole, so every caller — the clearance decision path in ``app`` and
+    the standing-grant fail-closed gate in ``grants`` — routes through this one
+    function and the two can never drift apart again.
+
+    Pass ``settings`` (or an already-built ``policy``) whenever the caller has
+    them: without either, the family half can only see the static floor and is
+    blind to families the operator configured as mobile-only.
+
+    Returns the channels allowed to decide, or ``None`` when nothing is mandated.
+    """
+    halves = [
+        required
+        for required in (
+            required_channels_for_risk_family(
+                risk_family, settings=settings, policy=policy
+            ),
+            required_channels_for_risk_vector(risk_vector),
+        )
+        if required
+    ]
+    if not halves:
+        return None
+    allowed = set(_CHANNEL_PRECEDENCE)
+    for required in halves:
+        allowed &= set(required)
+    if not allowed:
+        # Two halves demanding disjoint channels must not produce an empty
+        # tuple: channel_satisfies reads a falsy requirement as "no requirement"
+        # and would fail *open*. Fall back to the strictest channel instead.
+        return MOBILE_MANDATORY_CHANNELS
+    return tuple(channel for channel in _CHANNEL_PRECEDENCE if channel in allowed)
 
 
 def channel_satisfies(
