@@ -235,16 +235,44 @@ def evaluate_clearance_channel(
     approval: dict,
     channel: str,
 ) -> ChannelPolicyDecision:
-    policy = ClearanceChannelPolicy.from_settings(settings)
-    deployment_trust_context = deployment_trust_context_for_agent(
+    return evaluate_clearance_channel_for(
         store=store,
         settings=settings,
         node_id=approval["node_id"],
         agent_id=approval["agent_id"],
+        risk_family=approval.get("risk_family"),
+        channel=channel,
+    )
+
+
+def evaluate_clearance_channel_for(
+    *,
+    store: SQLiteStore,
+    settings: Settings,
+    node_id: str,
+    agent_id: str,
+    risk_family: str | None,
+    channel: str,
+) -> ChannelPolicyDecision:
+    """"May a decision on this channel clear a request with this risk family?"
+
+    THE implementation of that question — :func:`evaluate_clearance_channel` is
+    the approval-row-shaped wrapper over it, and the standing-grant channel
+    authority check asks it about the *granting* device. Split out only so callers
+    that hold the fields but not an approval row (a grant lookup happens before
+    the approval row exists) do not have to rebuild the policy and the trust
+    context themselves and drift from the live decision path.
+    """
+    policy = ClearanceChannelPolicy.from_settings(settings)
+    deployment_trust_context = deployment_trust_context_for_agent(
+        store=store,
+        settings=settings,
+        node_id=node_id,
+        agent_id=agent_id,
     )
     return policy.evaluate(
         channel=channel,
-        risk_family=approval.get("risk_family") or "external_effect",
+        risk_family=risk_family or "external_effect",
         deployment_trust_context=deployment_trust_context,
     )
 

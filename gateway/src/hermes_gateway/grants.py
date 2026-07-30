@@ -20,6 +20,8 @@ from typing import Any
 
 from .capability_registry import RISK_FAMILY_RANKS
 from .clearance_policy import (
+    channel_for_device,
+    evaluate_clearance_channel_for,
     required_channels_for_request,
     required_channels_for_risk_family,
 )
@@ -109,16 +111,21 @@ def grant_expiry(settings: Settings, scope: str) -> str:
     )
 
 
-def standing_grant_block_reason(
+def standing_grant_policy_block_reason(
     *,
     settings: Settings,
     risk_family: str | None,
     risk_vector: dict[str, Any] | None,
 ) -> str | None:
-    """The single fail-closed gate, shared by the write and read sides.
+    """The CONFIG-and-request half of the gate: kill switch, risk-ladder floor,
+    and the channel requirements the risk family / risk vector impose on their own.
 
-    Returns a machine-readable reason string when a standing grant must not be
-    minted or consumed, or ``None`` when it may be.
+    Deliberately NOT the whole gate and deliberately not named as if it were —
+    it knows nothing about *who* granted the standing authority, so on its own it
+    cannot tell a family the operator restricted to ``local_terminal`` from a
+    family with no channel requirement at all. :func:`standing_grant_block_reason`
+    is what mint and consume call; this is one of its two halves, exposed only so
+    the pure-policy half can be unit-tested without a store.
     """
     if not settings.standing_grants_enabled:
         return "standing_grants_disabled"
@@ -147,6 +154,114 @@ def standing_grant_block_reason(
     return None
 
 
+def grant_channel_authority_block_reason(
+    *,
+    store: SQLiteStore,
+    settings: Settings,
+    node_id: str,
+    agent_id: str,
+    risk_family: str | None,
+    granted_by_device_id: str | None,
+) -> str | None:
+    """The AUTHORITY half of the gate: does the granting device's channel actually
+    have the standing to decide *this* request?
+
+    A standing grant is a **prior human decision**, so it carries exactly the
+    channel authority of the device that minted it and no more. The question asked
+    here is therefore the *same* question the live decision path asks of a phone
+    tapping "approve" — :func:`evaluate_clearance_channel_for`, i.e.
+    ``ClearanceChannelPolicy.evaluate`` on the effective operator policy plus the
+    agent's deployment trust context — only with the *granting* device's channel
+    substituted for the deciding device's.
+
+    Why the family-level half above cannot answer this: it projects the policy onto
+    the single question "is this family mobile-mandatory". An operator who restricts
+    a family to the OTHER human channel (``routine: ("local_terminal",)``) imposes
+    a real human-channel requirement that projection cannot see, so the request
+    looked unconstrained and a stored grant cleared it. Asking ``evaluate`` instead
+    keeps the whole map in play. And the naive alternative — "block whenever the
+    policy imposes any requirement" — is not available: ``validate()`` requires
+    ``risk_channel_map`` to cover every family and the lookup default is
+    ``("mobile_signed",)``, so every family always imposes something and the
+    feature would be dead rather than safe.
+
+    Consequence, which is the intended posture: a ``mobile_signed`` grant may
+    auto-satisfy families the policy lets ``mobile_signed`` decide and may NOT
+    auto-satisfy a family restricted to ``local_terminal`` (and vice-versa).
+
+    Fail-closed in every unresolvable case: no granting device recorded, the device
+    row gone (deleted/never existed), a device whose channel cannot be resolved, or
+    a policy that will not validate. "We cannot tell whose authority this was" is
+    never an answer that permits auto-satisfy.
+    """
+    if not granted_by_device_id:
+        return "grant_channel_authority_unresolved"
+    try:
+        device = store.get_device(granted_by_device_id)
+    except KeyError:
+        return "grant_channel_authority_unresolved"
+    channel = channel_for_device(device)
+    if not channel:
+        return "grant_channel_authority_unresolved"
+    try:
+        decision = evaluate_clearance_channel_for(
+            store=store,
+            settings=settings,
+            node_id=node_id,
+            agent_id=agent_id,
+            risk_family=risk_family,
+            channel=channel,
+        )
+    except ValueError:
+        # An operator policy that will not validate must not widen the gate.
+        return "grant_channel_authority_unresolved"
+    if not decision.allowed:
+        return "grant_channel_authority_insufficient"
+    return None
+
+
+def standing_grant_block_reason(
+    *,
+    store: SQLiteStore,
+    settings: Settings,
+    node_id: str,
+    agent_id: str,
+    risk_family: str | None,
+    risk_vector: dict[str, Any] | None,
+    granted_by_device_id: str | None,
+) -> str | None:
+    """The single fail-closed gate, shared by the write and read sides.
+
+    Returns a machine-readable reason string when a standing grant must not be
+    minted or consumed, or ``None`` when it may be. Both halves, in order:
+    :func:`standing_grant_policy_block_reason` (kill switch, risk ladder, the
+    channel requirements the family/vector impose) then
+    :func:`grant_channel_authority_block_reason` (the granting device's channel
+    authority over this request). The policy half runs first so its coarser,
+    config-independent refusal reasons stay stable in the audit trail.
+
+    Every caller goes through here — ``mint_grant_for_decision`` and
+    ``standing_grant_for_request`` — which is why the ``granted_by_device_id``
+    argument is required rather than defaulted: a call site that does not know
+    whose authority it is honouring must not compile, let alone silently pass.
+    """
+    reason = standing_grant_policy_block_reason(
+        settings=settings,
+        risk_family=risk_family,
+        risk_vector=risk_vector,
+    )
+    if reason is not None:
+        return reason
+    return grant_channel_authority_block_reason(
+        store=store,
+        settings=settings,
+        node_id=node_id,
+        agent_id=agent_id,
+        risk_family=risk_family,
+        granted_by_device_id=granted_by_device_id,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Write side — mint a grant from a human decision
 # ---------------------------------------------------------------------------
@@ -172,9 +287,17 @@ def mint_grant_for_decision(
         return None
 
     reason = standing_grant_block_reason(
+        store=store,
         settings=settings,
+        node_id=approval["node_id"],
+        agent_id=approval["agent_id"],
         risk_family=approval.get("risk_family"),
         risk_vector=approval.get("risk_vector"),
+        # The device deciding *is* the device that would mint the grant, so the
+        # authority half is asked about it here and about
+        # ``grant["granted_by_device_id"]`` on the consume side — the same device,
+        # the same question, one gate.
+        granted_by_device_id=decided_by_device_id,
     )
     if reason is not None:
         store.append_audit_event(
@@ -332,11 +455,16 @@ def standing_grant_for_request(
     # A grant existing is not authority to use it. The same gate the write side
     # applies is re-applied here, so a grant that predates a policy change (or
     # a request that carries a channel-mandating risk vector the granted one did
-    # not) still fails closed.
+    # not, or one whose granting device no longer has the standing to decide this
+    # family) still fails closed.
     reason = standing_grant_block_reason(
+        store=store,
         settings=settings,
+        node_id=node_id,
+        agent_id=agent_id,
         risk_family=risk_family,
         risk_vector=risk_vector,
+        granted_by_device_id=grant.get("granted_by_device_id"),
     )
     if reason is not None:
         return StandingGrantResolution(refusal=reason)

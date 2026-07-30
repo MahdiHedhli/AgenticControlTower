@@ -35,7 +35,7 @@ from hermes_gateway.config import Settings
 from hermes_gateway.grants import (
     GRANT_UNGRANTABLE_RISK_FAMILIES,
     grant_ungrantable_risk_families,
-    standing_grant_block_reason,
+    standing_grant_policy_block_reason,
 )
 
 # The gate scenarios deliberately use a risk family a standing grant MAY satisfy.
@@ -859,7 +859,7 @@ def test_auto_satisfied_clearance_can_be_reserved_and_committed(
 # WS6 — the fail-closed gate must enforce the WHOLE channel policy, not the
 # risk_vector half of it.
 #
-# Regression: standing_grant_block_reason consulted only
+# Regression: standing_grant_policy_block_reason consulted only
 # required_channels_for_risk_vector, so ``external_effect`` — which ranks BELOW
 # the destructive exclusion floor yet is in MOBILE_MANDATORY_RISK_FAMILIES —
 # slipped through both halves and came back approved / approved_by=standing_grant
@@ -991,14 +991,14 @@ def test_every_mobile_mandatory_family_blocks_a_standing_grant() -> None:
         database_path=":memory:",
     )
     for family in MOBILE_MANDATORY_RISK_FAMILIES:
-        reason = standing_grant_block_reason(
+        reason = standing_grant_policy_block_reason(
             settings=settings, risk_family=family, risk_vector=None
         )
         assert reason is not None, family
         assert required_channels_for_request(risk_family=family) == ("mobile_signed",)
     assert MOBILE_MANDATORY_RISK_FAMILIES <= set(GRANT_UNGRANTABLE_RISK_FAMILIES)
     assert (
-        standing_grant_block_reason(
+        standing_grant_policy_block_reason(
             settings=settings, risk_family="not_a_family", risk_vector=None
         )
         is not None
@@ -1006,7 +1006,7 @@ def test_every_mobile_mandatory_family_blocks_a_standing_grant() -> None:
     # The low tier stays grantable, otherwise the feature is dead rather than safe.
     for family in LOW_RISK_FAMILIES:
         assert (
-            standing_grant_block_reason(
+            standing_grant_policy_block_reason(
                 settings=settings, risk_family=family, risk_vector=None
             )
             is None
@@ -1027,7 +1027,7 @@ def test_gate_tracks_the_mobile_mandatory_set_without_editing_grants(
         database_path=":memory:",
     )
     assert (
-        standing_grant_block_reason(
+        standing_grant_policy_block_reason(
             settings=settings, risk_family="routine", risk_vector=None
         )
         is None
@@ -1038,7 +1038,7 @@ def test_gate_tracks_the_mobile_mandatory_set_without_editing_grants(
         clearance_policy.MOBILE_MANDATORY_RISK_FAMILIES | {"routine"},
     )
     assert (
-        standing_grant_block_reason(
+        standing_grant_policy_block_reason(
             settings=settings, risk_family="routine", risk_vector=None
         )
         == "channel_requirement"
@@ -1150,13 +1150,13 @@ def test_the_gate_reads_the_effective_policy_not_the_static_constant(
 
     # Config ADDS: identical family, identical call, different effective policy.
     assert (
-        standing_grant_block_reason(
+        standing_grant_policy_block_reason(
             settings=default, risk_family="routine", risk_vector=None
         )
         is None
     )
     assert (
-        standing_grant_block_reason(
+        standing_grant_policy_block_reason(
             settings=configured, risk_family="routine", risk_vector=None
         )
         == "channel_requirement"
@@ -1175,7 +1175,7 @@ def test_the_gate_reads_the_effective_policy_not_the_static_constant(
         | {"external_effect": ("mobile_signed", "local_terminal")},
     )
     assert (
-        standing_grant_block_reason(
+        standing_grant_policy_block_reason(
             settings=downgraded, risk_family="external_effect", risk_vector=None
         )
         == "channel_requirement"
@@ -1184,15 +1184,301 @@ def test_the_gate_reads_the_effective_policy_not_the_static_constant(
     # Preserved: an unrecognised family still fails closed, and the low tier the
     # operator did NOT restrict stays grantable so the feature is not dead.
     assert (
-        standing_grant_block_reason(
+        standing_grant_policy_block_reason(
             settings=configured, risk_family="not_a_family", risk_vector=None
         )
         is not None
     )
     for family in LOW_RISK_FAMILIES - {"routine"}:
         assert (
-            standing_grant_block_reason(
+            standing_grant_policy_block_reason(
                 settings=configured, risk_family=family, risk_vector=None
             )
             is None
         ), family
+
+
+# --------------------------------------------------------------------------
+# WS8 — a standing grant carries the CHANNEL AUTHORITY of the device that
+# minted it, no more.
+#
+# Regression: the gate projected the operator's policy onto the single question
+# "is this family restricted to mobile_signed?" (set(channels) <= {"mobile_signed"}).
+# An operator who restricts a family to the OTHER human channel —
+# routine=local_terminal, "only a human at the local terminal may decide this" —
+# produced channels that are not a subset of the mobile set, so the family was
+# absent from the effective mobile-mandatory set, required_channels_for_request
+# returned None, and the gate returned None: a stored grant auto-approved a
+# request that NO channel enabled on the host was allowed to decide. Failed OPEN
+# on an operator tightening the policy.
+#
+# The correct question is not "which families are mobile-only" but "does the
+# GRANTING DEVICE's channel satisfy this request's channel requirement" — the
+# same ClearanceChannelPolicy.evaluate call the live decision path makes, asked
+# of the prior human decision. Blocking whenever the policy imposes any
+# requirement is not an option: validate() forces risk_channel_map to cover every
+# family and the lookup default is ("mobile_signed",), so that reading blocks
+# every family and kills the feature.
+# --------------------------------------------------------------------------
+
+#: Operator restricts ``routine`` to the local terminal. Complete, valid, and
+#: makes the family a HUMAN-channel family that a mobile device may not decide.
+LOCAL_ONLY_ROUTINE_MAP: dict[str, tuple[str, ...]] = dict(
+    Settings.default_clearance_risk_channel_map
+) | {"routine": ("local_terminal",)}
+
+
+def grants_settings(tmp_path: Path, **over: Any) -> Settings:
+    base = Settings(
+        node_id="node_test",
+        node_display_name="Test Hermes",
+        node_fingerprint="test-fingerprint",
+        gateway_base_url="http://127.0.0.1:8787/v1",
+        database_path=str(tmp_path / "gateway.sqlite3"),
+        pairing_ttl_seconds=60,
+    )
+    return replace(base, **over)
+
+
+def grants_client(settings: Settings) -> TestClient:
+    return TestClient(create_app(settings), client=("127.0.0.1", 50000))
+
+
+def test_mobile_grant_does_not_auto_satisfy_a_local_terminal_only_family(
+    tmp_path: Path,
+) -> None:
+    """(a) The refuter's exact scenario, over HTTP, one database, two boots.
+
+    Boot 1 on the default map: a paired mobile human legitimately grants "allow
+    forever" on ``routine``. Boot 2 with the operator's map tightened to
+    ``routine=local_terminal``: the same mobile human is now 403'd by the live
+    decision path, so the stored grant — which carries only that device's mobile
+    authority — must not clear the request either.
+    """
+    db_settings = grants_settings(tmp_path)
+    with grants_client(db_settings) as client:
+        paired = pair_device(client)
+        first = create_approval(
+            client, action_id="act_auth_1", requested_tool="git_status"
+        )
+        decide(client, paired, first, scope="permanent")
+        assert client.app.state.store.list_approval_grants(), "grant should exist"
+        device_id = paired["device"]["device_id"]
+        private_key = paired["private_key"]
+
+    tightened = replace(db_settings, clearance_risk_channel_map=LOCAL_ONLY_ROUTINE_MAP)
+    with grants_client(tightened) as client:
+        # The live decision path refuses this device for this family. Everything
+        # below is the claim that the grants path agrees with it.
+        pending = create_approval(
+            client, action_id="act_auth_live", requested_tool="other_tool"
+        )
+        rejected = signed_request(
+            client,
+            "POST",
+            f"/v1/approvals/{pending['approval_id']}/decisions",
+            private_key=private_key,
+            device_id=device_id,
+            json_body=decision_body(
+                approval_id=pending["approval_id"],
+                decision="approve",
+                scope="once",
+                params_fingerprint=pending["params_fingerprint"],
+            ),
+        )
+        assert rejected.status_code == 403, rejected.text
+        assert rejected.json()["detail"] == "channel_not_eligible_for_risk_family"
+
+        second = create_approval(
+            client, action_id="act_auth_2", requested_tool="git_status"
+        )
+        assert second["state"] == "pending", (
+            "BYPASS: the operator restricted routine to the local-terminal human "
+            "channel, yet a mobile-minted grant auto-approved it: "
+            f"{second['state']} / {second.get('approved_by')}"
+        )
+        assert second.get("approved_by") != "standing_grant"
+        assert not second.get("human_approved")
+
+        runtime = client.post(
+            "/v1/runtime/approvals",
+            json={
+                "requested_tool": "git_status",
+                "risk_level": "medium",
+                "risk_family": "routine",
+                "summary": "again",
+                "payload_redacted": {"command": "git status"},
+                "agent_id": "agent_runtime",
+                "session_id": "sess_runtime",
+                "expires_in_seconds": 300,
+            },
+        )
+        assert runtime.status_code == 201, runtime.text
+        assert runtime.json()["state"] == "pending", "BYPASS on the runtime path"
+
+        paired2 = pair_device(client)
+        assert audit_events(client, paired2, "approval_auto_satisfied") == []
+        refusals = audit_events(client, paired2, "approval_auto_satisfy_refused")
+        assert [event["payload_redacted"]["reason"] for event in refusals] == [
+            "grant_channel_authority_insufficient"
+        ] * len(refusals)
+        assert len(refusals) >= 1
+
+
+def test_mobile_device_cannot_mint_a_grant_for_a_local_terminal_only_family(
+    tmp_path: Path,
+) -> None:
+    """Mint side of the same gate: a device that may not decide the family in the
+    first place must not be able to leave standing authority over it behind."""
+    settings = grants_settings(tmp_path, clearance_risk_channel_map=LOCAL_ONLY_ROUTINE_MAP)
+    with grants_client(settings) as client:
+        paired = pair_device(client)
+        approval = create_approval(
+            client, action_id="act_auth_mint", requested_tool="git_status"
+        )
+        # The decision itself is refused upstream by the channel policy, so the
+        # grant cannot even be attempted — no grant row, no created event.
+        response = signed_request(
+            client,
+            "POST",
+            f"/v1/approvals/{approval['approval_id']}/decisions",
+            private_key=paired["private_key"],
+            device_id=paired["device"]["device_id"],
+            json_body=decision_body(
+                approval_id=approval["approval_id"],
+                decision="approve",
+                scope="permanent",
+                params_fingerprint=approval["params_fingerprint"],
+            ),
+        )
+        assert response.status_code == 403, response.text
+        assert client.app.state.store.list_approval_grants() == []
+        assert audit_events(client, paired, "capability_grant_created") == []
+
+
+def test_session_scope_grant_still_auto_satisfies_under_the_default_policy(
+    client: TestClient,
+) -> None:
+    """(b) FEATURE ALIVE. The channel-authority check must not be a blanket block:
+    under the DEFAULT policy a mobile-minted session-scope grant still clears a
+    byte-identical second request, with the grant recorded as its authority."""
+    paired = pair_device(client)
+    first = create_approval(client, action_id="act_alive_1", requested_tool="git_status")
+    decide(client, paired, first, scope="session")
+
+    second = create_approval(client, action_id="act_alive_2", requested_tool="git_status")
+
+    assert second["params_fingerprint"] == first["params_fingerprint"]
+    assert second["state"] == "approved"
+    assert second["approved_by"] == "standing_grant"
+    assert not second["human_approved"]
+    satisfied = audit_events(client, paired, "approval_auto_satisfied")
+    assert len(satisfied) == 1
+    assert satisfied[0]["payload_redacted"]["granted_by_device_id"] == (
+        paired["device"]["device_id"]
+    )
+    assert audit_events(client, paired, "approval_auto_satisfy_refused") == []
+
+
+def test_local_terminal_grant_does_satisfy_a_local_terminal_only_family(
+    tmp_path: Path,
+) -> None:
+    """The other direction, which is what makes this an AUTHORITY model rather
+    than a second blanket refusal: on a host where the local terminal is enabled
+    and trusted, a grant minted by a ``local_terminal`` device DOES auto-satisfy
+    the family the operator restricted to that channel."""
+    settings = grants_settings(
+        tmp_path,
+        clearance_enabled_channels=("mobile_signed", "local_terminal"),
+        clearance_local_terminal_enabled=True,
+        clearance_default_deployment_trust_context="trusted_host",
+        clearance_risk_channel_map=LOCAL_ONLY_ROUTINE_MAP,
+    )
+    with grants_client(settings) as client:
+        # The trust context is a property of the AGENT row, not of settings.
+        client.app.state.store.update_agent_trust_context(
+            node_id="node_test", agent_id="agent_mock", deployment_trust_context="trusted_host"
+        )
+        terminal = pair_device(client, clearance_channel="local_terminal")
+        mobile = pair_device(client)
+        first = create_approval(
+            client, action_id="act_auth_local_1", requested_tool="git_status"
+        )
+        decide(client, terminal, first, scope="session")
+
+        second = create_approval(
+            client, action_id="act_auth_local_2", requested_tool="git_status"
+        )
+        assert second["state"] == "approved"
+        assert second["approved_by"] == "standing_grant"
+        assert audit_events(client, mobile, "approval_auto_satisfy_refused") == []
+
+
+def test_grant_whose_granting_device_was_deleted_fails_closed(
+    client: TestClient,
+) -> None:
+    """(c) Authority that cannot be resolved is not authority. Delete the device
+    row the grant was minted by and the grant must stop clearing requests."""
+    paired = pair_device(client)
+    first = create_approval(client, action_id="act_auth_del_1", requested_tool="git_status")
+    decide(client, paired, first, scope="permanent")
+
+    second = create_approval(client, action_id="act_auth_del_2", requested_tool="git_status")
+    assert second["state"] == "approved", "sanity: the grant works before the deletion"
+
+    store = client.app.state.store
+    device_id = paired["device"]["device_id"]
+    with store.connect() as db:
+        # auth_tokens / request_nonces carry a FK onto devices, so a real deletion
+        # takes them with it.
+        db.execute("DELETE FROM request_nonces WHERE device_id = ?", (device_id,))
+        db.execute("DELETE FROM auth_tokens WHERE device_id = ?", (device_id,))
+        db.execute("DELETE FROM devices WHERE device_id = ?", (device_id,))
+
+    third = create_approval(client, action_id="act_auth_del_3", requested_tool="git_status")
+    assert third["state"] == "pending"
+    assert third.get("approved_by") != "standing_grant"
+
+    auditor = pair_device(client)
+    refusals = audit_events(client, auditor, "approval_auto_satisfy_refused")
+    assert len(refusals) == 1
+    assert refusals[0]["payload_redacted"]["reason"] == "grant_channel_authority_unresolved"
+
+
+def test_grant_with_no_granting_device_recorded_fails_closed(client: TestClient) -> None:
+    """A row with no ``granted_by_device_id`` records no human authority at all —
+    it can only have arrived by predating the feature or by a hand-edited
+    database — so it must never clear a request."""
+    paired = pair_device(client)
+    plant_grant(
+        client,
+        scope="permanent",
+        risk_family="routine",
+        requested_tool="git_status",
+    )
+
+    approval = create_approval(
+        client, action_id="act_auth_nodev", requested_tool="git_status"
+    )
+
+    assert approval["state"] == "pending"
+    assert audit_events(client, paired, "approval_auto_satisfied") == []
+    refusals = audit_events(client, paired, "approval_auto_satisfy_refused")
+    assert len(refusals) == 1
+    assert refusals[0]["payload_redacted"]["reason"] == "grant_channel_authority_unresolved"
+
+
+def test_the_policy_half_alone_cannot_see_a_local_terminal_only_family(
+    tmp_path: Path,
+) -> None:
+    """Unit-level statement of why the authority half had to exist: the
+    config/family/vector half returns None for a family restricted to
+    ``local_terminal``, so it is provably not the whole gate."""
+    settings = grants_settings(tmp_path, clearance_risk_channel_map=LOCAL_ONLY_ROUTINE_MAP)
+    assert (
+        standing_grant_policy_block_reason(
+            settings=settings, risk_family="routine", risk_vector=None
+        )
+        is None
+    )
+    assert required_channels_for_request(risk_family="routine", settings=settings) is None
