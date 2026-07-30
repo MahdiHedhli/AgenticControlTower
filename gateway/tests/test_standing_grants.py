@@ -34,6 +34,7 @@ from hermes_gateway.clearance_policy import (
 from hermes_gateway.config import Settings
 from hermes_gateway.grants import (
     GRANT_UNGRANTABLE_RISK_FAMILIES,
+    grant_ungrantable_risk_families,
     standing_grant_block_reason,
 )
 
@@ -1042,3 +1043,156 @@ def test_gate_tracks_the_mobile_mandatory_set_without_editing_grants(
         )
         == "channel_requirement"
     )
+
+
+# --------------------------------------------------------------------------
+# WS7 — the gate must read the EFFECTIVE policy, not just module constants.
+#
+# Regression: required_channels_for_risk_family consulted the STATIC
+# MOBILE_MANDATORY_RISK_FAMILIES set and ignored the operator-supplied
+# ACT_CLEARANCE_RISK_CHANNEL_MAP that ClearanceChannelPolicy.from_settings
+# actually runs on. A family the operator had configured as mobile-only was
+# therefore invisible to the grants gate and could still be auto-satisfied from
+# a stored grant — the same two-sources-of-truth drift the previous fix set out
+# to eliminate, one layer down.
+#
+# Semantics under test: the static set is a FLOOR config cannot downgrade (that
+# is test_config_cannot_downgrade_a_mobile_mandatory_family, in the channel
+# policy suite) AND config can ADD requirements the gate must honour. Strictest
+# of both; config can add, never remove.
+# --------------------------------------------------------------------------
+
+#: ``routine`` is grantable under the default map (eligible on BOTH channels) and
+#: is absent from the static mobile-mandatory set, so restricting it here makes it
+#: mobile-mandatory *purely* by operator configuration.
+MOBILE_ONLY_ROUTINE_MAP: dict[str, tuple[str, ...]] = dict(
+    Settings.default_clearance_risk_channel_map
+) | {"routine": ("mobile_signed",)}
+
+
+def config_mobile_only_settings(tmp_path: Path) -> Settings:
+    return Settings(
+        node_id="node_test",
+        node_display_name="Test Hermes",
+        node_fingerprint="test-fingerprint",
+        gateway_base_url="http://127.0.0.1:8787/v1",
+        database_path=str(tmp_path / "gateway.sqlite3"),
+        pairing_ttl_seconds=60,
+        clearance_risk_channel_map=MOBILE_ONLY_ROUTINE_MAP,
+    )
+
+
+def config_mobile_only_client(tmp_path: Path) -> TestClient:
+    return TestClient(
+        create_app(config_mobile_only_settings(tmp_path)),
+        client=("127.0.0.1", 50000),
+    )
+
+
+def test_config_added_mobile_mandatory_family_is_not_auto_satisfied(
+    tmp_path: Path,
+) -> None:
+    """CONSUME side. A live grant matching a family the operator's risk-channel
+    map restricts to ``mobile_signed`` must not clear the request."""
+    with config_mobile_only_client(tmp_path) as client:
+        paired = pair_device(client)
+        plant_grant(
+            client,
+            scope="permanent",
+            risk_family="routine",
+            requested_tool="git_status",
+        )
+
+        approval = create_approval(
+            client,
+            action_id="act_cfg_consume",
+            requested_tool="git_status",
+            risk_family="routine",
+        )
+
+        assert approval["state"] == "pending"
+        assert approval.get("approved_by") != "standing_grant"
+        assert not approval.get("human_approved")
+        assert audit_events(client, paired, "approval_auto_satisfied") == []
+        refusals = audit_events(client, paired, "approval_auto_satisfy_refused")
+        assert len(refusals) == 1
+        assert refusals[0]["payload_redacted"]["reason"] == "channel_requirement"
+        assert refusals[0]["payload_redacted"]["risk_family"] == "routine"
+
+
+def test_config_added_mobile_mandatory_family_refuses_to_mint(tmp_path: Path) -> None:
+    """MINT side of the same gate: "allow forever" on a family the operator made
+    mobile-mandatory must not persist standing authority in the first place."""
+    with config_mobile_only_client(tmp_path) as client:
+        paired = pair_device(client)
+        approval = create_approval(
+            client,
+            action_id="act_cfg_mint",
+            requested_tool="git_status",
+            risk_family="routine",
+        )
+        decide(client, paired, approval, scope="permanent")
+
+        assert audit_events(client, paired, "capability_grant_created") == []
+        refusals = audit_events(client, paired, "capability_grant_refused")
+        assert len(refusals) == 1
+        assert refusals[0]["payload_redacted"]["reason"] == "channel_requirement"
+        assert client.app.state.store.list_approval_grants() == []
+
+
+def test_the_gate_reads_the_effective_policy_not_the_static_constant(
+    tmp_path: Path,
+) -> None:
+    """Unit-level statement of the same thing, plus the "config can add, never
+    remove" direction and the preserved fail-closed behaviours."""
+    configured = config_mobile_only_settings(tmp_path)
+    default = replace(configured, clearance_risk_channel_map=None)
+
+    # Config ADDS: identical family, identical call, different effective policy.
+    assert (
+        standing_grant_block_reason(
+            settings=default, risk_family="routine", risk_vector=None
+        )
+        is None
+    )
+    assert (
+        standing_grant_block_reason(
+            settings=configured, risk_family="routine", risk_vector=None
+        )
+        == "channel_requirement"
+    )
+    assert required_channels_for_request(
+        risk_family="routine", settings=configured
+    ) == ("mobile_signed",)
+    assert "routine" in grant_ungrantable_risk_families(configured)
+    assert "routine" not in grant_ungrantable_risk_families(default)
+
+    # Config can never REMOVE: handing external_effect both channels does not
+    # make it grantable, because the static set is a floor.
+    downgraded = replace(
+        configured,
+        clearance_risk_channel_map=dict(Settings.default_clearance_risk_channel_map)
+        | {"external_effect": ("mobile_signed", "local_terminal")},
+    )
+    assert (
+        standing_grant_block_reason(
+            settings=downgraded, risk_family="external_effect", risk_vector=None
+        )
+        == "channel_requirement"
+    )
+
+    # Preserved: an unrecognised family still fails closed, and the low tier the
+    # operator did NOT restrict stays grantable so the feature is not dead.
+    assert (
+        standing_grant_block_reason(
+            settings=configured, risk_family="not_a_family", risk_vector=None
+        )
+        is not None
+    )
+    for family in LOW_RISK_FAMILIES - {"routine"}:
+        assert (
+            standing_grant_block_reason(
+                settings=configured, risk_family=family, risk_vector=None
+            )
+            is None
+        ), family

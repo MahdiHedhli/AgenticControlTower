@@ -48,15 +48,35 @@ GRANT_EXCLUDED_RISK_FAMILIES: frozenset[str] = frozenset(
     family for family, rank in RISK_FAMILY_RANKS.items() if rank >= _EXCLUSION_FLOOR
 )
 
-#: Every family a standing grant can never satisfy, both halves of the policy
-#: combined. Derived, never enumerated: a family added to either the risk ladder
-#: above the floor or to MOBILE_MANDATORY_RISK_FAMILIES lands here for free.
+#: The CONFIG-INDEPENDENT floor of families a standing grant can never satisfy —
+#: both halves of the static policy combined. Derived, never enumerated: a family
+#: added to either the risk ladder above the floor or to
+#: MOBILE_MANDATORY_RISK_FAMILIES lands here for free.
+#:
+#: A module constant cannot see operator configuration, so this is a floor and not
+#: the whole answer: ``ACT_CLEARANCE_RISK_CHANNEL_MAP`` can make further families
+#: mobile-mandatory. :func:`grant_ungrantable_risk_families` is the effective set
+#: for a given deployment, and :func:`standing_grant_block_reason` is what the
+#: gateway actually enforces.
 GRANT_UNGRANTABLE_RISK_FAMILIES: frozenset[str] = frozenset(
     family
     for family in RISK_FAMILY_RANKS
     if family in GRANT_EXCLUDED_RISK_FAMILIES
     or required_channels_for_risk_family(family)
 )
+
+
+def grant_ungrantable_risk_families(settings: Settings) -> frozenset[str]:
+    """Every family a standing grant can never satisfy *in this deployment*.
+
+    :data:`GRANT_UNGRANTABLE_RISK_FAMILIES` plus whatever the operator's
+    effective channel policy adds. Config can add, never remove.
+    """
+    return GRANT_UNGRANTABLE_RISK_FAMILIES | frozenset(
+        family
+        for family in RISK_FAMILY_RANKS
+        if required_channels_for_risk_family(family, settings=settings)
+    )
 
 
 def risk_family_blocks_standing_grant(risk_family: str | None) -> bool:
@@ -107,13 +127,22 @@ def standing_grant_block_reason(
     if required_channels_for_request(
         risk_family=risk_family,
         risk_vector=risk_vector,
+        # The EFFECTIVE policy, not just the module constants. The gateway runs on
+        # ClearanceChannelPolicy.from_settings(settings), whose risk_channel_map is
+        # operator-supplied (ACT_CLEARANCE_RISK_CHANNEL_MAP); a gate that read only
+        # the static set was blind to every family the operator had configured as
+        # mobile-mandatory and would auto-satisfy it from a stored grant. Threading
+        # settings through the ONE shared gate covers both callers at once — mint
+        # (mint_grant_for_decision) and consume (standing_grant_for_request).
+        settings=settings,
     ):
         # The channel policy mandates a specific (mobile-signed, human) decision
         # channel for this request — because of its risk family, its per-surface
         # risk vector, or both. A stored grant is not a human on a channel, so it
         # must always prompt. Routed through the canonical combined entry point so
         # this gate enforces the WHOLE policy, not one half of it: adding a family
-        # to MOBILE_MANDATORY_RISK_FAMILIES blocks auto-satisfy here with no edit.
+        # to MOBILE_MANDATORY_RISK_FAMILIES *or* to the operator's mobile-only map
+        # blocks auto-satisfy here with no edit.
         return "channel_requirement"
     return None
 

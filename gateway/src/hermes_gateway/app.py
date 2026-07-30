@@ -2930,6 +2930,15 @@ def _transition_approval(
         required_channels = required_channels_for_request(
             risk_family=approval.get("risk_family"),
             risk_vector=approval.get("risk_vector"),
+            # Deliberately NOT passed ``settings`` here, unlike the standing-grant
+            # gate. On this path the operator's risk_channel_map is already fully
+            # enforced upstream by ``enforce_clearance_channel`` ->
+            # ``ClearanceChannelPolicy.evaluate``, which rejects a device whose
+            # channel is not in the map's eligible list for the family. What this
+            # check adds is the part evaluate cannot express: the static
+            # MOBILE_MANDATORY_RISK_FAMILIES *floor* config must not downgrade.
+            # Threading settings in as well would be unreachable code — no input
+            # exists for which it could change the outcome.
         )
         if not channel_satisfies(device_channel, required_channels):
             store.append_audit_event(
