@@ -296,3 +296,45 @@ def register_identity_routes(
             request_id=request_id(request),
             payload_redacted={"device_id": device_id},
         )
+        # Cascade: a revoked device's standing grants must not outlive it.
+        # The read-side liveness gate in ``grants.py`` is the load-bearing
+        # control (it also covers rows this loop never sees — a hand-flipped
+        # status, a crash between the UPDATE above and here); this write keeps
+        # ``GET /v1/approval-grants`` honest and audits the withdrawal per
+        # grant, exactly like ``POST /v1/approval-grants/<id>/revoke`` does.
+        revoked_by = f"device_revoked:{device_id}"
+        for grant in store.list_approval_grants(state="active"):
+            if grant.get("granted_by_device_id") != device_id:
+                continue
+            revoked = store.revoke_approval_grant(grant["grant_id"], revoked_by=revoked_by)
+            store.append_audit_event(
+                event_type="capability_grant_revoked",
+                actor_type="device",
+                actor_id=device.device_id,
+                node_id=revoked["node_id"],
+                agent_id=revoked["agent_id"],
+                session_id=revoked.get("session_id"),
+                approval_id=revoked["source_approval_id"],
+                request_id=request_id(request),
+                payload_redacted={
+                    "grant_id": revoked["grant_id"],
+                    "scope": revoked["scope"],
+                    "requested_tool": revoked["requested_tool"],
+                    "risk_family": revoked["risk_family"],
+                    "source_approval_id": revoked["source_approval_id"],
+                    "revoked_at": revoked["revoked_at"],
+                    "revoked_by": revoked_by,
+                },
+            )
+            store.create_event(
+                node_id=revoked["node_id"],
+                agent_id=revoked["agent_id"],
+                session_id=revoked.get("session_id"),
+                event_type="capability_grant.revoked",
+                payload={
+                    "grant_id": revoked["grant_id"],
+                    "scope": revoked["scope"],
+                    "requested_tool": revoked["requested_tool"],
+                    "revoked_by": revoked_by,
+                },
+            )
