@@ -152,6 +152,20 @@ void main() {
           reason: 'the connection check must say what to do, not just fail');
       expectNoRawExceptionText(tester, where: 'settings check, dead gateway');
 
+      // --- what this scenario structurally cannot reach ------------------
+      // Browser Assist and TUA are pushed routes whose *list* load fails first
+      // against a closed port: `LoadFailurePanel` replaces the session cards,
+      // so Record Note / Return / the reply bar are never rendered and their
+      // action-path escapes cannot be provoked here. One dead port cannot
+      // produce "the list succeeded, the action did not", which is exactly the
+      // state those bugs lived in. Those are covered by
+      // `test/browser_assistance_actions_test.dart` and `test/tua_outage_test.dart`,
+      // which serve the list and then refuse the write.
+      //
+      // Also note what this whole scenario asserts implicitly: `testWidgets`
+      // fails outright on an unhandled async error in its zone, so every leg
+      // above is simultaneously a check that nothing escaped unclaimed.
+
       await unmountApp(tester);
     },
   );

@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 
 import '../app_runtime.dart';
 import '../models/alpha_models.dart';
+import '../operator_error.dart';
 import '../repositories/alpha_repository.dart';
 import '../routes.dart';
 import '../viewmodels/tui_viewmodel.dart';
@@ -76,8 +77,8 @@ class _TuiScreenState extends State<TuiScreen> {
           _TerminalHeader(
             viewModel: _viewModel,
             onCopy: _copyScrollback,
-            onDetach: _viewModel.detach,
-            onClose: _viewModel.close,
+            onDetach: () => _runTerminalAction(_viewModel.detach),
+            onClose: () => _runTerminalAction(_viewModel.close),
           ),
           Expanded(
             child: _TerminalPane(
@@ -94,7 +95,8 @@ class _TuiScreenState extends State<TuiScreen> {
             page: _page,
             keys: _viewModel.keysForPage(_page),
             onPageSelected: (page) => setState(() => _page = page),
-            onKeyPressed: _viewModel.sendSpecialKey,
+            onKeyPressed: (label) =>
+                _runTerminalAction(() => _viewModel.sendSpecialKey(label)),
           ),
         ],
       ),
@@ -118,32 +120,55 @@ class _TuiScreenState extends State<TuiScreen> {
     });
   }
 
-  Future<void> _sendDraft() async {
+  void _sendDraft() {
     final text = _inputController.text;
     if (text.trim().isEmpty) {
       return;
     }
-    await _viewModel.sendText(text.endsWith('\n') ? text : '$text\n');
-    _inputController.clear();
+    _runTerminalAction(() async {
+      await _viewModel.sendText(text.endsWith('\n') ? text : '$text\n');
+      _inputController.clear();
+    });
   }
 
-  Future<void> _pasteFromClipboard() async {
-    final data = await Clipboard.getData(Clipboard.kTextPlain);
-    final text = data?.text;
-    if (text == null || text.isEmpty) {
-      return;
-    }
-    await _viewModel.sendPaste(text.endsWith('\n') ? text : '$text\n');
+  void _pasteFromClipboard() {
+    _runTerminalAction(() async {
+      final data = await Clipboard.getData(Clipboard.kTextPlain);
+      final text = data?.text;
+      if (text == null || text.isEmpty) {
+        return;
+      }
+      await _viewModel.sendPaste(text.endsWith('\n') ? text : '$text\n');
+    });
   }
 
-  Future<void> _copyScrollback() async {
-    await Clipboard.setData(ClipboardData(text: _viewModel.scrollbackText));
-    if (!mounted) {
-      return;
+  void _copyScrollback() {
+    _runTerminalAction(() async {
+      await Clipboard.setData(ClipboardData(text: _viewModel.scrollbackText));
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Terminal scrollback copied')),
+      );
+    });
+  }
+
+  /// Same class of escape as `browser_assistance_screen`: every one of these is
+  /// wired to a `VoidCallback` (`onSend`, `onPaste`, `onCopy`, `onDetach`,
+  /// `onClose`, `onKeyPressed`), so the future was discarded and a throw from
+  /// the clipboard platform channel or from writing to a closed terminal
+  /// socket escaped unhandled with nothing shown to the operator.
+  Future<void> _runTerminalAction(Future<void> Function() action) async {
+    try {
+      await action();
+    } on Object catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(operatorErrorMessage(error, context: 'tui'))),
+        );
+      }
     }
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Terminal scrollback copied')),
-    );
   }
 }
 
