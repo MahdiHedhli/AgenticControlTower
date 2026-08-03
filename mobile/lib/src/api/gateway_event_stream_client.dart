@@ -118,7 +118,15 @@ class GatewayEventStreamClient {
     if (connector != null) {
       return connector(uri);
     }
-    return WebSocketChannel.connect(uri).stream;
+    final channel = WebSocketChannel.connect(uri);
+    // `ready` completes with an error of its own when the socket cannot be
+    // established (gateway down, wrong port). Nothing awaits it — the reconnect
+    // loop learns the same thing from `stream`, which it does handle — so its
+    // rejection escapes as an UNHANDLED async error: a zone-level crash on
+    // device and a failed test here, for a condition the client recovers from.
+    // Claim it and drop it; `stream` remains the single error path.
+    unawaited(channel.ready.catchError((Object _) {}));
+    return channel.stream;
   }
 
   Duration _backoffFor(int attempt) {

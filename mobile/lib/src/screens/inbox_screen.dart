@@ -6,6 +6,7 @@ import '../repositories/alpha_repository.dart';
 import '../routes.dart';
 import '../viewmodels/alpha_viewmodels.dart';
 import '../widgets/alpha_components.dart';
+import '../widgets/load_failure.dart';
 import '../widgets/screen_shell.dart';
 
 class InboxScreen extends StatefulWidget {
@@ -34,7 +35,7 @@ class _InboxScreenState extends State<InboxScreen> {
   void initState() {
     super.initState();
     _viewModel = InboxViewModel(_repository);
-    _items = _viewModel.loadInbox();
+    _items = claimLoadErrors(_viewModel.loadInbox(), context: 'inbox');
     widget.runtime?.addListener(_runtimeChanged);
   }
 
@@ -52,7 +53,10 @@ class _InboxScreenState extends State<InboxScreen> {
     if (_seenEventRevision != runtime.eventRevision) {
       _seenEventRevision = runtime.eventRevision;
       setState(() {
-        _items = InboxViewModel(_repository).loadInbox();
+        _items = claimLoadErrors(
+          InboxViewModel(_repository).loadInbox(),
+          context: 'inbox',
+        );
       });
       return;
     }
@@ -68,6 +72,18 @@ class _InboxScreenState extends State<InboxScreen> {
         future: _items,
         builder: (context, snapshot) {
           final items = snapshot.data;
+          if (snapshot.hasError) {
+            return LoadFailurePanel(
+              error: snapshot.error!,
+              context_: 'inbox',
+              onRetry: () => setState(
+                () => _items = claimLoadErrors(
+                  InboxViewModel(_repository).loadInbox(),
+                  context: 'inbox',
+                ),
+              ),
+            );
+          }
           if (items == null) {
             return const Center(child: CircularProgressIndicator());
           }

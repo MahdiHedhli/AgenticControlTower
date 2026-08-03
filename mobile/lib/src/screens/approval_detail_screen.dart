@@ -2,11 +2,13 @@ import 'package:flutter/material.dart';
 
 import '../app_runtime.dart';
 import '../models/alpha_models.dart';
+import '../models/approval_options.dart';
 import '../operator_error.dart';
 import '../repositories/alpha_repository.dart';
 import '../routes.dart';
 import '../viewmodels/alpha_viewmodels.dart';
 import '../widgets/alpha_components.dart';
+import '../widgets/load_failure.dart';
 import '../widgets/screen_shell.dart';
 
 class ApprovalDetailScreen extends StatefulWidget {
@@ -56,7 +58,10 @@ class _ApprovalDetailScreenState extends State<ApprovalDetailScreen> {
     final approvalId = argument is String ? argument : 'appr-shell';
     if (!_loadedRoute || approvalId != _approvalId) {
       _approvalId = approvalId;
-      _approval = _viewModel.load(_approvalId);
+      _approval = claimLoadErrors(
+        _viewModel.load(_approvalId),
+        context: 'approval',
+      );
       _loadedRoute = true;
     }
   }
@@ -78,7 +83,10 @@ class _ApprovalDetailScreenState extends State<ApprovalDetailScreen> {
         lastEvent.type == 'approval.requested' ||
         lastEvent.type == 'approval.resolved') {
       setState(() {
-        _approval = _viewModel.load(_approvalId);
+        _approval = claimLoadErrors(
+          _viewModel.load(_approvalId),
+          context: 'approval',
+        );
       });
     }
   }
@@ -137,11 +145,12 @@ class _ApprovalDetailScreenState extends State<ApprovalDetailScreen> {
                       ),
                 ),
               ),
-              const SectionHeader(title: 'Operator Constraints'),
+              const SectionHeader(title: 'Offered Decision Options'),
               AlphaPanel(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: approval.constraints
+                      .map(humanizeApprovalOption)
                       .map(
                         (constraint) => Padding(
                           padding: const EdgeInsets.only(bottom: 8),

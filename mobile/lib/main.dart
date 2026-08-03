@@ -1,10 +1,6 @@
-import 'package:flutter/material.dart';
+import 'src/bootstrap.dart';
 
-import 'src/app_runtime.dart';
-import 'src/app.dart';
-
-Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  final runtime = await HermesAppRuntime.create();
-  runApp(HermesMobileApp(runtime: runtime));
-}
+/// Nothing may be awaited here beyond [bootstrapAndRun], which is budgeted so
+/// the first frame can never be gated on push registration, a platform channel
+/// or the network. See `src/bootstrap.dart` and `app_boot_test.dart`.
+Future<void> main() => bootstrapAndRun();
