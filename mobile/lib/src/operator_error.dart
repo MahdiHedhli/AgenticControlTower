@@ -30,8 +30,9 @@ String _describe(Object error) {
       'generate_failed' ||
       'access_control' =>
         "Couldn't create a secure key on this device.$reason",
-      'sign_failed' => "Couldn't authorize this with Face ID or your "
-          'passcode.$reason',
+      'sign_failed' ||
+      'auth_failed' =>
+        "Couldn't authorize this with Face ID or your passcode.$reason",
       'no_key' => 'This device has no signing key yet — pair it again.',
       'bad_arguments' => 'The app sent an incomplete signing request.',
       _ => 'The device could not complete this secure operation.$reason',

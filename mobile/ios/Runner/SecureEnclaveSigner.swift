@@ -30,14 +30,42 @@ final class SecureEnclaveSigner {
   // again — so each clearance decision still requires a fresh presence check.
   private var cachedContext: LAContext?
   private var cachedContextAt: Date?
-  // Whether the cached context has already passed a presence check. Only the
-  // Simulator's software path consults this (see handleSign): real hardware lets
-  // LocalAuthentication enforce the reuse window itself.
+  // Whether the cached context has already passed a presence check. The
+  // Simulator's software path consults this to skip a redundant prompt (see
+  // performSign); on real hardware LocalAuthentication enforces the reuse
+  // window itself and this is bookkeeping only — the sign queue uses it to
+  // tell "this operation owned the (failed) evaluation" from "signing failed
+  // under an already-authenticated context" when deciding whether a failure
+  // must fail the whole queued batch.
   private var cachedContextAuthenticated = false
   private let cacheLock = NSLock()
   // 1-byte marker stored ahead of the key blob: 0x01 = enclave, 0x00 = software.
   private let enclaveMarker: UInt8 = 0x01
   private let softwareMarker: UInt8 = 0x00
+
+  // Serialize sign operations — the iOS twin of the Android KeystoreSigner
+  // queue-and-drain fix (8cbf226). Overlapping LAContext evaluations cancel
+  // each other with LAError -4 ("Canceled by another authentication"): on a
+  // device the enclave key's user-presence gate runs one evaluation per
+  // signature, so a launch burst of concurrent signed GETs killed every
+  // in-flight sign and left the MethodChannel results unsettled — Dart futures
+  // hung forever and no request ever reached the gateway. While one sign
+  // operation is in flight, later requests queue here; when it resolves the
+  // queue drains strictly serially: a request whose reuse window covers the
+  // just-authenticated context signs without prompting, an allowReuse == 0
+  // request (clearance decision) runs its OWN fresh evaluation — one at a
+  // time, never concurrently. A failed evaluation fails the whole queued batch
+  // with auth_failed so every future settles.
+  private struct PendingSign {
+    let data: Data
+    let reason: String
+    let allowReuse: Double
+    let stored: StoredKey
+    let result: FlutterResult
+  }
+  private var signQueue: [PendingSign] = []
+  private var signInFlight = false
+  private let signStateLock = NSLock()
 
   /// The single source of truth for "can this build actually use the Secure Enclave".
   ///
@@ -180,17 +208,39 @@ final class SecureEnclaveSigner {
       return
     }
 
+    let request = PendingSign(
+      data: data, reason: reason, allowReuse: allowReuse, stored: stored, result: result)
+
+    // Never start a second evaluation while one is in flight (see PendingSign).
+    signStateLock.lock()
+    if signInFlight {
+      NSLog(
+        "SecureEnclaveSigner: sign in flight, queueing (depth=%d) reason=%@",
+        signQueue.count + 1, reason)
+      signQueue.append(request)
+      signStateLock.unlock()
+      return
+    }
+    signInFlight = true
+    signStateLock.unlock()
+    performSign(request)
+  }
+
+  /// Run one sign operation. Exactly one is in flight at any time
+  /// (`signInFlight`); the operation's resolution settles this request's
+  /// result and then drains the queue through `finishSign`.
+  private func performSign(_ request: PendingSign) {
     let (context, presenceEstablished) = authenticationContext(
-      reason: reason, allowReuse: allowReuse)
+      reason: request.reason, allowReuse: request.allowReuse)
 
     // Sign off the main thread; the enclave/biometric evaluation can block.
     DispatchQueue.global(qos: .userInitiated).async {
       do {
         let signatureDer: Data
-        if stored.isEnclave {
+        if request.stored.isEnclave {
           let key = try SecureEnclave.P256.Signing.PrivateKey(
-            dataRepresentation: stored.blob, authenticationContext: context)
-          signatureDer = try key.signature(for: data).derRepresentation
+            dataRepresentation: request.stored.blob, authenticationContext: context)
+          signatureDer = try key.signature(for: request.data).derRepresentation
         } else {
           // Software fallback still drives an auth prompt so the gate is exercised.
           //
@@ -203,25 +253,111 @@ final class SecureEnclaveSigner {
           // which never yields a reused context — so decisions always prompt.
           #if targetEnvironment(simulator)
             if !presenceEstablished {
-              try self.evaluatePresence(context: context, reason: reason)
+              try self.evaluatePresence(context: context, reason: request.reason)
               self.markPresenceEstablished(for: context)
             }
           #else
             _ = presenceEstablished
-            try self.evaluatePresence(context: context, reason: reason)
+            try self.evaluatePresence(context: context, reason: request.reason)
           #endif
-          let key = try P256.Signing.PrivateKey(rawRepresentation: stored.blob)
-          signatureDer = try key.signature(for: data).derRepresentation
+          let key = try P256.Signing.PrivateKey(rawRepresentation: request.stored.blob)
+          signatureDer = try key.signature(for: request.data).derRepresentation
         }
+        // Bookkeeping only: record that this context passed its presence check
+        // so queue drains know the window is warm. On hardware,
+        // LocalAuthentication still enforces the reuse window itself, and an
+        // allowReuse == 0 request never receives a cached context at all.
+        self.markPresenceEstablished(for: context)
         let encoded = self.base64url(signatureDer)
-        DispatchQueue.main.async { result(encoded) }
+        DispatchQueue.main.async { request.result(encoded) }
+        self.finishSign(evaluationFailed: false, message: "")
       } catch {
+        // If this operation owned a fresh presence evaluation (or the error is
+        // auth-shaped), each queued request would re-prompt on drain — fail the
+        // whole batch with auth_failed instead, mirroring the Android fix.
+        let authError = self.isAuthenticationError(error)
+        let evaluationFailed = !presenceEstablished || authError
+        if evaluationFailed { self.clearCachedContext(ifMatches: context) }
         DispatchQueue.main.async {
-          result(
+          request.result(
             FlutterError(
-              code: "sign_failed", message: "\(error)", details: nil))
+              code: authError ? "auth_failed" : "sign_failed",
+              message: "\(error)", details: nil))
+        }
+        self.finishSign(evaluationFailed: evaluationFailed, message: "\(error)")
+      }
+    }
+  }
+
+  /// Called exactly once when the in-flight sign operation resolves — every
+  /// path through `performSign` reaches here, so every queued MethodChannel
+  /// result settles. On a failed evaluation the whole pending batch fails with
+  /// auth_failed (the Android KeystoreSigner drain does the same); otherwise
+  /// the next queued request starts — signing under the just-authenticated
+  /// context when its reuse window permits, or running its own fresh
+  /// evaluation (allowReuse == 0) — never concurrently.
+  private func finishSign(evaluationFailed: Bool, message: String) {
+    signStateLock.lock()
+    if evaluationFailed {
+      let failed = signQueue
+      signQueue.removeAll()
+      signInFlight = false
+      signStateLock.unlock()
+      if !failed.isEmpty {
+        NSLog("SecureEnclaveSigner: evaluation failed; failing %d queued sign(s)", failed.count)
+        DispatchQueue.main.async {
+          for pending in failed {
+            pending.result(FlutterError(code: "auth_failed", message: message, details: nil))
+          }
         }
       }
+      return
+    }
+    guard !signQueue.isEmpty else {
+      signInFlight = false
+      signStateLock.unlock()
+      return
+    }
+    let next = signQueue.removeFirst()
+    let remaining = signQueue.count
+    signStateLock.unlock()
+    NSLog(
+      "SecureEnclaveSigner: draining queued sign (remaining=%d) reason=%@",
+      remaining, next.reason)
+    performSign(next)
+  }
+
+  /// Best-effort classification of a sign failure as an authentication
+  /// (user-presence) failure rather than a crypto/keychain one. Walks the
+  /// underlying-error chain for LocalAuthentication and Security auth codes.
+  private func isAuthenticationError(_ error: Error) -> Bool {
+    var current: NSError? = error as NSError
+    var depth = 0
+    while let nsError = current, depth < 4 {
+      if nsError.domain == LAError.errorDomain { return true }
+      if nsError.domain == NSOSStatusErrorDomain,
+        nsError.code == Int(errSecAuthFailed)
+          || nsError.code == Int(errSecUserCanceled)
+          || nsError.code == Int(errSecInteractionNotAllowed)
+      {
+        return true
+      }
+      current = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
+      depth += 1
+    }
+    return false
+  }
+
+  /// Drop the cached context after [context]'s evaluation failed, so the next
+  /// sign starts from a clean prompt rather than a context that has a failed
+  /// evaluation on record.
+  private func clearCachedContext(ifMatches context: LAContext) {
+    cacheLock.lock()
+    defer { cacheLock.unlock() }
+    if cachedContext === context {
+      cachedContext = nil
+      cachedContextAt = nil
+      cachedContextAuthenticated = false
     }
   }
 
