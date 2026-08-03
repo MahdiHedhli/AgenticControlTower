@@ -20,8 +20,8 @@ class AgentDetailScreen extends StatefulWidget {
 }
 
 class _AgentDetailScreenState extends State<AgentDetailScreen> {
-  late final String _agentId;
-  late Future<FleetAgent> _agent;
+  String? _agentId;
+  Future<FleetAgent>? _agent;
   bool _loadedRoute = false;
 
   @override
@@ -33,17 +33,35 @@ class _AgentDetailScreenState extends State<AgentDetailScreen> {
     // The route argument is only readable from didChangeDependencies onwards.
     // Loading here rather than in build() keeps the request to one per visit:
     // an inline future re-issues it on every rebuild (search, scroll, retry).
+    //
+    // The default used to be `'agent-repo'` — which is the *mock fixture's*
+    // first agent id. Against the live gateway that id is not in the fleet, so
+    // an argument-less push landed on the repository's not-found path and, back
+    // when that path borrowed from the mock, rendered "Repo Sentinel" every
+    // time. There is no honest agent to show without an argument, so the screen
+    // shows none.
     final argument = ModalRoute.of(context)?.settings.arguments;
-    _agentId = argument is String ? argument : 'agent-repo';
-    _agent = claimLoadErrors(
-      widget.repository.loadAgent(_agentId),
-      context: 'agent-detail',
-    );
+    final agentId = argument is String && argument.isNotEmpty ? argument : null;
+    _agentId = agentId;
+    if (agentId != null) {
+      _agent = claimLoadErrors(
+        widget.repository.loadAgent(agentId),
+        context: 'agent-detail',
+      );
+    }
     _loadedRoute = true;
   }
 
   @override
   Widget build(BuildContext context) {
+    final agentId = _agentId;
+    if (agentId == null) {
+      return const ScreenShell(
+        title: 'Agent Detail',
+        selectedRoute: HermesRoutes.agents,
+        body: _NoAgentSelected(),
+      );
+    }
     return ScreenShell(
       title: 'Agent Detail',
       selectedRoute: HermesRoutes.agents,
@@ -57,7 +75,7 @@ class _AgentDetailScreenState extends State<AgentDetailScreen> {
               context_: 'agent-detail',
               onRetry: () => setState(
                 () => _agent = claimLoadErrors(
-                  widget.repository.loadAgent(_agentId),
+                  widget.repository.loadAgent(agentId),
                   context: 'agent-detail',
                 ),
               ),
@@ -155,6 +173,46 @@ class _AgentDetailScreenState extends State<AgentDetailScreen> {
             ],
           );
         },
+      ),
+    );
+  }
+}
+
+/// What the screen shows when it was pushed with no agent to show.
+///
+/// The alternative — inventing an id and loading whatever comes back — is how a
+/// fabricated agent used to reach this screen.
+class _NoAgentSelected extends StatelessWidget {
+  const _NoAgentSelected();
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.person_search_outlined,
+              size: 36,
+              color: Theme.of(context).colorScheme.outline,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'No agent selected. Pick one from the fleet.',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: () =>
+                  Navigator.of(context).pushNamed(HermesRoutes.agents),
+              icon: const Icon(Icons.groups_outlined),
+              label: const Text('Open Fleet'),
+            ),
+          ],
+        ),
       ),
     );
   }

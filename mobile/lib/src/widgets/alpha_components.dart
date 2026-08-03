@@ -259,6 +259,7 @@ String _agentStatusLabel(AgentRunStatus status) {
     AgentRunStatus.warning => 'warning',
     AgentRunStatus.failed => 'failed',
     AgentRunStatus.completed => 'completed',
+    AgentRunStatus.unknown => 'unknown state',
   };
 }
 
@@ -276,6 +277,9 @@ Color _agentStatusColor(BuildContext context, AgentRunStatus status) {
     AgentRunStatus.idle => const Color(0xFF5DADEC),
     AgentRunStatus.failed => Theme.of(context).colorScheme.error,
     AgentRunStatus.completed => const Color(0xFF68D391),
+    // Deliberately not a healthy colour: this is the absence of a known
+    // status, and it used to be painted as "online" green.
+    AgentRunStatus.unknown => Theme.of(context).colorScheme.outline,
   };
 }
 
@@ -289,6 +293,7 @@ String _missionStateLabel(MissionState state) {
     MissionState.complete => 'complete',
     MissionState.failed => 'failed',
     MissionState.cancelled => 'cancelled',
+    MissionState.unknown => 'unknown state',
   };
 }
 
@@ -302,5 +307,6 @@ Color _missionStateColor(BuildContext context, MissionState state) {
     MissionState.complete => const Color(0xFF68D391),
     MissionState.failed => Theme.of(context).colorScheme.error,
     MissionState.cancelled => Theme.of(context).colorScheme.outline,
+    MissionState.unknown => Theme.of(context).colorScheme.outline,
   };
 }

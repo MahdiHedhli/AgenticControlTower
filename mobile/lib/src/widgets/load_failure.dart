@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../operator_error.dart';
+import '../repositories/alpha_repository.dart';
 import '../routes.dart';
 
 /// Claim a load future's error the moment it is created.
@@ -45,6 +46,12 @@ class LoadFailurePanel extends StatelessWidget {
   final VoidCallback onRetry;
   final String? context_;
 
+  /// True when the tower answered and the answer was "that record is gone" /
+  /// "there is nothing live here", as opposed to never having been reached.
+  bool get _isAbsence =>
+      error is FleetRecordNotFoundException ||
+      error is LiveDataUnavailableException;
+
   @override
   Widget build(BuildContext context) {
     return Center(
@@ -53,8 +60,11 @@ class LoadFailurePanel extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            // A missing record is not a connectivity problem, and the panel must
+            // not dress it as one: the cloud-off glyph plus "Open Settings"
+            // tells the operator to go fix a gateway URL that is working fine.
             Icon(
-              Icons.cloud_off_outlined,
+              _isAbsence ? Icons.search_off_outlined : Icons.cloud_off_outlined,
               size: 36,
               color: Theme.of(context).colorScheme.outline,
             ),
@@ -74,12 +84,13 @@ class LoadFailurePanel extends StatelessWidget {
                   icon: const Icon(Icons.refresh),
                   label: const Text('Retry'),
                 ),
-                OutlinedButton.icon(
-                  onPressed: () =>
-                      Navigator.of(context).pushNamed(HermesRoutes.settings),
-                  icon: const Icon(Icons.settings_outlined),
-                  label: const Text('Open Settings'),
-                ),
+                if (!_isAbsence)
+                  OutlinedButton.icon(
+                    onPressed: () =>
+                        Navigator.of(context).pushNamed(HermesRoutes.settings),
+                    icon: const Icon(Icons.settings_outlined),
+                    label: const Text('Open Settings'),
+                  ),
               ],
             ),
           ],

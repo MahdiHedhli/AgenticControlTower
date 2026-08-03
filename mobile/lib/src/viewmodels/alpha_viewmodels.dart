@@ -184,14 +184,20 @@ class ApprovalDetailViewModel {
     ];
   }
 
+  /// Whether the tower offered this decision scope, and nothing else.
+  ///
+  /// This used to fall back to `{'work-vm-02', 'laptop', 'vps-prod'}.contains
+  /// (approval.node)` so the demo approvals stayed clickable. The guard was on
+  /// the *node name*, not on the data source — and `laptop` is a name a real
+  /// host has. A live approval from an agent running on a machine called
+  /// `laptop` therefore had Approve-Once / Approve-For-Session /
+  /// Approve-For-Agent enabled regardless of the scopes the tower actually
+  /// offered: an invented authority, presented to the operator as the tower's.
+  ///
+  /// The demo data now declares its own options like the gateway does, so there
+  /// is nothing left to guess.
   bool _hasOption(ApprovalAlpha approval, String option) {
-    if (approval.constraints.contains(option)) {
-      return true;
-    }
-    // Mock approvals use human-readable operator constraints instead of the
-    // gateway option names. Keep the mock UX clickable while real gateway data
-    // still follows the offered approval options.
-    return {'work-vm-02', 'laptop', 'vps-prod'}.contains(approval.node);
+    return approval.constraints.contains(option);
   }
 }
 
@@ -275,50 +281,5 @@ class TuaViewModel extends ChangeNotifier {
       ),
     );
     notifyListeners();
-  }
-}
-
-class TuiViewModel {
-  TuiViewModel(this.repository);
-
-  final AlphaRepository repository;
-
-  Future<TerminalSessionAlpha> load(String sessionId) =>
-      repository.loadTerminalSession(sessionId);
-
-  List<String> keysForPage(TerminalKeyPage page) {
-    return switch (page) {
-      TerminalKeyPage.controls => [
-          'ESC',
-          'TAB',
-          'CTRL',
-          'ALT',
-          'CMD',
-          'Left',
-          'Up',
-          'Down',
-          'Right'
-        ],
-      TerminalKeyPage.symbols => ['/', '~', '|', '&', r'$', ';', ':'],
-      TerminalKeyPage.brackets => ['{}', '[]', '()', '<>'],
-      TerminalKeyPage.functions => [
-          'F1',
-          'F2',
-          'F3',
-          'F4',
-          'F5',
-          'F6',
-          'F7',
-          'F8',
-          'F9',
-          'F10',
-          'F11',
-          'F12',
-          'Home',
-          'End',
-          'PgUp',
-          'PgDn',
-        ],
-    };
   }
 }
