@@ -4,9 +4,10 @@ import '../models/alpha_models.dart';
 import '../repositories/alpha_repository.dart';
 import '../routes.dart';
 import '../widgets/alpha_components.dart';
+import '../widgets/load_failure.dart';
 import '../widgets/screen_shell.dart';
 
-class AgentDetailScreen extends StatelessWidget {
+class AgentDetailScreen extends StatefulWidget {
   const AgentDetailScreen({
     required this.repository,
     super.key,
@@ -15,16 +16,53 @@ class AgentDetailScreen extends StatelessWidget {
   final AlphaRepository repository;
 
   @override
-  Widget build(BuildContext context) {
+  State<AgentDetailScreen> createState() => _AgentDetailScreenState();
+}
+
+class _AgentDetailScreenState extends State<AgentDetailScreen> {
+  late final String _agentId;
+  late Future<FleetAgent> _agent;
+  bool _loadedRoute = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_loadedRoute) {
+      return;
+    }
+    // The route argument is only readable from didChangeDependencies onwards.
+    // Loading here rather than in build() keeps the request to one per visit:
+    // an inline future re-issues it on every rebuild (search, scroll, retry).
     final argument = ModalRoute.of(context)?.settings.arguments;
-    final agentId = argument is String ? argument : 'agent-repo';
+    _agentId = argument is String ? argument : 'agent-repo';
+    _agent = claimLoadErrors(
+      widget.repository.loadAgent(_agentId),
+      context: 'agent-detail',
+    );
+    _loadedRoute = true;
+  }
+
+  @override
+  Widget build(BuildContext context) {
     return ScreenShell(
       title: 'Agent Detail',
       selectedRoute: HermesRoutes.agents,
       body: FutureBuilder<FleetAgent>(
-        future: repository.loadAgent(agentId),
+        future: _agent,
         builder: (context, snapshot) {
           final agent = snapshot.data;
+          if (snapshot.hasError) {
+            return LoadFailurePanel(
+              error: snapshot.error!,
+              context_: 'agent-detail',
+              onRetry: () => setState(
+                () => _agent = claimLoadErrors(
+                  widget.repository.loadAgent(_agentId),
+                  context: 'agent-detail',
+                ),
+              ),
+            );
+          }
           if (agent == null) {
             return const Center(child: CircularProgressIndicator());
           }

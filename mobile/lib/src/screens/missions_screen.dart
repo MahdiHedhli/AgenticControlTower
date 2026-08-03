@@ -5,9 +5,10 @@ import '../repositories/alpha_repository.dart';
 import '../routes.dart';
 import '../viewmodels/alpha_viewmodels.dart';
 import '../widgets/alpha_components.dart';
+import '../widgets/load_failure.dart';
 import '../widgets/screen_shell.dart';
 
-class MissionsScreen extends StatelessWidget {
+class MissionsScreen extends StatefulWidget {
   const MissionsScreen({
     required this.repository,
     super.key,
@@ -16,15 +17,41 @@ class MissionsScreen extends StatelessWidget {
   final AlphaRepository repository;
 
   @override
+  State<MissionsScreen> createState() => _MissionsScreenState();
+}
+
+class _MissionsScreenState extends State<MissionsScreen> {
+  late final MissionsViewModel _viewModel;
+  late Future<List<MissionSummary>> _missions;
+
+  @override
+  void initState() {
+    super.initState();
+    _viewModel = MissionsViewModel(widget.repository);
+    _missions = claimLoadErrors(_viewModel.loadMissions(), context: 'missions');
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final viewModel = MissionsViewModel(repository);
     return ScreenShell(
       title: 'Missions',
       selectedRoute: HermesRoutes.missions,
       body: FutureBuilder<List<MissionSummary>>(
-        future: viewModel.loadMissions(),
+        future: _missions,
         builder: (context, snapshot) {
           final missions = snapshot.data;
+          if (snapshot.hasError) {
+            return LoadFailurePanel(
+              error: snapshot.error!,
+              context_: 'missions',
+              onRetry: () => setState(
+                () => _missions = claimLoadErrors(
+                  _viewModel.loadMissions(),
+                  context: 'missions',
+                ),
+              ),
+            );
+          }
           if (missions == null) {
             return const Center(child: CircularProgressIndicator());
           }

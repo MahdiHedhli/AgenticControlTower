@@ -8,6 +8,7 @@ import '../repositories/alpha_repository.dart';
 import '../routes.dart';
 import '../viewmodels/alpha_viewmodels.dart';
 import '../widgets/alpha_components.dart';
+import '../widgets/load_failure.dart';
 import '../widgets/screen_shell.dart';
 
 class TuaScreen extends StatefulWidget {
@@ -27,6 +28,7 @@ class TuaScreen extends StatefulWidget {
 class _TuaScreenState extends State<TuaScreen> {
   late final TuaViewModel _viewModel;
   late Future<void> _load;
+  String? _contextId;
   final _replyController = TextEditingController();
   bool _loadedRoute = false;
   AssistanceSessionModel? _gatewaySession;
@@ -45,11 +47,17 @@ class _TuaScreenState extends State<TuaScreen> {
     if (_loadedRoute) {
       return;
     }
-    final contextId = ModalRoute.of(context)?.settings.arguments as String?;
-    _load = (contextId == null || contextId.isEmpty)
-        ? Future<void>.value()
-        : _loadSession(contextId);
+    _contextId = ModalRoute.of(context)?.settings.arguments as String?;
+    _load = _startLoad();
     _loadedRoute = true;
+  }
+
+  Future<void> _startLoad() {
+    final contextId = _contextId;
+    if (contextId == null || contextId.isEmpty) {
+      return Future<void>.value();
+    }
+    return claimLoadErrors(_loadSession(contextId), context: 'tua');
   }
 
   @override
@@ -66,6 +74,13 @@ class _TuaScreenState extends State<TuaScreen> {
       body: FutureBuilder<void>(
         future: _load,
         builder: (context, snapshot) {
+          if (snapshot.hasError) {
+            return LoadFailurePanel(
+              error: snapshot.error!,
+              context_: 'tua',
+              onRetry: () => setState(() => _load = _startLoad()),
+            );
+          }
           if (snapshot.connectionState != ConnectionState.done) {
             return const Center(child: CircularProgressIndicator());
           }

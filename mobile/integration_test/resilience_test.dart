@@ -87,6 +87,55 @@ void main() {
               'Rendered: ${renderedText(tester)}');
       expectNoRawExceptionText(tester, where: 'inbox, dead gateway');
 
+      // --- and on every other gateway-backed tab ---------------------------
+      // Home and Inbox were fixed first; the same FutureBuilder shape was still
+      // live on the rest of the bottom navigation, where a dead gateway left
+      // the screen spinning with nothing to read and nothing to press.
+      for (final tab in const ['Agents', 'Missions']) {
+        await openTab(tester, tab);
+        final tabSettled = await pumpUntil(
+          tester,
+          () => !tester.any(find.byType(CircularProgressIndicator)),
+          timeout: E2EConfig.loadBudget,
+        );
+        expect(tabSettled, isTrue,
+            reason: 'INFINITE SPINNER on $tab against a dead gateway. '
+                'Rendered: ${renderedText(tester)}');
+        expect(textMatching(tester, "Can't reach the control tower"), isTrue,
+            reason: '$tab does not explain the outage. '
+                'Rendered: ${renderedText(tester)}');
+        expect(find.text('Retry'), findsWidgets,
+            reason: '$tab offers no way to try the load again');
+        expect(find.text('Open Settings'), findsWidgets,
+            reason: '$tab offers no way to fix the gateway URL');
+        expectNoRawExceptionText(tester, where: '$tab, dead gateway');
+      }
+
+      // --- Voice: no load on entry, so prove the *action* degrades ----------
+      // Voice has no FutureBuilder — it holds no data until the operator starts
+      // a session — so the spinner class cannot bite it. What can is the reply
+      // path: a failed createSession must still read as a sentence.
+      await openTab(tester, 'Voice');
+      final voiceSettled = await pumpUntil(
+        tester,
+        () => !tester.any(find.byType(CircularProgressIndicator)),
+        timeout: E2EConfig.loadBudget,
+      );
+      expect(voiceSettled, isTrue,
+          reason: 'INFINITE SPINNER on Voice against a dead gateway. '
+              'Rendered: ${renderedText(tester)}');
+      expectNoRawExceptionText(tester, where: 'voice, dead gateway');
+
+      await tapWhenVisible(tester, find.text('Start Voice Session'));
+      final voiceFailed = await pumpUntilVisible(
+        tester,
+        "Can't reach the control tower",
+      );
+      expect(voiceFailed, isTrue,
+          reason: 'starting a voice session against a dead gateway gave the '
+              'operator no verdict. Rendered: ${renderedText(tester)}');
+      expectNoRawExceptionText(tester, where: 'voice session, dead gateway');
+
       // --- and the operator can still reach the fix -------------------------
       await openSettings(tester);
       expectNoRawExceptionText(tester, where: 'settings, dead gateway');

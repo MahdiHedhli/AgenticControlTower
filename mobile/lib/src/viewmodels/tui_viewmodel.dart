@@ -7,6 +7,7 @@ import '../api/tui_protocol.dart';
 import '../api/tui_stream_client.dart';
 import '../models/alpha_models.dart';
 import '../models/core_models.dart';
+import '../operator_error.dart';
 import '../repositories/alpha_repository.dart';
 import '../repositories/tui_repository.dart';
 
@@ -94,7 +95,8 @@ class TuiViewModel extends ChangeNotifier {
       await _loadMock(routeContext, 'Mock terminal; gateway rejected TUI (${error.statusCode})');
     } on Object catch (error) {
       await _loadMock(routeContext, 'Mock terminal; TUI unavailable');
-      _errorLabel = '$error';
+      // Never the raw toString(): this label is operator-facing copy.
+      _errorLabel = operatorErrorMessage(error, context: 'tui-start');
     } finally {
       _loading = false;
       notifyListeners();
@@ -126,7 +128,7 @@ class TuiViewModel extends ChangeNotifier {
       _handleFrame,
       onError: (Object error) {
         _connected = false;
-        _errorLabel = 'TUI stream error: $error';
+        _errorLabel = operatorErrorMessage(error, context: 'tui-stream');
         _statusLabel = 'Terminal stream error';
         notifyListeners();
       },
@@ -154,7 +156,7 @@ class TuiViewModel extends ChangeNotifier {
     try {
       await _attachRelay(session, repository, streamClient);
     } on Object catch (error) {
-      _errorLabel = '$error';
+      _errorLabel = operatorErrorMessage(error, context: 'tui-relay');
     } finally {
       _loading = false;
       notifyListeners();

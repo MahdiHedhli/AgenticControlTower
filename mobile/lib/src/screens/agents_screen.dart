@@ -5,6 +5,7 @@ import '../repositories/alpha_repository.dart';
 import '../routes.dart';
 import '../viewmodels/alpha_viewmodels.dart';
 import '../widgets/alpha_components.dart';
+import '../widgets/load_failure.dart';
 import '../widgets/screen_shell.dart';
 
 class AgentsScreen extends StatefulWidget {
@@ -21,13 +22,13 @@ class AgentsScreen extends StatefulWidget {
 
 class _AgentsScreenState extends State<AgentsScreen> {
   late final AgentsViewModel _viewModel;
-  late final Future<List<FleetAgent>> _agents;
+  late Future<List<FleetAgent>> _agents;
 
   @override
   void initState() {
     super.initState();
     _viewModel = AgentsViewModel(widget.repository);
-    _agents = _viewModel.loadAgents();
+    _agents = claimLoadErrors(_viewModel.loadAgents(), context: 'agents');
   }
 
   @override
@@ -39,6 +40,18 @@ class _AgentsScreenState extends State<AgentsScreen> {
         future: _agents,
         builder: (context, snapshot) {
           final agents = snapshot.data;
+          if (snapshot.hasError) {
+            return LoadFailurePanel(
+              error: snapshot.error!,
+              context_: 'agents',
+              onRetry: () => setState(
+                () => _agents = claimLoadErrors(
+                  _viewModel.loadAgents(),
+                  context: 'agents',
+                ),
+              ),
+            );
+          }
           if (agents == null) {
             return const Center(child: CircularProgressIndicator());
           }

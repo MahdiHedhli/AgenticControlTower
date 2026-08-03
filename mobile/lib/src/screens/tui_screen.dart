@@ -7,6 +7,7 @@ import '../repositories/alpha_repository.dart';
 import '../routes.dart';
 import '../viewmodels/tui_viewmodel.dart';
 import '../widgets/alpha_components.dart';
+import '../widgets/load_failure.dart';
 import '../widgets/screen_shell.dart';
 
 class TuiScreen extends StatefulWidget {
@@ -49,7 +50,10 @@ class _TuiScreenState extends State<TuiScreen> {
     }
     final sessionId =
         ModalRoute.of(context)?.settings.arguments as String? ?? 'terminal-release';
-    _viewModel.start(sessionId);
+    // start() reports failure through the view model's own status/error labels,
+    // so nothing subscribes to this future — claim it so a gateway that is not
+    // there cannot escape as an unhandled async error.
+    claimLoadErrors(_viewModel.start(sessionId), context: 'tui');
     _loadedRoute = true;
   }
 
