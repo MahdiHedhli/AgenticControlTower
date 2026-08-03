@@ -28,6 +28,7 @@ mobile/scripts/e2e-smoke.sh --verbose              # stream flutter output
 mobile/scripts/e2e-smoke.sh --scenario app_boot    # one scenario
 mobile/scripts/e2e-smoke.sh --keep-gateway         # leave the gateway up to poke at
 mobile/scripts/e2e-smoke.sh --udid <UDID>          # a different simulator
+mobile/scripts/e2e-smoke.sh --strict               # CI: a SKIP is a failure
 ```
 
 Overrides: `ACT_E2E_UDID`, `FLUTTER_BIN`, `ACT_E2E_PYTHON`,
@@ -112,6 +113,29 @@ platform channel, or the network.
 ```
 
 Revert and it goes green again.
+
+## Flakiness, and what the harness does about it
+
+The simulator is a shared, stateful machine, and two failure shapes here are
+*stalls* rather than failures — the test framework's own timeout cannot fire,
+because `tester.pump()` never returns when the app stops producing frames.
+Observed roughly once in eight scenario runs, always in the launch/build phase.
+
+Mitigations, in order of how much they matter:
+
+1. **`SCENARIO_TIMEOUT_SECONDS` (default 420, `ACT_E2E_SCENARIO_TIMEOUT`).**
+   The driver kills a scenario that exceeds it and reports `TIMED OUT`. A
+   harness that can stall forever is not a harness.
+2. **Per-scenario log files, not pipes.** `flutter` block-buffers into a pipe,
+   so a killed scenario used to come back with three lines of output. The tail
+   printed on failure is now the real tail.
+3. **Stale `Runner` killed before every scenario**, and `flutter pub get` run
+   once up front rather than per scenario.
+4. **A gateway per scenario**, each with an empty database, so no fixture from
+   one scenario can decide another's assertions.
+
+If a run does stall, `xcrun simctl uninstall <UDID> app.act.agenticControlTower`
+followed by a re-run clears it. A stuck system alert is the usual cause.
 
 ## What this CANNOT cover
 

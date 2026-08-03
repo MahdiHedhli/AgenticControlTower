@@ -348,6 +348,17 @@ def find_flutter() -> str:
     raise RuntimeError("flutter not found; set FLUTTER_BIN")
 
 
+def warm_pub_cache(flutter: str) -> None:
+    """Resolve dependencies once, not once per scenario."""
+    subprocess.run(
+        [flutter, "pub", "get"],
+        cwd=str(MOBILE_DIR),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
 def strip_icloud_detritus() -> None:
     """``codesign`` refuses to sign anything carrying com.apple.FinderInfo, and
     the iCloud file provider stamps it back onto package directories under
@@ -366,6 +377,7 @@ def run_scenario(
     udid: str,
     gateway_base_url: str,
     verbose: bool,
+    log_dir: Path,
 ) -> ScenarioResult:
     command = [
         flutter, "test", path,
@@ -385,22 +397,28 @@ def run_scenario(
 
     started = time.monotonic()
     timed_out = False
-    try:
-        proc = subprocess.run(
+    # Write to a real file rather than a pipe. `flutter` block-buffers into a
+    # pipe, so a scenario killed on timeout came back with only its first few
+    # lines — exactly the run whose tail you need.
+    log_path = log_dir / f"{name}.log"
+    with log_path.open("w") as log_file:
+        proc = subprocess.Popen(
             command,
             cwd=str(MOBILE_DIR),
-            capture_output=True,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
             text=True,
             env=env,
-            timeout=SCENARIO_TIMEOUT_SECONDS,
         )
-        returncode = proc.returncode
-        output = (proc.stdout or "") + (proc.stderr or "")
-    except subprocess.TimeoutExpired as expired:
-        timed_out = True
-        returncode = -1
-        output = _decode(expired.stdout) + _decode(expired.stderr)
-        kill_stale_app(udid)
+        try:
+            returncode = proc.wait(timeout=SCENARIO_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            returncode = -1
+            proc.kill()
+            proc.wait(timeout=15)
+            kill_stale_app(udid)
+    output = log_path.read_text(errors="replace")
     elapsed = time.monotonic() - started
     if verbose:
         print(output)
@@ -508,6 +526,12 @@ def main() -> int:
     )
     parser.add_argument("--verbose", action="store_true", help="stream flutter output")
     parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="treat a skipped scenario as a failure (use this in CI: a "
+        "regression net that quietly stops running is worse than none)",
+    )
+    parser.add_argument(
         "--keep-gateway",
         action="store_true",
         help="leave the scratch gateway running for manual poking",
@@ -535,11 +559,14 @@ def main() -> int:
     kill_stale_app(args.udid)
     enroll_face_id(args.udid)
     strip_icloud_detritus()
+    warm_pub_cache(flutter)
 
     results: list[ScenarioResult] = []
     with tempfile.TemporaryDirectory(prefix="act-e2e-") as temp_dir, FaceIdAnswerer(
         args.udid
     ):
+        log_dir = Path(temp_dir) / "logs"
+        log_dir.mkdir()
         for index, (name, path) in enumerate(selected):
             # A gateway per scenario, each with its own empty database. Sharing
             # one leaks fixtures between scenarios: an inbox full of a previous
@@ -558,6 +585,7 @@ def main() -> int:
                         udid=args.udid,
                         gateway_base_url=base_url,
                         verbose=args.verbose,
+                        log_dir=log_dir,
                     )
                 )
             finally:
@@ -571,10 +599,10 @@ def main() -> int:
                     except subprocess.TimeoutExpired:
                         gateway.kill()
 
-    return report(results)
+    return report(results, strict=args.strict)
 
 
-def report(results: list[ScenarioResult]) -> int:
+def report(results: list[ScenarioResult], *, strict: bool = False) -> int:
     print("\n" + "=" * 78)
     print("ACT end-to-end simulator smoke")
     print("=" * 78)
@@ -595,13 +623,15 @@ def report(results: list[ScenarioResult]) -> int:
     )
     for item in skipped:
         print(f"  ! {item.name} did NOT run: {item.detail}")
+    if skipped and strict:
+        print("  ! --strict: skipped scenarios count as failures")
     if failed:
         print("=" * 78)
         for item in failed:
             print(f"\n--- {item.name} output (tail) ---")
             print("\n".join(item.output.splitlines()[-40:]))
     print("=" * 78)
-    return 1 if failed else 0
+    return 1 if failed or (strict and skipped) else 0
 
 
 if __name__ == "__main__":
