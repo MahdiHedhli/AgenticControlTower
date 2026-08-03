@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import '../api/gateway_api_client.dart';
 import '../api/tui_protocol.dart';
 import '../api/tui_stream_client.dart';
+import '../async_guard.dart';
 import '../models/alpha_models.dart';
 import '../models/core_models.dart';
 import '../operator_error.dart';
@@ -109,8 +110,13 @@ class TuiViewModel extends ChangeNotifier {
     TuiRepository repository,
     TuiStreamClient streamClient,
   ) async {
-    await _subscription?.cancel();
-    _connection?.close();
+    // Re-attaching tears down the previous socket. Neither teardown may fail
+    // the attach that follows it, and neither may escape: `close()` is
+    // deliberately not awaited (the old socket's drain must not delay the new
+    // relay), which is only safe because `TuiStreamConnection.close()` now
+    // always completes and never throws.
+    await cancelQuietly(_subscription);
+    unawaited(_connection?.close() ?? Future<void>.value());
     _gatewaySession = session;
     _gatewayMode = true;
     _isRelay = true;
@@ -263,8 +269,13 @@ class TuiViewModel extends ChangeNotifier {
 
   @override
   void dispose() {
-    _subscription?.cancel();
-    _connection?.close();
+    // Both futures are discarded by a synchronous `dispose()`, so both must be
+    // incapable of rejecting: `cancel()` is wrapped, and `close()` claims its
+    // own errors and cannot hang on a socket that never connected.
+    unawaited(cancelQuietly(_subscription));
+    unawaited(_connection?.close() ?? Future<void>.value());
+    _subscription = null;
+    _connection = null;
     super.dispose();
   }
 

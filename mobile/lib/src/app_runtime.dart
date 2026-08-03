@@ -13,6 +13,7 @@ import 'security/secure_enclave_signer.dart';
 import 'api/gateway_api_client.dart';
 import 'api/gateway_event_stream_client.dart';
 import 'api/tui_stream_client.dart';
+import 'async_guard.dart';
 import 'config/gateway_config.dart';
 import 'models/core_models.dart';
 import 'operator_error.dart';
@@ -460,7 +461,13 @@ class HermesAppRuntime extends ChangeNotifier {
 
   @override
   void dispose() {
-    _eventSubscription?.cancel();
+    // `cancel()` returns a future that can complete with an error (the stream's
+    // onCancel runs arbitrary teardown). `dispose()` is synchronous, so that
+    // future is discarded and its rejection escapes to the root zone — an
+    // unhandled async error blamed on whatever ran next. Claim it here; a
+    // teardown failure is not actionable and must not be allowed to escape.
+    unawaited(cancelQuietly(_eventSubscription));
+    _eventSubscription = null;
     super.dispose();
   }
 
@@ -513,6 +520,16 @@ class HermesAppRuntime extends ChangeNotifier {
     }
   }
 
+  /// Re-authenticate and reconnect. Never throws — it is fired from
+  /// [_onStreamConnectError] with `unawaited`, so nothing is left to catch it.
+  ///
+  /// Two escapes lived here. (1) `try { … } finally { … }` with no `catch`:
+  /// `_restartEventStream()` can throw (a subscription `cancel()` that rejects,
+  /// a `notifyListeners()` on a disposed runtime) and that throw went straight
+  /// past the discarded future into the root zone. (2) When
+  /// `refreshAccessToken()` returned false the method simply stopped, leaving
+  /// the status pinned at "re-authenticating" forever — a permanent misleading
+  /// state, and the operator's only signal that the pairing needs redoing.
   Future<void> _refreshTokenAndRestartStream() async {
     if (_refreshingToken) {
       return;
@@ -523,9 +540,38 @@ class HermesAppRuntime extends ChangeNotifier {
       notifyListeners();
       if (await refreshAccessToken()) {
         await _restartEventStream();
+      } else {
+        _eventStreamStatus =
+            'Live stream signed out. Pair this device again in Settings.';
+        _eventStreamConnected = false;
+        notifyListeners();
       }
+    } on Object catch (error) {
+      _eventStreamStatus = 'Live stream re-authentication failed. '
+          '${operatorErrorMessage(error, context: 'refreshTokenAndRestart')}';
+      _eventStreamConnected = false;
+      // Not the plain call: the commonest way into this catch is a
+      // `notifyListeners()` on a runtime that was disposed while the refresh was
+      // in flight, and repeating it here would throw straight back out. A net
+      // that can itself throw is not a net (see `error_net.dart`).
+      _notifyQuietly();
     } finally {
       _refreshingToken = false;
+    }
+  }
+
+  /// Fire-and-forget entry point for [_refreshTokenAndRestartStream], which is
+  /// otherwise only reachable from an `unawaited` call inside a stream error
+  /// callback. Exists so the guard has a test that can await it.
+  @visibleForTesting
+  Future<void> debugRefreshTokenAndRestartStream() =>
+      _refreshTokenAndRestartStream();
+
+  void _notifyQuietly() {
+    try {
+      notifyListeners();
+    } on Object {
+      // The runtime is already disposed; there is no listener left to tell.
     }
   }
 
@@ -563,7 +609,10 @@ class HermesAppRuntime extends ChangeNotifier {
   Future<void> _stopEventStream() async {
     final subscription = _eventSubscription;
     _eventSubscription = null;
-    await subscription?.cancel();
+    // Same reason as `dispose()`: this runs inside `clearPairing()` and
+    // `_restartEventStream()`, where a rejected cancel() would abort the very
+    // teardown it is part of and leave the runtime half-torn-down.
+    await cancelQuietly(subscription);
   }
 
   void _handleGatewayEvent(GatewayEvent event) {

@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import '../api/gateway_api_client.dart';
 import '../models/alpha_models.dart';
 import '../models/core_models.dart';
 import 'agents_repository.dart';
@@ -148,18 +149,36 @@ class GatewayAlphaRepository implements AlphaRepository {
 
   /// Real, operator-actionable TUA assistance requests as inbox items, each
   /// carrying its true requestId so the TUA screen can open a real session.
-  /// Best-effort: a gateway without /tua/requests degrades to no items rather
-  /// than failing the whole inbox.
+  ///
+  /// This used to end in a bare `on Object { return const []; }`. Because it
+  /// feeds both [loadInbox] and [loadHome], **every** refusal — a 500, an
+  /// expired token, a gateway that is not listening at all — was rendered to the
+  /// operator as "you have no items". That is the same dishonesty the TUA screen
+  /// fix addressed, one layer down, and down here it silently defeats the
+  /// screen-level guard: the future resolves successfully, so `hasError` can
+  /// never fire and `LoadFailurePanel` can never render.
+  ///
+  /// The discriminator is the one the TUA fix uses. A [GatewayApiException]
+  /// exists only because a response came back, so it already proves the tower
+  /// answered; a 404 on this route is an older gateway that has no
+  /// `/tua/requests` at all, which is a genuine "no assistance items" and stays
+  /// empty. Everything else — 5xx, auth, and any transport failure
+  /// (`ClientException` / `SocketException`, which never reach this catch
+  /// clause) — propagates so the screens can say what actually happened.
   Future<List<InboxItem>> _loadOpenAssistanceInbox() async {
+    final List<AssistanceRequestModel> requests;
     try {
-      final requests = await tuaRepository.listRequests();
-      return requests
-          .where((request) => _isOpenAssistance(request.state))
-          .map(_inboxFromAssistanceRequest)
-          .toList();
-    } on Object {
-      return const [];
+      requests = await tuaRepository.listRequests();
+    } on GatewayApiException catch (error) {
+      if (error.statusCode == 404) {
+        return const [];
+      }
+      rethrow;
     }
+    return requests
+        .where((request) => _isOpenAssistance(request.state))
+        .map(_inboxFromAssistanceRequest)
+        .toList();
   }
 
   @override
