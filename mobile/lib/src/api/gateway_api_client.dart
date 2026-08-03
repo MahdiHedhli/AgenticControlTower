@@ -11,10 +11,17 @@ class GatewayApiClient {
     required this.config,
     required this.signer,
     http.Client? httpClient,
+    this.timeout = defaultTimeout,
   }) : _httpClient = httpClient ?? http.Client();
+
+  /// Bound on the network round-trip. Applied to the HTTP exchange only, never
+  /// to [DeviceRequestSigner.sign] — enclave signing waits on user presence and
+  /// the operator gets as long as they need to authenticate.
+  static const Duration defaultTimeout = Duration(seconds: 30);
 
   final GatewayConfig config;
   final DeviceRequestSigner signer;
+  final Duration timeout;
   final http.Client _httpClient;
 
   Future<Map<String, dynamic>> getJson(
@@ -75,8 +82,8 @@ class GatewayApiClient {
     if (bodyBytes.isNotEmpty) {
       request.bodyBytes = bodyBytes;
     }
-    final response = await _httpClient.send(request);
-    final responseText = await response.stream.bytesToString();
+    final response = await _httpClient.send(request).timeout(timeout);
+    final responseText = await response.stream.bytesToString().timeout(timeout);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw GatewayApiException(
         statusCode: response.statusCode,

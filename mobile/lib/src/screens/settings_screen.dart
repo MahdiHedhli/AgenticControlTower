@@ -78,6 +78,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         label: 'Push',
                         value: 'Notification records only in alpha'),
                     DetailRow(
+                        label: 'Push token', value: runtime.pushStatus),
+                    DetailRow(
                         label: 'Storage', value: runtime.secureStorageStatus),
                     DetailRow(
                         label: 'Key backend',

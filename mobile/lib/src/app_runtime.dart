@@ -37,15 +37,47 @@ class HermesAppRuntime extends ChangeNotifier {
   HermesAppRuntime({
     required GatewayConfigStore configStore,
     required SecureKeyStore keyStore,
+    SecureEnclaveChannel enclave = const SecureEnclaveChannel(),
+    PushTokenChannel pushToken = const PushTokenChannel(),
+    Duration pushTokenTimeout = pushTokenRequestTimeout,
+    Duration bootTimeout = defaultBootTimeout,
+    GatewayEventSocketConnector? socketConnector,
   })  : _configStore = configStore,
-        _keyStore = keyStore;
+        _keyStore = keyStore,
+        _enclave = enclave,
+        _pushToken = pushToken,
+        _pushTokenTimeout = pushTokenTimeout,
+        _bootTimeout = bootTimeout,
+        _socketConnector = socketConnector;
+
+  /// Hard bound on everything that runs before `runApp()`. Local setup
+  /// (SharedPreferences, keychain reads, a native status query) is normally a
+  /// few milliseconds; if any of it stalls we would otherwise leave iOS sitting
+  /// on the black launch storyboard forever. This guard fails *open*: the app
+  /// renders with whatever state has landed, and the slow work keeps running
+  /// and calls [notifyListeners] when it finishes.
+  static const Duration defaultBootTimeout = Duration(seconds: 10);
+
+  /// Bound on a single native MethodChannel round-trip made during boot.
+  static const Duration platformChannelTimeout = Duration(seconds: 5);
+
+  /// Bound on the APNs device-token request. Push registration is optional: on
+  /// a dev-signed build, on the Simulator, or when the operator declines the
+  /// notification prompt, the token callback may simply never arrive.
+  static const Duration pushTokenRequestTimeout = Duration(seconds: 10);
 
   final GatewayConfigStore _configStore;
   final SecureKeyStore _keyStore;
-  final SecureEnclaveChannel _enclave = const SecureEnclaveChannel();
-  final PushTokenChannel _pushToken = const PushTokenChannel();
+  final SecureEnclaveChannel _enclave;
+  final PushTokenChannel _pushToken;
+  final Duration _pushTokenTimeout;
+  final Duration _bootTimeout;
+  final GatewayEventSocketConnector? _socketConnector;
   String? _apnsToken;
   bool _pushHandlerInstalled = false;
+  bool _backgroundBootstrapStarted = false;
+  bool _protectionUnresolved = false;
+  String _pushStatus = 'Push registration pending';
   final ClearanceProofVerifier _proofVerifier = const ClearanceProofVerifier();
   final AlphaRepository _mockRepository = const MockAlphaRepository();
 
@@ -71,14 +103,47 @@ class HermesAppRuntime extends ChangeNotifier {
   bool _refreshingToken = false;
   PairingSessionModel? _lastPairing;
 
+  /// Build the runtime for `main()`. Everything awaited here is local and
+  /// cheap, and every step is bounded, so this always completes and the first
+  /// frame is never gated on the network, on APNs, or on a native callback.
   static Future<HermesAppRuntime> create() async {
-    final preferences = await SharedPreferences.getInstance();
+    final preferences = await _preferencesOrNull();
     final runtime = HermesAppRuntime(
-      configStore: SharedPreferencesGatewayConfigStore(preferences),
-      keyStore: PlatformAwareSecureKeyStore(preferences),
+      configStore: preferences == null
+          ? InMemoryGatewayConfigStore()
+          : SharedPreferencesGatewayConfigStore(preferences),
+      keyStore: preferences == null
+          ? InMemorySecureKeyStore()
+          : PlatformAwareSecureKeyStore(preferences),
     );
-    await runtime.initialize();
+    await runtime.initializeBounded();
     return runtime;
+  }
+
+  static Future<SharedPreferences?> _preferencesOrNull() async {
+    try {
+      return await SharedPreferences.getInstance()
+          .timeout(platformChannelTimeout);
+    } on Object {
+      // Degraded but rendering: an unreachable preference store must not cost
+      // the operator the whole UI.
+      return null;
+    }
+  }
+
+  /// [initialize] under a last-resort bound. Never throws, never exceeds the
+  /// boot timeout, and never leaves the caller without a runtime to render.
+  Future<void> initializeBounded() async {
+    try {
+      await initialize().timeout(_bootTimeout);
+    } on TimeoutException {
+      _connectionStatus = 'Startup slow: local setup still finishing';
+      notifyListeners();
+    } on Object catch (error) {
+      _connectionStatus = 'Startup error. '
+          '${operatorErrorMessage(error, context: 'initialize')}';
+      notifyListeners();
+    }
   }
 
   GatewayConfig get config => _config;
@@ -86,6 +151,7 @@ class HermesAppRuntime extends ChangeNotifier {
   String? get accessToken => _accessToken;
   String get connectionStatus => _connectionStatus;
   String get secureStorageStatus => _secureStorageStatus;
+  String get pushStatus => _pushStatus;
   ClearanceKeyProtection get clearanceKeyProtection => _clearanceKeyProtection;
   String get eventStreamStatus => _eventStreamStatus;
   bool get eventStreamConnected => _eventStreamConnected;
@@ -157,6 +223,11 @@ class HermesAppRuntime extends ChangeNotifier {
     return TuiStreamClient(config: _config);
   }
 
+  /// Local-only startup: preferences, keychain material, native key status.
+  ///
+  /// Deliberately contains no network and no APNs work. Everything that can
+  /// stall indefinitely lives in [startBackgroundBootstrap], which runs after
+  /// the first frame. See the note there.
   Future<void> initialize() async {
     _installPushHandler();
     _config = await _configStore.read();
@@ -178,10 +249,37 @@ class HermesAppRuntime extends ChangeNotifier {
       _publicKey = null;
       _connectionStatus = 'Pairing reset: stored device key mismatch';
     }
-    if (isPaired && _accessToken != null) {
-      await _startEventStream();
-      await _registerPushToken();
+    notifyListeners();
+  }
+
+  /// Bring the paired device online: live event stream, then push registration.
+  ///
+  /// This must never run before `runApp()`. Every step here can block for an
+  /// unbounded time — the gateway may be unreachable, and the iOS APNs device
+  /// token callback never fires on a build whose provisioning profile has no
+  /// usable aps-environment. Awaiting that before the first frame is exactly
+  /// what left the app on a black launch storyboard with working networking
+  /// underneath. The runtime is a [ChangeNotifier], so the UI picks each piece
+  /// up through the existing status fields as it comes online.
+  ///
+  /// Safe to call more than once; only the first call does work.
+  Future<void> startBackgroundBootstrap() async {
+    if (_backgroundBootstrapStarted) {
+      return;
     }
+    _backgroundBootstrapStarted = true;
+    if (_protectionUnresolved) {
+      // The boot-time native status query timed out; retry now that the UI is
+      // up so Settings stops reporting the protection as unverified.
+      _clearanceKeyProtection = await _resolveProtection();
+      notifyListeners();
+    }
+    if (!(isPaired && _accessToken != null)) {
+      return;
+    }
+    await _startEventStream();
+    notifyListeners();
+    await _registerPushToken();
     notifyListeners();
   }
 
@@ -200,8 +298,32 @@ class HermesAppRuntime extends ChangeNotifier {
   /// Pull the latest APNs token from native and upload it to the gateway for
   /// this paired device. Best-effort; failures never block the app.
   Future<void> _registerPushToken() async {
-    _apnsToken ??= await _pushToken.requestToken();
+    _apnsToken ??= await _requestPushTokenBounded();
     await _uploadPushToken();
+  }
+
+  /// Ask native for the APNs device token under a hard bound.
+  ///
+  /// The token only exists once iOS has completed remote-notification
+  /// registration. On a dev-signed build, on the Simulator, or when the
+  /// operator declines notifications, that never happens and the request never
+  /// answers. Push is an optional capability: on timeout we record why and
+  /// carry on with a null token. If the token turns up later, the native
+  /// `onApnsToken` callback installed by [_installPushHandler] uploads it.
+  Future<String?> _requestPushTokenBounded() async {
+    try {
+      final token = await _pushToken.requestToken().timeout(_pushTokenTimeout);
+      _pushStatus = token == null
+          ? 'Push registration unavailable: no APNs token'
+          : 'Push token registered';
+      return token;
+    } on TimeoutException {
+      _pushStatus = 'Push registration unavailable: APNs token timed out';
+      return null;
+    } on Object {
+      _pushStatus = 'Push registration unavailable: APNs token failed';
+      return null;
+    }
   }
 
   Future<void> _uploadPushToken() async {
@@ -214,8 +336,10 @@ class HermesAppRuntime extends ChangeNotifier {
         '/devices/me/push-token',
         body: {'push_token': token},
       );
+      _pushStatus = 'Push token registered';
     } on Object {
       // best-effort push registration
+      _pushStatus = 'Push token upload failed';
     }
   }
 
@@ -276,8 +400,11 @@ class HermesAppRuntime extends ChangeNotifier {
     _clearanceKeyProtection = await _resolveProtection();
     _lastPairing = null;
     _connectionStatus = 'Paired with ${completion.node.displayName}';
+    _backgroundBootstrapStarted = true;
     await _restartEventStream();
-    await _registerPushToken();
+    // Never make the operator watch a spinner while APNs decides whether to
+    // answer. Push registration is optional and best-effort.
+    unawaited(_registerPushToken().then((_) => notifyListeners()));
     notifyListeners();
   }
 
@@ -336,13 +463,49 @@ class HermesAppRuntime extends ChangeNotifier {
     return completion;
   }
 
+  /// Query the native signer status under a hard bound.
+  ///
+  /// Returns the status and whether the call was *inconclusive* (it timed out)
+  /// rather than definitively answering "no key". Callers must not treat an
+  /// inconclusive result as evidence of absence.
+  Future<({SecureEnclaveStatus? status, bool inconclusive})>
+      _boundedEnclaveStatus() async {
+    try {
+      final status = await _enclave.status().timeout(platformChannelTimeout);
+      return (status: status, inconclusive: false);
+    } on TimeoutException {
+      return (status: null, inconclusive: true);
+    } on Object {
+      return (status: null, inconclusive: false);
+    }
+  }
+
   /// Resolve the honest protection record: native-sourced on iOS (enclave or
   /// software-dev), key-store-sourced otherwise.
   Future<ClearanceKeyProtection> _resolveProtection() async {
-    final status = await _enclave.status();
+    final result = await _boundedEnclaveStatus();
+    final status = result.status;
     if (status != null && (_keyAlgorithm == 'p256' || status.hasKey)) {
+      _protectionUnresolved = false;
       return status.toProtection();
     }
+    if (result.inconclusive && _keyAlgorithm == 'p256') {
+      // Do not fall through to the key-store record: that would advertise this
+      // enclave-backed device as an exportable Ed25519 key. Say what is true —
+      // the protection could not be read.
+      _protectionUnresolved = true;
+      return const ClearanceKeyProtection(
+        backend: 'secure_enclave_status_unavailable',
+        hardwareBacked: null,
+        userPresenceRequired: null,
+        privateKeyExportable: false,
+        productionReady: false,
+        warning: 'Secure Enclave status did not answer; key protection is '
+            'unverified. Signing still happens inside the enclave behind user '
+            'presence.',
+      );
+    }
+    _protectionUnresolved = false;
     return _keyStore.clearanceKeyProtection();
   }
 
@@ -441,8 +604,15 @@ class HermesAppRuntime extends ChangeNotifier {
     if (_keyAlgorithm == 'p256') {
       // Non-exportable enclave key: validate by presence only — signing here
       // would force a biometric prompt at launch.
-      final status = await _enclave.status();
-      return status?.hasKey ?? false;
+      final result = await _boundedEnclaveStatus();
+      if (result.inconclusive) {
+        // A slow native status query is not evidence that the key is gone.
+        // Keep the pairing: discarding it here would silently unpair a working
+        // device. Nothing is weakened — every request is still signed by the
+        // enclave and the gateway still verifies it fail-closed.
+        return true;
+      }
+      return result.status?.hasKey ?? false;
     }
     final privateKey = _privateKey;
     if (privateKey == null) {
@@ -477,6 +647,7 @@ class HermesAppRuntime extends ChangeNotifier {
     _eventSubscription = GatewayEventStreamClient(
       config: _config,
       accessToken: token,
+      socketConnector: _socketConnector,
       onConnectError: _onStreamConnectError,
     ).connect(after: _lastEventCursor).listen(
       _handleGatewayEvent,
