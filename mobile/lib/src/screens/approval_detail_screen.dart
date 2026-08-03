@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../acs_tokens.dart';
 import '../app_runtime.dart';
 import '../models/alpha_models.dart';
 import '../operator_error.dart';
@@ -113,10 +114,14 @@ class _ApprovalDetailScreenState extends State<ApprovalDetailScreen> {
                         style: Theme.of(context).textTheme.bodyLarge),
                     const SizedBox(height: 14),
                     DetailRow(label: 'State', value: approval.state),
-                    DetailRow(label: 'Tool', value: approval.requestedTool),
+                    DetailRow(
+                        label: 'Tool',
+                        value: approval.requestedTool,
+                        mono: true),
                     DetailRow(label: 'Agent', value: approval.agentName),
-                    DetailRow(label: 'Node', value: approval.node),
-                    DetailRow(label: 'Session', value: approval.session),
+                    DetailRow(label: 'Node', value: approval.node, mono: true),
+                    DetailRow(
+                        label: 'Session', value: approval.session, mono: true),
                     DetailRow(label: 'Expires', value: approval.expiresIn),
                     if (approval.decisionScope != null)
                       DetailRow(
@@ -133,17 +138,17 @@ class _ApprovalDetailScreenState extends State<ApprovalDetailScreen> {
                 child: SelectableText(
                   approval.payloadPreview,
                   style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                        fontFamily: 'monospace',
+                        fontFamily: AcsTokens.fontMono,
                       ),
                 ),
               ),
-              const SectionHeader(title: 'Operator Constraints'),
+              const SectionHeader(title: 'Available Decisions'),
               AlphaPanel(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: approval.constraints
                       .map(
-                        (constraint) => Padding(
+                        (option) => Padding(
                           padding: const EdgeInsets.only(bottom: 8),
                           child: Row(
                             crossAxisAlignment: CrossAxisAlignment.start,
@@ -154,7 +159,8 @@ class _ApprovalDetailScreenState extends State<ApprovalDetailScreen> {
                                 size: 18,
                               ),
                               const SizedBox(width: 8),
-                              Expanded(child: Text(constraint)),
+                              Expanded(
+                                  child: Text(_humanizeDecisionOption(option))),
                             ],
                           ),
                         ),
@@ -671,12 +677,14 @@ class _ApprovalActions extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                DetailRow(label: 'Approval', value: approval.id),
+                DetailRow(label: 'Approval', value: approval.id, mono: true),
                 DetailRow(label: 'Risk', value: approval.risk),
-                DetailRow(label: 'Tool', value: approval.requestedTool),
+                DetailRow(
+                    label: 'Tool', value: approval.requestedTool, mono: true),
                 DetailRow(label: 'Agent', value: approval.agentName),
-                DetailRow(label: 'Node', value: approval.node),
-                DetailRow(label: 'Session', value: approval.session),
+                DetailRow(label: 'Node', value: approval.node, mono: true),
+                DetailRow(
+                    label: 'Session', value: approval.session, mono: true),
                 DetailRow(label: 'State', value: approval.state),
                 if (approval.decisionScope != null)
                   DetailRow(label: 'Scope', value: approval.decisionScope!),
@@ -684,7 +692,7 @@ class _ApprovalActions extends StatelessWidget {
                 SelectableText(
                   approval.payloadPreview,
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                        fontFamily: 'monospace',
+                        fontFamily: AcsTokens.fontMono,
                       ),
                 ),
               ],
@@ -758,10 +766,26 @@ IconData _actionIcon(ApprovalMoreActionKind action) {
 
 Color _stateColor(BuildContext context, String state) {
   return switch (state) {
-    'approved' => Theme.of(context).colorScheme.primary,
-    'denied' => Theme.of(context).colorScheme.error,
+    'approved' => AcsTokens.go,
+    'denied' => AcsTokens.alert,
     'expired' => Theme.of(context).colorScheme.outline,
     'cancelled' => Theme.of(context).colorScheme.outline,
-    _ => Theme.of(context).colorScheme.secondary,
+    _ => AcsTokens.attention,
+  };
+}
+
+/// The gateway sends decision-option tokens (`approve_once`,
+/// `approve_for_session`, ...). Humanize the known ones; pass anything
+/// else through with underscores softened.
+String _humanizeDecisionOption(String option) {
+  return switch (option) {
+    'approve_once' => 'Approve once',
+    'approve_for_session' => 'Approve for session',
+    'approve_for_agent' => 'Approve for agent',
+    'approve_forever' => 'Approve forever (policy proposal)',
+    'deny' => 'Deny',
+    'needs_info' => 'Request more info',
+    'modified' => 'Modified response',
+    _ => option.replaceAll('_', ' '),
   };
 }

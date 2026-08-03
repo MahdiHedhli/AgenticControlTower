@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../acs_tokens.dart';
 import '../models/alpha_models.dart';
 import '../repositories/alpha_repository.dart';
 import '../routes.dart';
@@ -147,7 +148,7 @@ class _AgentRow extends StatelessWidget {
                 if (agent.approvalCount > 0)
                   StatusPill(
                     label: '${agent.approvalCount} approvals',
-                    color: const Color(0xFFFFB84D),
+                    color: AcsTokens.attention,
                   ),
               ],
             ),

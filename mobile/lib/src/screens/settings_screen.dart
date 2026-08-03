@@ -153,7 +153,7 @@ class _GatewayPanel extends StatelessWidget {
               StatusPill(
                 label: runtime.isPaired ? 'paired' : 'unpaired',
                 color: runtime.isPaired
-                    ? Theme.of(context).colorScheme.primary
+                    ? Theme.of(context).colorScheme.tertiary
                     : Theme.of(context).colorScheme.secondary,
               ),
               const Spacer(),
@@ -234,7 +234,10 @@ class _PairingPanel extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          DetailRow(label: 'Device', value: runtime.deviceId ?? 'Not paired'),
+          DetailRow(
+              label: 'Device',
+              value: runtime.deviceId ?? 'Not paired',
+              mono: runtime.deviceId != null),
           DetailRow(
               label: 'Mode',
               value: runtime.isPaired ? 'Signed gateway access' : 'Mock data'),
@@ -339,8 +342,11 @@ class _PairingTokenBlock extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            DetailRow(label: 'Pairing ID', value: pairing.pairingId),
-            DetailRow(label: 'Token', value: pairing.pairingToken ?? 'hidden'),
+            DetailRow(label: 'Pairing ID', value: pairing.pairingId, mono: true),
+            DetailRow(
+                label: 'Token',
+                value: pairing.pairingToken ?? 'hidden',
+                mono: pairing.pairingToken != null),
             DetailRow(
                 label: 'Expires',
                 value: pairing.expiresAt.toLocal().toString()),

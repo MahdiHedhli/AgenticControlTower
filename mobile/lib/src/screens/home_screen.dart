@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../acs_tokens.dart';
 import '../app_runtime.dart';
 import '../models/alpha_models.dart';
 import '../repositories/alpha_repository.dart';
@@ -165,7 +166,7 @@ class _LiveStatusPanel extends StatelessWidget {
                   ? Icons.sensors_outlined
                   : Icons.sensors_off_outlined,
               color: runtime.eventStreamConnected
-                  ? Theme.of(context).colorScheme.primary
+                  ? Theme.of(context).colorScheme.tertiary
                   : Theme.of(context).colorScheme.outline,
             ),
             const SizedBox(width: 10),
@@ -290,9 +291,9 @@ IconData _activityIcon(String severity) {
 
 Color _activityColor(BuildContext context, String severity) {
   return switch (severity) {
-    'critical' => Theme.of(context).colorScheme.error,
-    'warn' => const Color(0xFFFFB84D),
-    'good' => const Color(0xFF68D391),
+    'critical' => AcsTokens.alert,
+    'warn' => AcsTokens.warn,
+    'good' => AcsTokens.go,
     _ => Theme.of(context).colorScheme.primary,
   };
 }

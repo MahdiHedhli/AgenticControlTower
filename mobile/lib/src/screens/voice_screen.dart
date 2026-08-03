@@ -63,7 +63,9 @@ class _VoiceScreenState extends State<VoiceScreen> {
                       label: widget.runtime?.isPaired == true
                           ? 'gateway'
                           : 'fallback',
-                      color: Theme.of(context).colorScheme.primary,
+                      color: widget.runtime?.isPaired == true
+                          ? Theme.of(context).colorScheme.tertiary
+                          : Theme.of(context).colorScheme.secondary,
                     ),
                   ],
                 ),

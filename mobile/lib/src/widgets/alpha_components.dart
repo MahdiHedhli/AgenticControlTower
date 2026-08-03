@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../acs_tokens.dart';
 import '../models/alpha_models.dart';
 
 class AlphaPanel extends StatelessWidget {
@@ -110,19 +111,25 @@ class StatusPill extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final baseSize = Theme.of(context).textTheme.labelSmall?.fontSize ?? 11;
     return DecoratedBox(
       decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.16),
+        // 14% alpha fill mirrors the ACS `-soft` token variants.
+        color: color.withValues(alpha: 0.14),
         borderRadius: BorderRadius.circular(999),
         border: Border.all(color: color.withValues(alpha: 0.55)),
       ),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
         child: Text(
-          label,
+          // Presentation-only transform: ACS status labels are uppercase,
+          // tracked IBM Plex Mono.
+          label.toUpperCase(),
           style: Theme.of(context).textTheme.labelSmall?.copyWith(
                 color: color,
-                fontWeight: FontWeight.w700,
+                fontWeight: FontWeight.w600,
+                fontFamily: AcsTokens.fontMono,
+                letterSpacing: baseSize * AcsTokens.trackingLabelEm,
               ),
         ),
       ),
@@ -159,7 +166,7 @@ class CommandButton extends StatelessWidget {
       label: Text(label),
       style: FilledButton.styleFrom(
         backgroundColor: color,
-        foregroundColor: Colors.black,
+        foregroundColor: AcsTokens.bg,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
       ),
     );
@@ -202,11 +209,16 @@ class DetailRow extends StatelessWidget {
   const DetailRow({
     required this.label,
     required this.value,
+    this.mono = false,
     super.key,
   });
 
   final String label;
   final String value;
+
+  /// Render the value in IBM Plex Mono — for short codes, ids, and
+  /// other machine-shaped data.
+  final bool mono;
 
   @override
   Widget build(BuildContext context) {
@@ -219,7 +231,14 @@ class DetailRow extends StatelessWidget {
             width: 104,
             child: Text(label, style: Theme.of(context).textTheme.labelMedium),
           ),
-          Expanded(child: Text(value)),
+          Expanded(
+            child: Text(
+              value,
+              style: mono
+                  ? const TextStyle(fontFamily: AcsTokens.fontMono)
+                  : null,
+            ),
+          ),
         ],
       ),
     );
@@ -228,19 +247,19 @@ class DetailRow extends StatelessWidget {
 
 Color riskColor(BuildContext context, String risk) {
   return switch (risk) {
-    'critical' => Theme.of(context).colorScheme.error,
-    'high' => const Color(0xFFFFB84D),
-    'medium' => const Color(0xFF5DADEC),
-    _ => Theme.of(context).colorScheme.primary,
+    'critical' => AcsTokens.alert,
+    'high' => AcsTokens.warn,
+    'medium' => AcsTokens.attention,
+    _ => AcsTokens.go,
   };
 }
 
 Color _intentColor(BuildContext context, String intent) {
   return switch (intent) {
-    'good' => const Color(0xFF68D391),
-    'warn' => const Color(0xFFFFB84D),
-    'critical' => Theme.of(context).colorScheme.error,
-    'active' => const Color(0xFF5DADEC),
+    'good' => AcsTokens.go,
+    'warn' => AcsTokens.warn,
+    'critical' => AcsTokens.alert,
+    'active' => AcsTokens.beacon,
     _ => Theme.of(context).colorScheme.onSurface,
   };
 }
@@ -264,18 +283,18 @@ String _agentStatusLabel(AgentRunStatus status) {
 
 Color _agentStatusColor(BuildContext context, AgentRunStatus status) {
   return switch (status) {
-    AgentRunStatus.running => Theme.of(context).colorScheme.primary,
-    AgentRunStatus.online => const Color(0xFF68D391),
-    AgentRunStatus.blocked => const Color(0xFFFFB84D),
-    AgentRunStatus.waitingApproval => const Color(0xFFFFB84D),
-    AgentRunStatus.waitingAssistance => const Color(0xFF5DADEC),
-    AgentRunStatus.userControlling => const Color(0xFF2FD1B2),
-    AgentRunStatus.warning => Theme.of(context).colorScheme.error,
-    AgentRunStatus.paused => const Color(0xFFBCA7FF),
+    AgentRunStatus.running => AcsTokens.go,
+    AgentRunStatus.online => AcsTokens.go,
+    AgentRunStatus.blocked => AcsTokens.attention,
+    AgentRunStatus.waitingApproval => AcsTokens.attention,
+    AgentRunStatus.waitingAssistance => AcsTokens.attention,
+    AgentRunStatus.userControlling => AcsTokens.attention,
+    AgentRunStatus.warning => AcsTokens.warn,
+    AgentRunStatus.paused => Theme.of(context).colorScheme.outline,
     AgentRunStatus.offline => Theme.of(context).colorScheme.outline,
-    AgentRunStatus.idle => const Color(0xFF5DADEC),
-    AgentRunStatus.failed => Theme.of(context).colorScheme.error,
-    AgentRunStatus.completed => const Color(0xFF68D391),
+    AgentRunStatus.idle => Theme.of(context).colorScheme.outline,
+    AgentRunStatus.failed => AcsTokens.alert,
+    AgentRunStatus.completed => AcsTokens.go,
   };
 }
 
@@ -295,12 +314,12 @@ String _missionStateLabel(MissionState state) {
 Color _missionStateColor(BuildContext context, MissionState state) {
   return switch (state) {
     MissionState.queued => Theme.of(context).colorScheme.outline,
-    MissionState.running => Theme.of(context).colorScheme.primary,
-    MissionState.waitingApproval => const Color(0xFFFFB84D),
-    MissionState.waitingAssistance => const Color(0xFF5DADEC),
-    MissionState.userControlling => const Color(0xFF2FD1B2),
-    MissionState.complete => const Color(0xFF68D391),
-    MissionState.failed => Theme.of(context).colorScheme.error,
+    MissionState.running => AcsTokens.go,
+    MissionState.waitingApproval => AcsTokens.attention,
+    MissionState.waitingAssistance => AcsTokens.attention,
+    MissionState.userControlling => AcsTokens.attention,
+    MissionState.complete => AcsTokens.go,
+    MissionState.failed => AcsTokens.alert,
     MissionState.cancelled => Theme.of(context).colorScheme.outline,
   };
 }

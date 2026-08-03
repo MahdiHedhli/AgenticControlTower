@@ -251,7 +251,7 @@ class _SessionHeader extends StatelessWidget {
                   label:
                       returnedToAgent ? 'returned' : _stateLabel(session.state),
                   color: returnedToAgent
-                      ? Theme.of(context).colorScheme.primary
+                      ? Theme.of(context).colorScheme.tertiary
                       : Theme.of(context).colorScheme.secondary,
                 ),
                 const Spacer(),

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../acs_tokens.dart';
 import '../app_runtime.dart';
 import '../models/alpha_models.dart';
 import '../repositories/alpha_repository.dart';
@@ -266,7 +267,7 @@ IconData _kindIcon(InboxKind kind) {
 
 Color _kindColor(BuildContext context, InboxKind kind) {
   return switch (kind) {
-    InboxKind.approval => const Color(0xFFFFB84D),
+    InboxKind.approval => AcsTokens.attention,
     InboxKind.notification => Theme.of(context).colorScheme.tertiary,
     InboxKind.assistance => Theme.of(context).colorScheme.primary,
     InboxKind.security => Theme.of(context).colorScheme.error,

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../acs_tokens.dart';
 import '../app_runtime.dart';
 import '../models/alpha_models.dart';
 import '../repositories/alpha_repository.dart';
@@ -239,7 +240,7 @@ class _TerminalPane extends StatelessWidget {
   Widget build(BuildContext context) {
     final terminalStyle = Theme.of(context).textTheme.bodyMedium?.copyWith(
           color: const Color(0xFFD8F8EA),
-          fontFamily: 'monospace',
+          fontFamily: AcsTokens.fontMono,
           height: 1.45,
         );
     final text = viewModel.scrollbackText.trimRight();
@@ -303,7 +304,7 @@ class _TerminalInputBar extends StatelessWidget {
               controller: controller,
               minLines: 1,
               maxLines: 3,
-              style: const TextStyle(fontFamily: 'monospace'),
+              style: const TextStyle(fontFamily: AcsTokens.fontMono),
               decoration: const InputDecoration(
                 hintText: 'command',
                 isDense: true,

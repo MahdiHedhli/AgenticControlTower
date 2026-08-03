@@ -1,28 +1,39 @@
 import 'package:flutter/material.dart';
 
+import 'acs_tokens.dart';
+
+/// ACS canonical dark theme for the ACT operator app.
+///
+/// Colors and type come from [AcsTokens] (the agenticsuite.work anchor):
+/// beacon amber is THE accent and carries approval/attention surfaces,
+/// `go` green means connected/success, `alert` red is reserved for
+/// panic/deny/critical. Inter for UI, IBM Plex Mono for status/ids.
 ThemeData hermesTheme() {
-  const primary = Color(0xFF20D0A0);
-  const secondary = Color(0xFFFFB84D);
-  const tertiary = Color(0xFF5DADEC);
-  const background = Color(0xFF101111);
-  const surface = Color(0xFF191B1B);
-  const surfaceBright = Color(0xFF222626);
-  const text = Color(0xFFF4F7F5);
-  const muted = Color(0xFF9EA7A3);
+  const background = AcsTokens.bg;
+  const surface = AcsTokens.surface;
+  // Derived raised-input tone: one step from surface toward hairline.
+  const surfaceBright = Color(0xFF18202C);
+  const text = AcsTokens.ink;
+  const muted = AcsTokens.muted;
 
   return ThemeData(
     colorScheme: const ColorScheme.dark(
-      primary: primary,
-      secondary: secondary,
-      tertiary: tertiary,
+      primary: AcsTokens.beacon,
+      onPrimary: background,
+      secondary: AcsTokens.attention,
+      onSecondary: background,
+      tertiary: AcsTokens.go,
+      onTertiary: background,
       surface: surface,
       surfaceContainerHighest: surfaceBright,
       onSurface: text,
       outline: muted,
-      outlineVariant: Color(0xFF303636),
-      error: Color(0xFFFF6B6B),
+      outlineVariant: AcsTokens.hairline,
+      error: AcsTokens.alert,
+      onError: background,
     ),
     scaffoldBackgroundColor: background,
+    fontFamily: AcsTokens.fontSans,
     appBarTheme: const AppBarTheme(
       centerTitle: false,
       elevation: 0,
@@ -31,7 +42,7 @@ ThemeData hermesTheme() {
     ),
     navigationBarTheme: NavigationBarThemeData(
       backgroundColor: surface,
-      indicatorColor: primary.withValues(alpha: 0.16),
+      indicatorColor: AcsTokens.beacon.withValues(alpha: 0.14),
       labelTextStyle: WidgetStateProperty.resolveWith(
         (_) => const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
       ),
