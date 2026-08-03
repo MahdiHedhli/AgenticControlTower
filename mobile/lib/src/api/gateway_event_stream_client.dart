@@ -44,31 +44,73 @@ class GatewayEventStreamClient {
     return httpUri.replace(scheme: scheme);
   }
 
-  Stream<GatewayEvent> connect({String? after}) async* {
-    var cursor = after;
-    var reconnects = 0;
-    while (maxReconnects == null || reconnects <= maxReconnects!) {
-      try {
-        await for (final raw in _connectRaw(streamUri(after: cursor))) {
-          final event = parseGatewayEvent(raw);
-          cursor = event.cursor;
-          reconnects = 0;
-          yield event;
-        }
-      } on Object catch (error) {
-        // The caller observes liveness through missing events and the next
-        // successful event. Requests remain fail-closed because approvals still
-        // require signed HTTP decisions. Surface the error so the caller can
-        // refresh an expired access token and reconnect.
-        onConnectError?.call(error);
-      }
+  /// Connect and emit gateway events, reconnecting with exponential backoff.
+  ///
+  /// Implemented on a [StreamController] rather than as an `async*` generator.
+  /// A generator only observes the listener's cancel() at a `yield`, and a
+  /// stream that cannot connect (gateway down, token revoked — exactly the
+  /// state in which an operator reaches for Clear Pairing) never yields, so
+  /// cancel() never completed and every caller awaiting it hung forever.
+  /// Here cancel() completes immediately, wakes any backoff sleep, and the
+  /// reconnect task shuts itself down at its next checkpoint.
+  Stream<GatewayEvent> connect({String? after}) {
+    final controller = StreamController<GatewayEvent>();
+    var cancelled = false;
+    Completer<void>? wake;
 
-      reconnects += 1;
-      if (maxReconnects != null && reconnects > maxReconnects!) {
-        break;
+    Future<void> run() async {
+      var cursor = after;
+      var reconnects = 0;
+      while (!cancelled &&
+          (maxReconnects == null || reconnects <= maxReconnects!)) {
+        try {
+          await for (final raw in _connectRaw(streamUri(after: cursor))) {
+            if (cancelled) {
+              break;
+            }
+            final event = parseGatewayEvent(raw);
+            cursor = event.cursor;
+            reconnects = 0;
+            controller.add(event);
+          }
+        } on Object catch (error) {
+          // The caller observes liveness through missing events and the next
+          // successful event. Requests remain fail-closed because approvals
+          // still require signed HTTP decisions. Surface the error so the
+          // caller can refresh an expired access token and reconnect.
+          if (!cancelled) {
+            onConnectError?.call(error);
+          }
+        }
+
+        if (cancelled) {
+          break;
+        }
+        reconnects += 1;
+        if (maxReconnects != null && reconnects > maxReconnects!) {
+          break;
+        }
+        final sleep = wake = Completer<void>();
+        await Future.any(<Future<void>>[
+          Future<void>.delayed(_backoffFor(reconnects)),
+          sleep.future,
+        ]);
+        wake = null;
       }
-      await Future<void>.delayed(_backoffFor(reconnects));
+      await controller.close();
     }
+
+    controller.onListen = () {
+      unawaited(run());
+    };
+    controller.onCancel = () {
+      cancelled = true;
+      final sleep = wake;
+      if (sleep != null && !sleep.isCompleted) {
+        sleep.complete();
+      }
+    };
+    return controller.stream;
   }
 
   Stream<dynamic> _connectRaw(Uri uri) {

@@ -76,6 +76,44 @@ void main() {
     expect(errors, isNotEmpty);
     expect(errors.first.toString(), contains('403'));
   });
+
+  test('cancel completes promptly while stuck in the reconnect loop', () async {
+    // Regression: connect() was an async* generator, which only observes the
+    // listener's cancel() at a `yield`. A stream that never connects (dead
+    // gateway / revoked token) never yields, so cancel() never completed and
+    // clearPairing hung forever awaiting it.
+    var connects = 0;
+    final client = GatewayEventStreamClient(
+      config: GatewayConfig.fromInput('http://127.0.0.1:8787/v1'),
+      accessToken: 'revoked-token',
+      // Long backoff so the loop is asleep when we cancel — the exact state
+      // the operator hits.
+      initialBackoff: const Duration(minutes: 5),
+      socketConnector: (uri) {
+        connects += 1;
+        return Stream<dynamic>.error(
+          StateError('WebSocket handshake failed: 403 Forbidden'),
+        );
+      },
+    );
+
+    final subscription = client.connect().listen((_) {});
+    // Let the first connect attempt fail and the backoff sleep begin.
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(connects, greaterThanOrEqualTo(1));
+
+    await subscription
+        .cancel()
+        .timeout(const Duration(seconds: 5), onTimeout: () {
+      fail('cancel() did not complete while the stream was reconnecting');
+    });
+
+    // The reconnect task must stop: no further connection attempts after the
+    // cancel has been observed.
+    final connectsAtCancel = connects;
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    expect(connects, connectsAtCancel);
+  });
 }
 
 Map<String, dynamic> _eventJson({
