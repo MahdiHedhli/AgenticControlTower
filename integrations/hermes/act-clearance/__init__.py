@@ -43,9 +43,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import posixpath
-import re
-import shlex
 import subprocess
 import sys
 import threading
@@ -54,7 +51,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 try:  # tomllib is stdlib on 3.11+; degrade gracefully on older runtimes.
     import tomllib
@@ -280,17 +277,22 @@ def _poll() -> float:
         return 2.0
 
 
-# --- risk classification: per-tool families + read-only shell classifier -----
+# --- risk classification: per-tool risk families -----------------------------
 #
-# Why this exists: a blanket ``external_effect`` on every gated tool was both
-# dishonest and useless. Dishonest because `delete_file` is not the same risk as
-# `cat README.md`; useless because `external_effect` is in the tower's
-# MOBILE_MANDATORY_RISK_FAMILIES, so EVERY clearance this plugin raised was
-# structurally ineligible for a standing grant — the operator could pick "for
-# this session" on the phone and the tower would refuse it
-# (capability_grant_refused / channel_requirement). This module now says what
-# each tool can actually do, and computes a per-call downgrade for shell
-# invocations that are PROVABLY read-only.
+# Why this exists: a blanket ``external_effect`` on every gated tool was
+# dishonest — `delete_file` is not the same risk as `send_email`, and the phone
+# showed the operator one undifferentiated severity for all of them. This module
+# says what each tool can actually do, per tool, and derives the scalar
+# ``risk_level`` from the same source so the two can never disagree.
+#
+# What it deliberately does NOT do is inspect arguments to LOWER a family. Note
+# the consequence, because it is the whole cost of that decision: every family
+# here is in the tower's MOBILE_MANDATORY_RISK_FAMILIES, so every clearance this
+# plugin raises is structurally ineligible for a standing grant — the operator
+# can pick "for this session" on the phone and the tower will refuse it
+# (capability_grant_refused / channel_requirement). Terminal work therefore
+# needs a tap every time. That is accepted; see WHY SHELL COMMANDS ARE NOT
+# CONTENT-CLASSIFIED below for what it would take to change it safely.
 
 #: Mirror of hermes_gateway.capability_registry.RISK_FAMILY_RANKS. Duplicated
 #: (not imported) because this plugin is stdlib-only and loads inside an
@@ -329,8 +331,9 @@ _MOBILE_MANDATORY_RISK_FAMILIES = frozenset(
 #:   ceiling but would make every terminal call read as maximally severe on the
 #:   phone and destroy the signal that separates them from ``delete_file``;
 #:   ``external_effect`` is already mobile-mandatory, so nothing is unlocked by
-#:   the lower rank. Individual invocations that are provably read-only are
-#:   downgraded per-call by :func:`_is_provably_read_only_command`.
+#:   the lower rank. It is a floor with NO per-call escape hatch: the command
+#:   string is never inspected (see WHY SHELL COMMANDS ARE NOT CONTENT-CLASSIFIED
+#:   below).
 #: * Local file mutation: ``destructive`` rather than ``irreversible``.
 #:   ``irreversible`` is the top of the tower's ladder and is reserved for
 #:   effects with no local undo path at all; a clobbered or deleted working-tree
@@ -372,444 +375,69 @@ _RISK_LEVEL_FOR_FAMILY: Dict[str, str] = {
     "irreversible": "critical",
 }
 
-#: Tools whose arguments carry a SHELL COMMAND LINE that the classifier below can
-#: reason about. ``execute_code`` is deliberately absent: its payload is a
-#: program in a general-purpose language, and no allowlist over source text can
-#: prove that read-only.
-_SHELL_CLASSIFIABLE_TOOLS = frozenset(
-    {"terminal", "bash", "shell", "execute_command", "run_command"}
-)
-
-#: Argument keys that may carry the command string. Exactly one must be present.
-_SHELL_COMMAND_KEYS = ("command", "cmd")
-
-#: Keys that carry the WORKING DIRECTORY the command runs in.
-#:
-#: These are NOT benign companions. cwd fully determines what every relative
-#: operand resolves to, so it is part of the command's meaning: with cwd checked
-#: by key name only, ``{"command": "cat config", "cwd": "/Users/x/.ssh"}`` reads
-#: a private key while naming neither ``.ssh`` nor a key file anywhere the
-#: sensitive-operand markers can see it. Classification therefore resolves every
-#: relative operand against this value and applies the markers to the RESULT, and
-#: to the cwd itself. Anything about the cwd we cannot pin down exactly — a
-#: non-string, a relative path, more than one of these keys at once — fails the
-#: whole classification closed rather than silently reverting to un-rooted
-#: operands. See :func:`_extract_cwd`.
-_SHELL_CWD_ARG_KEYS = ("cwd", "workdir", "working_directory", "directory")
-
-#: Keys that carry no execution semantics at all.
-_SHELL_INERT_ARG_KEYS = frozenset(
-    {
-        "timeout",
-        "timeout_ms",
-        "timeout_seconds",
-        "description",
-        "explanation",
-        "session_id",
-    }
-)
-
-#: Every key permitted to appear in a classifiable call. An unrecognised key may
-#: change execution semantics (``shell``, ``env``, ``stdin``, ``args``...), and an
-#: unknown key means we cannot claim to know what will run — so its presence
-#: fails closed to the floor.
-_SHELL_BENIGN_ARG_KEYS = (
-    frozenset(_SHELL_COMMAND_KEYS) | frozenset(_SHELL_CWD_ARG_KEYS)
-    | _SHELL_INERT_ARG_KEYS
-)
-
-#: ALLOWLIST of characters a provably-read-only command may contain. Everything
-#: else — every shell metacharacter (``; | & $ ` > < ( ) { } [ ] * ? ~ ! #``),
-#: the backslash escape, newline/carriage return, control characters, and every
-#: non-ASCII codepoint (so NBSP / RTL-override / homoglyph tricks cannot smuggle
-#: anything past the parser) — is rejected. An allowlist is used rather than a
-#: denylist precisely because the denylist can never be finished.
-_SAFE_COMMAND_CHARS = frozenset(
-    "abcdefghijklmnopqrstuvwxyz"
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    "0123456789"
-    " _-./:=,+@'\""
-)
-
-_MAX_COMMAND_CHARS = 2048
-_MAX_COMMAND_TOKENS = 32
-
-#: Substrings that make an operand look like it addresses a credential store.
-#: Reading a secret has no side effect, but the tower has a dedicated
-#: ``credential_or_secret`` family and calling such a read "read_only" would be
-#: the same category error this change exists to fix. Deliberately over-broad:
-#: a false positive costs a standing grant, a false negative leaks a key.
-_SENSITIVE_OPERAND_MARKERS = (
-    ".env",
-    ".ssh",
-    ".aws",
-    ".gnupg",
-    ".kube",
-    ".docker",
-    ".npmrc",
-    ".pypirc",
-    ".netrc",
-    ".pem",
-    ".key",
-    ".p12",
-    ".pfx",
-    "id_rsa",
-    "id_ed25519",
-    "id_ecdsa",
-    "credential",
-    "secret",
-    "passwd",
-    "password",
-    "shadow",
-    "keychain",
-    "keyring",
-    "token",
-    "apikey",
-    "api_key",
-)
-
-#: Absolute-path prefixes whose "reads" are not reads.
-#:
-#: Character devices and the pseudo-filesystems are stateful: consuming from a
-#: FIFO or a serial device REMOVES data, ``/dev/random`` drains entropy,
-#: ``cat /dev/urandom`` never returns, and a number of ``/proc`` and ``/sys``
-#: nodes act on access or block indefinitely. ``cat``/``head``/``wc``/``du``
-#: against those is not side-effect-free, so an operand that resolves under one
-#: of these is not classifiable no matter which allowlisted program reads it.
-_NON_INERT_PATH_PREFIXES = ("/dev", "/proc", "/sys")
-
-_NUMERIC_SHORT_FLAG = re.compile(r"-[0-9]{1,6}")
-
-
-def _cmd_spec(
-    flags: Any = (),
-    operands: bool = False,
-    numeric_short_flags: bool = False,
-) -> Dict[str, Any]:
-    return {
-        "flags": frozenset(flags),
-        "operands": operands,
-        "numeric_short_flags": numeric_short_flags,
-    }
-
-
-#: Read-only programs and the ONLY flags each may carry.
-#:
-#: Per-program flag ALLOWLISTS, not a denylist of dangerous flags. A denylist has
-#: to enumerate ``-o/--output``, ``--exec``, ``-exec``, ``--write``, ``-i``,
-#: ``--upload-pack``, ``--ext-diff``, pager/editor overrides, and whatever the
-#: next release of the tool adds — and a single miss is an arbitrary write. An
-#: allowlist is wrong in the safe direction: a flag nobody thought about is
-#: simply not classifiable, and the call falls back to the floor.
-#: A program earns a place here only if it answers NO to the question that
-#: removed ``git`` (see :data:`_PROGRAMS_REMOVED_FOR_CONFIG_EXECUTION`): *can it
-#: execute another program, or honour a config / dotfile / attribute file that an
-#: attacker who has had one prior write could control?*
-_READ_ONLY_PROGRAMS: Dict[str, Dict[str, Any]] = {
-    "pwd": _cmd_spec(),
-    # Resolves a name against PATH and stats the candidates; it never runs the
-    # program it finds, and it reads no dotfile in this flag set (`--read-alias`
-    # / `--read-functions` are not allowlisted, and they only parse text piped
-    # in on stdin anyway).
-    "which": _cmd_spec(flags=("-a",), operands=True),
-    # No flags: macOS `stat -f` takes a format string and GNU `stat -f` reports a
-    # filesystem; neither is worth the parsing surface.
-    "stat": _cmd_spec(operands=True),
-    "ls": _cmd_spec(
-        flags=(
-            "-l",
-            "-a",
-            "-A",
-            "-la",
-            "-al",
-            "-lA",
-            "-h",
-            "-lh",
-            "-hl",
-            "-lah",
-            "-1",
-            "-t",
-            "-r",
-            "-S",
-            "-R",
-            "-F",
-            "-d",
-            "-ltr",
-            "-lrt",
-            "--color=never",
-            "--color=auto",
-        ),
-        operands=True,
-    ),
-    "wc": _cmd_spec(flags=("-l", "-w", "-c", "-m"), operands=True),
-    "du": _cmd_spec(flags=("-h", "-s", "-sh", "-hs", "-c", "-a", "-d"), operands=True),
-    "cat": _cmd_spec(flags=("-n", "-b", "-s"), operands=True),
-    "head": _cmd_spec(
-        flags=("-n", "-c", "-q", "-v"), operands=True, numeric_short_flags=True
-    ),
-    # `-f` (follow) is absent on purpose: it never returns.
-    "tail": _cmd_spec(
-        flags=("-n", "-c", "-q", "-v"), operands=True, numeric_short_flags=True
-    ),
-}
-
-#: ``git`` IS NOT CLASSIFIABLE — REMOVED, and it must stay removed.
-#:
-#: Every ``git`` invocation now falls through to the ``external_effect`` floor
-#: and requires a human tap. This was previously an allowlist of read-shaped
-#: subcommands (``status``/``log``/``diff``/``show``/``branch``/``rev-parse``/
-#: ``describe``/``remote``) with no top-level flags accepted. That was not
-#: enough, and the gap was remote code execution, demonstrated end to end:
-#:
-#:   git -C repo config core.fsmonitor '<payload>'
-#:       -> a later bare `git status` EXECUTES <payload>
-#:   git -C repo config diff.evil.command '<payload>'  + .gitattributes
-#:   'f.txt diff=evil'
-#:       -> a later bare `git diff` EXECUTES <payload>
-#:
-#: The root cause is structural, not a missing entry. git executes helper
-#: programs named by the REPOSITORY's own ``.git/config``, by ``.gitattributes``,
-#: and by files those point at — none of which appear on the command line this
-#: classifier can see. One prior approved write inside a repo, or cloning a
-#: hostile one, is enough to arm it, and the payload then fires on the next
-#: read-shaped command.
-#:
-#: Why the "require hardening flags" alternative was rejected. It would mean
-#: classifying only when the caller passed something like
-#: ``-c core.fsmonitor= -c diff.external= --no-ext-diff``, which is sound ONLY
-#: if the set of config keys git will execute from can be enumerated completely.
-#: It cannot be, for three independent reasons:
-#:
-#:   1. The set is open by construction. External diff and textconv drivers are
-#:      ``diff.<name>.command`` / ``diff.<name>.textconv`` and filters are
-#:      ``filter.<name>.clean`` / ``.smudge`` / ``.process``, where ``<name>`` is
-#:      chosen by the repository's own ``.gitattributes``. There is no finite
-#:      list of key names to neutralise — only a wildcard we would have to
-#:      re-derive from attribute files we have not read.
-#:   2. The known-executing keys are already a long and version-dependent tail:
-#:      ``core.fsmonitor``, ``core.pager`` / ``pager.<cmd>``, ``core.editor``,
-#:      ``sequence.editor``, ``core.sshCommand``, ``core.gitProxy``,
-#:      ``core.hooksPath`` (plus in-repo ``.git/hooks/*``), ``core.askPass``,
-#:      ``core.attributesFile``, ``core.excludesFile``, ``alias.<x>`` with a
-#:      leading ``!``, ``credential.helper``, ``gpg.program`` /
-#:      ``gpg.<fmt>.program``, ``ssh.variant``, ``diff.external``,
-#:      ``interactive.diffFilter``, ``trailer.<t>.command``,
-#:      ``merge.<d>.driver``, ``submodule.<n>.update`` with ``!``,
-#:      ``protocol.<p>.command``, ``uploadpack.packObjectsHook``,
-#:      ``remote.<r>.uploadpack`` / ``receivepack``. Each new git release may add
-#:      one, and this plugin does not ship with git.
-#:   3. THE PLUGIN CLASSIFIES BUT DOES NOT CONTROL EXECUTION. It cannot inject
-#:      hardening flags; it can only hope the caller passed them. Trusting the
-#:      caller's flag list means trusting the attacker who wrote the tool call.
-#:      Worse, accepting ``-c`` in the top-level position at all would reopen
-#:      exactly the ``git -c core.pager=sh`` / ``-c alias.x=!sh`` injection that
-#:      the old "no top-level flags, ever" rule killed in one line.
-#:
-#: An incomplete allowlist here is an RCE, so there is no allowlist.
-#:
-#: COST, stated plainly: ``git status`` and ``git log`` were the operator's
-#: actual day-to-day use of this downgrade, and they are gone. This removes the
-#: feature's main use case rather than shrinking it at the edges. What survives
-#: is the non-git half of :data:`_READ_ONLY_PROGRAMS` (``ls``, ``cat``, ``head``,
-#: ``tail``, ``wc``, ``du``, ``stat``, ``which``, ``pwd``), which is a real but
-#: much smaller convenience. Restoring git would require the tower to EXECUTE the
-#: command itself under a hardened, config-neutralised environment instead of
-#: merely labelling a string someone else will run — that is a different design,
-#: not a bigger table.
-_PROGRAMS_REMOVED_FOR_CONFIG_EXECUTION = frozenset(
-    {
-        # Executes helpers named by repo-local config / attributes. See above.
-        "git",
-        # libmagic honours $MAGIC and ~/.magic; a magic file is attacker-shaped
-        # input under the same "one prior write" precondition as .git/config,
-        # and `file`'s compression handling shells out to external decompressors
-        # on several builds. Marginal value, non-zero and unbounded surface.
-        "file",
-    }
-)
+# --- WHY SHELL COMMANDS ARE NOT CONTENT-CLASSIFIED --------------------------
+#
+# A per-call downgrade used to live here: a shell tool whose ``command`` string
+# was "provably read-only" (an allowlist of characters, of programs, and of flags
+# per program, plus resolution of every operand against the call's ``cwd``) was
+# reclassified from the ``external_effect`` floor down to ``read_only``, which is
+# the only thing that makes a tool eligible for a standing grant. IT IS GONE, ON
+# PURPOSE, AND IT MUST NOT COME BACK IN THIS SHAPE. Three independent adversarial
+# reviews broke it, each time at whichever layer had just been added, while the
+# token parser itself held:
+#
+#   ROUND 1 — PROVEN ARBITRARY CODE EXECUTION AT ``read_only``.
+#     ``git -C repo config core.fsmonitor '<payload>'`` (or
+#     ``diff.<name>.command`` plus a ``.gitattributes`` line) arms a repository so
+#     that a later bare ``git status`` / ``git diff`` EXECUTES the payload. The
+#     helper is named by the repo's own config, so nothing about it appears on the
+#     command line the classifier is shown. One prior approved write inside a
+#     repo, or cloning a hostile one, is enough. Same review: ``cwd`` was accepted
+#     by KEY NAME only and never inspected, so ``{"command": "cat config",
+#     "cwd": ".../.ssh"}`` read a private key while naming no secret anywhere.
+#
+#   ROUND 2 — PATH NORMALISATION DEFEATED THREE WAYS, after git was removed and
+#   cwd handling was added.
+#     (a) ``posixpath.normpath`` preserves exactly two leading slashes (POSIX
+#         permits an implementation-defined meaning for ``//``), so ``//dev/
+#         urandom`` normalises to ``//dev/urandom`` and slips past a ``/dev``
+#         prefix check while still opening the device.
+#     (b) A relative operand with no ``cwd`` returned True before the non-inert
+#         path check ever ran, so that check simply did not apply to the most
+#         common argument shape.
+#     (c) ``cwd: "//dev"`` passed cwd validation for the same reason as (a).
+#     These are not cosmetic: ``//dev/ptmx`` allocates a pty pair on open and
+#     ``//dev/tty`` steals the operator's terminal input.
+#
+#   ROUND 3 — THE COST/BENEFIT NO LONGER HELD. Round 2 had already removed the
+#     feature's actual use case (``git status`` / ``git log``). What remained was
+#     a handful of commands on non-device paths, guarding a feature whose failure
+#     mode is unattended code execution with no human in the loop. So the whole
+#     downgrade was removed.
+#
+# The structural problem is not any one of those bugs. It is that THIS PLUGIN
+# LABELS A STRING THAT SOMEBODY ELSE THEN EXECUTES. It does not control the
+# environment, the shell, the PATH, the config files the program will read, or
+# the filesystem between the check and the run. Every "proof" it can offer is a
+# claim about text, and the thing that actually happens is decided by state the
+# text does not mention. An allowlist over that text can only ever be a guess
+# that has not been broken yet.
+#
+# THE CORRECT DESIGN, if this capability is wanted later: THE TOWER EXECUTES THE
+# COMMAND ITSELF, in a hardened, config-neutralised environment it owns — scrubbed
+# environment, no user/repo config honoured, no device or pseudo-filesystem paths
+# reachable, resource- and time-bounded, output captured — and reports the result.
+# Then "read-only" is a property of a sandbox the tower controls, not an assertion
+# about a string another party will run. That is a different component, not a
+# bigger table. Anything short of it belongs at the floor.
+#
+# The exploits above survive as tests: see tests/test_risk_classification.py,
+# which keeps the hostile fixtures and asserts they land at the floor.
 
 
 def _rank(family: str) -> int:
     """Rank of a family; an unknown name ranks at the floor, never below it."""
     return _RISK_FAMILY_RANKS.get(family, _RISK_FAMILY_RANKS["external_effect"])
-
-
-def _is_sensitive_operand(token: str) -> bool:
-    lowered = token.lower()
-    return any(marker in lowered for marker in _SENSITIVE_OPERAND_MARKERS)
-
-
-def _normalised_abs_path(path: str) -> Optional[str]:
-    """``path`` as a normalised absolute POSIX path, or ``None`` if we cannot be
-    certain what it names.
-
-    Purely lexical on purpose. Resolving symlinks would mean touching the
-    filesystem from inside a classifier — a TOCTOU race (the link can be
-    repointed between the check and the run) and a filesystem read of a path the
-    caller may not be entitled to. Instead, anything that is not already an
-    unambiguous absolute path is refused. ``~`` never reaches here: it is not in
-    :data:`_SAFE_COMMAND_CHARS`, so tilde expansion cannot be smuggled through
-    either the command or the cwd.
-    """
-    if not path.startswith("/"):
-        return None  # relative to something we cannot see
-    collapsed = posixpath.normpath(path)
-    if ".." in collapsed.split("/"):  # belt and braces; normpath clamps at /
-        return None
-    return collapsed
-
-
-def _is_non_inert_path(path: str) -> bool:
-    """Does this normalised absolute path address a device / pseudo-filesystem?"""
-    return any(
-        path == prefix or path.startswith(prefix + "/")
-        for prefix in _NON_INERT_PATH_PREFIXES
-    )
-
-
-def _operand_is_safe(token: str, cwd: Optional[str]) -> bool:
-    """Is this operand safe to read, once resolved against the supplied cwd?
-
-    The RAW token and the RESOLVED path are both checked. Normalisation can only
-    ever delete text (``x/../.ssh/k`` collapses to ``/.ssh/k`` only if rooted;
-    ``a/../b`` loses ``a`` entirely), so checking both sides means a marker
-    cannot be hidden on either side of the transform.
-    """
-    if _is_sensitive_operand(token):
-        return False
-    if token.startswith("/"):
-        # Absolute operand: cwd is irrelevant to it, but it still must resolve.
-        resolved = _normalised_abs_path(token)
-    elif cwd is not None:
-        resolved = _normalised_abs_path(posixpath.join(cwd, token))
-    else:
-        # No cwd was supplied, so this relative operand resolves against the
-        # host's ambient directory, which is not visible from the tool call and
-        # is not attacker-chosen either. The raw-token check above is the whole
-        # proof available; this is the pre-existing behaviour for this case.
-        return True
-    if resolved is None:
-        return False
-    return not _is_sensitive_operand(resolved) and not _is_non_inert_path(resolved)
-
-
-def _extract_cwd(args: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
-    """``(ok, cwd)`` — the working directory these tool args select.
-
-    ``ok`` is ``False`` whenever a working directory is present but cannot be
-    pinned down exactly. That must fail the WHOLE classification closed: falling
-    back to "treat operands as un-rooted" is precisely the bug this exists to
-    fix, because an unresolvable cwd is still a cwd the command will run in.
-    """
-    present = [key for key in _SHELL_CWD_ARG_KEYS if key in args]
-    if not present:
-        return True, None
-    if len(present) > 1:
-        return False, None  # ambiguous: we cannot know which the host honours
-    value = args[present[0]]
-    if not isinstance(value, str):
-        return False, None  # incl. None/dict/list — "present but not a plain string"
-    if not value or len(value) > _MAX_COMMAND_CHARS:
-        return False, None
-    if any(ch not in _SAFE_COMMAND_CHARS for ch in value):
-        # Metacharacters, `~`, tabs/newlines, control chars, non-ASCII homoglyphs.
-        return False, None
-    if _is_sensitive_operand(value):
-        return False, None
-    resolved = _normalised_abs_path(value)
-    if resolved is None:
-        return False, None  # a relative cwd resolves against an unknown parent
-    if _is_sensitive_operand(resolved) or _is_non_inert_path(resolved):
-        return False, None
-    return True, resolved
-
-
-def _tokens_match_spec(
-    tokens: List[str], spec: Dict[str, Any], cwd: Optional[str] = None
-) -> bool:
-    operands_only = False
-    for token in tokens:
-        if not token:  # an explicitly empty quoted argument
-            return False
-        if token == "--":
-            if operands_only or not spec["operands"]:
-                return False
-            operands_only = True
-            continue
-        if not operands_only and token.startswith("-"):
-            if token in spec["flags"]:
-                continue
-            if spec["numeric_short_flags"] and _NUMERIC_SHORT_FLAG.fullmatch(token):
-                continue
-            return False
-        if not spec["operands"]:
-            return False
-        if not _operand_is_safe(token, cwd):
-            return False
-    return True
-
-
-def _is_provably_read_only_command(command: Any, cwd: Optional[str] = None) -> bool:
-    """Is this command line PROVABLY free of side effects, run in ``cwd``?
-
-    Fail-closed by construction: every gate is an allowlist and the function
-    returns ``False`` for anything it does not positively recognise. In
-    particular a chain or pipeline can never be classified read-only even when
-    every element looks safe, because the character allowlist rejects the
-    operators outright — the command is never split on ``;``/``|``/``&&`` and
-    re-checked element-wise, which is the usual way this kind of classifier is
-    defeated.
-
-    ``cwd`` must be an already-validated normalised absolute path (see
-    :func:`_extract_cwd`) or ``None``. It is not optional information: it decides
-    what every relative operand names, so the sensitive-operand markers are
-    applied to operands RESOLVED against it, not to the text as written.
-    """
-    if not isinstance(command, str):
-        return False
-    if not command or len(command) > _MAX_COMMAND_CHARS:
-        return False
-    if any(ch not in _SAFE_COMMAND_CHARS for ch in command):
-        return False
-    if not command.strip():
-        return False
-    if cwd is not None and _normalised_abs_path(cwd) != cwd:
-        return False  # caller passed an unvalidated cwd
-    try:
-        tokens = shlex.split(command)
-    except ValueError:  # unbalanced quoting
-        return False
-    if not tokens or len(tokens) > _MAX_COMMAND_TOKENS:
-        return False
-
-    program, rest = tokens[0], tokens[1:]
-    spec = _READ_ONLY_PROGRAMS.get(program)
-    return spec is not None and _tokens_match_spec(rest, spec, cwd)
-
-
-def _extract_shell_invocation(args: Any) -> Optional[Tuple[str, Optional[str]]]:
-    """``(command, cwd)`` for these tool args, or ``None`` if we cannot say.
-
-    Reads the same tool-argument mapping that ``_redacted_payload`` fingerprints,
-    so classification and the clearance are computed from one source of truth.
-    The extracted values are used for classification ONLY: they are never logged,
-    never added to ``payload_redacted``, and never sent to the gateway — the
-    redaction invariant (tool name + argument KEYS) is unchanged.
-    """
-    if not isinstance(args, dict):
-        return None
-    if any(str(key) not in _SHELL_BENIGN_ARG_KEYS for key in args):
-        return None
-    present = [key for key in _SHELL_COMMAND_KEYS if key in args]
-    if len(present) != 1:
-        return None
-    value = args[present[0]]
-    if not isinstance(value, str):
-        return None
-    cwd_ok, cwd = _extract_cwd(args)
-    if not cwd_ok:
-        return None
-    return value, cwd
 
 
 def _unclassified_floor() -> str:
@@ -820,10 +448,10 @@ def _unclassified_floor() -> str:
     as a blanket floor over every tool. ``act install`` STAMPS that key with the
     historical blanket value (``clearance_risk_family = "external_effect"`` is
     sitting in the live act.toml right now), so honouring it as "raise every tool
-    to at least this" would re-break the exact workflow this change exists to
-    fix — the per-tool map and the read-only classifier would be overridden back
-    to a mobile-mandatory family on every install. An operator who genuinely
-    wants a blanket floor says so with ``min_risk_family``, which nothing stamps.
+    to at least this" would flatten the per-tool map back to one family on every
+    install and destroy the distinction the map exists to make. An operator who
+    genuinely wants a blanket floor says so with ``min_risk_family``, which
+    nothing stamps.
 
     Clamped upward at :data:`_DEFAULT_CLEARANCE_RISK_FAMILY`: an unclassified
     risky tool must never be configurable into a grant-eligible family.
@@ -837,15 +465,14 @@ def _unclassified_floor() -> str:
 
 
 def _classified_risk_family(tool_name: str, args: Any) -> str:
-    """Baseline family for THIS call, before operator overrides."""
-    baseline = _TOOL_RISK_FAMILIES.get(tool_name) or _unclassified_floor()
-    if tool_name not in _SHELL_CLASSIFIABLE_TOOLS:
-        return baseline
-    invocation = _extract_shell_invocation(args)
-    if invocation is None:
-        return baseline
-    command, cwd = invocation
-    return "read_only" if _is_provably_read_only_command(command, cwd) else baseline
+    """Baseline family for THIS call, before operator overrides.
+
+    The per-tool map, and nothing else. ``args`` is accepted (so the signature
+    stays stable for callers and for any future per-tool argument *tightening*)
+    but is deliberately NOT read: no content inspection may lower a family. See
+    WHY SHELL COMMANDS ARE NOT CONTENT-CLASSIFIED above before changing that.
+    """
+    return _TOOL_RISK_FAMILIES.get(tool_name) or _unclassified_floor()
 
 
 def _risk_family_env_key(tool_name: str) -> str:
@@ -1185,9 +812,9 @@ def _poll_question_answer(
 def _relay_clearance(
     tool_name: str, args: Any, session_id: str
 ) -> Optional[Dict[str, str]]:
-    # Honest per-tool family (capability ceiling), with a per-call downgrade to
-    # read_only when the shell command is provably side-effect-free. This is what
-    # decides whether the tower can honour a standing grant at all.
+    # Honest per-tool family (capability ceiling). This is what decides whether
+    # the tower can honour a standing grant at all. No per-call downgrade: the
+    # command string is never inspected, so every shell tool sits at its floor.
     risk_family = _risk_family_for_tool(tool_name, args)
     timeout_s = _timeout()
     payload_redacted = _redacted_payload(tool_name, args)

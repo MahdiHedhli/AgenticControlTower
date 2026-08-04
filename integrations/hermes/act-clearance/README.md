@@ -52,45 +52,61 @@ All of those are mobile-mandatory, so the tower will never satisfy them from a
 standing grant — approving "for this session" on the phone correctly yields
 nothing but a single-use clearance.
 
-**The exception that makes standing grants usable:** when a shell tool's command
-is *provably* read-only it is classified `read_only` for that call, which is
-grant-eligible. "Provably" is a fail-closed allowlist, not a filter:
+### Shell commands are deliberately NOT content-classified
 
-- an allowlist of characters — any shell metacharacter, escape, newline, control
-  character, or non-ASCII codepoint rejects the command outright, so a pipeline
-  or `;`-chain can never be classified read-only even if every element is safe;
-- an allowlist of programs (`ls`, `cat`, `head`, `tail`, `wc`, `du`, `pwd`,
-  `which`, `stat`) and **flags per program** — a flag nobody allowlisted is
-  simply not classifiable;
-- operands that look like credential paths (`.env`, `.ssh`, `id_rsa`, `.pem`,
-  `token`, `secret`, …) fall back to the floor, and the check is applied to the
-  operand **resolved against the call's `cwd`**, not to the text as written —
-  `{"command": "cat config", "cwd": ".../.ssh"}` names no secret anywhere but
-  reads one, so a `cwd` that cannot be pinned to an exact absolute path (missing
-  is fine; relative, `~`, non-string, or two `cwd`-ish keys at once are not)
-  fails the whole classification closed;
-- operands resolving under `/dev`, `/proc`, or `/sys` fall back to the floor:
-  consuming from a FIFO or character device is a side effect, and several such
-  reads never return;
-- `execute_code` is never classified: no allowlist over source text can prove a
-  program read-only.
+**The command string is never inspected.** `terminal`, `bash`, `shell`,
+`execute_command`, `run_command`, and `execute_code` sit at their `external_effect`
+floor unconditionally, whatever the arguments look like. `{"command": "ls -la"}`
+and `{"command": "rm -rf /"}` are classified identically.
 
-Anything the classifier does not positively recognise — including an unparsable,
-missing, non-string, or ambiguous command argument — stays at the floor.
+**What the operator loses, stated plainly: standing grants are unreachable for
+terminal work.** Every shell call needs a tap on the phone, every time. There is
+no "approve `git status` for this session".
 
-**`git` is deliberately NOT classifiable, and neither is `file`.** `git` executes
-helper programs named by the *repository's own* `.git/config` and
-`.gitattributes` — `core.fsmonitor` fires on `git status`, a `diff.<name>.command`
-driver fires on `git diff` — none of which appear on the command line. One prior
-approved write inside a repo, or cloning a hostile one, turns a read-shaped git
-command into arbitrary code execution. Because this plugin only *classifies* and
-never *executes*, it cannot inject hardening flags; and the set of config keys git
-will run a program from is open-ended (driver names come from `.gitattributes`)
-and grows between releases, so no allowlist of them can be proven complete. An
-incomplete one here is an RCE, so `git` falls to `external_effect` and always
-needs a human tap. `file` is out for the same class of reason: libmagic honours
-`$MAGIC` and `~/.magic`. **This is a real cost — `git status` and `git log` were
-the main day-to-day use of the downgrade.**
+An earlier version did downgrade "provably read-only" commands to `read_only` —
+an allowlist of characters, of programs, and of flags per program, with operands
+resolved against the call's `cwd`. Three independent adversarial reviews broke
+it, each time at whichever layer had just been added, while the token parser
+itself held:
+
+1. **Round 1 — proven arbitrary code execution at `read_only`.** `git` runs
+   helper programs named by the *repository's own* `.git/config` and
+   `.gitattributes`: `core.fsmonitor` fires on `git status`, a
+   `diff.<name>.command` driver fires on `git diff`. None of it appears on the
+   command line the classifier is shown, and one prior approved write inside a
+   repo (or cloning a hostile one) arms it. Same review: `cwd` was validated by
+   key *name* only, so `{"command": "cat config", "cwd": ".../.ssh"}` read a
+   private key while naming no secret anywhere.
+2. **Round 2 — path normalisation defeated three ways**, after `git` was dropped
+   and `cwd` resolution was added. POSIX permits an implementation-defined
+   meaning for a leading `//`, so `posixpath.normpath` preserves exactly two
+   leading slashes and `//dev/urandom` walked past the `/dev` prefix check while
+   still opening the device; a relative operand with *no* `cwd` returned "safe"
+   before the device check ran at all; and `cwd: "//dev"` passed validation for
+   the same reason as the first. `//dev/ptmx` allocates a pty pair on open and
+   `//dev/tty` steals the operator's terminal input.
+3. **Round 3 — the cost/benefit stopped holding.** Round 2 had already removed
+   the feature's real use case (`git status`, `git log`). What was left was a
+   handful of commands on non-device paths, guarding a feature whose failure mode
+   is unattended code execution with no human in the loop.
+
+The structural problem is not any one of those bugs: **this plugin labels a
+string that somebody else then executes.** It does not control the environment,
+the shell, `PATH`, the config files the program will read, or the filesystem
+between the check and the run. Every "proof" it can offer is a claim about text,
+while what actually happens is decided by state the text never mentions.
+
+**If this capability is wanted later, the correct design is for the tower to
+execute the command itself** in a hardened, config-neutralised environment it
+owns — scrubbed environment, no user or repo config honoured, no device or
+pseudo-filesystem paths reachable, resource- and time-bounded, output captured —
+and report the result. Then "read-only" is a property of a sandbox the tower
+controls rather than an assertion about a string another party will run. That is a
+different component, not a bigger allowlist.
+
+The exploit fixtures are kept as permanent tests
+(`tests/test_risk_classification.py`) and now assert that those inputs land at the
+floor, so any future attempt to reintroduce a downgrade trips them.
 
 Overrides (ENV > `act.toml`) may **tighten only**:
 

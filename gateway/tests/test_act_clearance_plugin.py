@@ -227,36 +227,48 @@ def test_plugin_tool_families_are_real_tower_families() -> None:
     assert set(plugin._TOOL_RISK_FAMILIES.values()) <= ALL_RISK_FAMILIES
 
 
-def test_gated_tools_are_never_grant_eligible_by_default() -> None:
-    """Every tool the plugin gates must, absent a per-call read-only proof, land
-    in a family the tower refuses to satisfy from a standing grant. This is the
-    invariant the honest per-tool map must not accidentally break."""
+def test_gated_tools_are_never_grant_eligible() -> None:
+    """Every tool the plugin gates must land in a family the tower refuses to
+    satisfy from a standing grant. This is the invariant the honest per-tool map
+    must not accidentally break."""
     for tool, family in plugin._TOOL_RISK_FAMILIES.items():
         assert family in GRANT_UNGRANTABLE_RISK_FAMILIES, tool
 
 
-def test_provably_read_only_shell_command_is_grant_eligible(
+def test_no_shell_command_is_ever_grant_eligible(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The point of the change: a provably read-only shell command must classify
-    into a family the tower CAN mint a standing grant for.
+    """CROSS-REPO GUARD for a deliberate removal.
 
-    `git status` was the original example here and is deliberately no longer one:
-    git executes helpers named by the repository's own config/attributes, which
-    is remote code execution behind a read-shaped command line, so no git
-    invocation classifies any more. See _PROGRAMS_REMOVED_FOR_CONFIG_EXECUTION in
-    the plugin."""
+    The plugin used to downgrade a "provably read-only" shell command to
+    ``read_only``, which is the only family the tower will mint a standing grant
+    for. Three adversarial rounds broke that classifier (repo-local git config ->
+    arbitrary code execution; an unchecked ``cwd`` -> secret reads; ``//`` paths
+    surviving ``posixpath.normpath`` -> device reads), so it was removed
+    entirely: shell command CONTENT is no longer inspected at all.
+
+    The tower-side consequence, asserted here rather than left implicit: no
+    terminal call this plugin raises can be satisfied by a standing grant. Every
+    one needs a human tap. See WHY SHELL COMMANDS ARE NOT CONTENT-CLASSIFIED in
+    integrations/hermes/act-clearance/__init__.py, and the exploit fixtures in
+    that plugin's tests/test_risk_classification.py."""
     # Hermetic: never read the developer's real ~/.hermes/act/act.toml or env.
     monkeypatch.setitem(plugin._TOML_CACHE, "loaded", True)
     monkeypatch.setitem(plugin._TOML_CACHE, "data", {})
     for key in list(plugin.os.environ):
         if key.startswith("ACT_CLEARANCE_"):
             monkeypatch.delenv(key, raising=False)
-    family = plugin._risk_family_for_tool("terminal", {"command": "ls -la"})
-    assert family in LOW_RISK_FAMILIES
-    assert family not in GRANT_UNGRANTABLE_RISK_FAMILIES
 
-    assert (
-        plugin._risk_family_for_tool("terminal", {"command": "git status"})
-        in GRANT_UNGRANTABLE_RISK_FAMILIES
-    )
+    for args in (
+        {"command": "ls -la"},
+        {"command": "ls -la", "cwd": "/repo"},
+        {"cmd": "pwd"},
+        {"command": "git status"},
+        {"command": "cat //dev/urandom"},
+        {},
+        None,
+    ):
+        for tool in ("terminal", "bash", "shell", "execute_command", "run_command"):
+            family = plugin._risk_family_for_tool(tool, args)
+            assert family in GRANT_UNGRANTABLE_RISK_FAMILIES, (tool, args, family)
+            assert family not in LOW_RISK_FAMILIES, (tool, args, family)
