@@ -24,10 +24,15 @@ Design notes
 from __future__ import annotations
 
 import argparse
+import hashlib
+import io
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,9 +43,14 @@ from pathlib import Path
 # --------------------------------------------------------------------------- #
 
 LAUNCHD_LABEL = "app.act.gateway"
+DASHBOARD_LAUNCHD_LABEL = "app.act.hermes-dashboard"
 GATEWAY_HOST = "127.0.0.1"
 GATEWAY_PORT = 8788
+DASHBOARD_HOST = "127.0.0.1"
+DASHBOARD_PORT = 9119
 PLUGIN_NAME = "act-clearance"
+PLUGIN_MANAGED_FILES = ("__init__.py", "plugin.yaml")
+PLUGIN_DISTRIBUTION_FILES = (*PLUGIN_MANAGED_FILES, "README.md")
 # launchd hands the job only this minimal PATH; everything else must be
 # reconstructed into EnvironmentVariables.
 LAUNCHD_MINIMAL_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
@@ -86,6 +96,10 @@ def shim_path() -> Path:
     return bin_dir() / "act-gateway"
 
 
+def dashboard_shim_path() -> Path:
+    return bin_dir() / "act-hermes-dashboard"
+
+
 def gateway_toml_path() -> Path:
     return act_home() / "gateway.toml"
 
@@ -102,8 +116,39 @@ def plist_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 
 
+def dashboard_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{DASHBOARD_LAUNCHD_LABEL}.plist"
+
+
+def hermes_dashboard_executable() -> Path:
+    """Stable Hermes CLI installed by the desktop/agent distribution."""
+    return Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "hermes"
+
+
 def hermes_config_path() -> Path:
     return Path.home() / ".hermes" / "config.yaml"
+
+
+def plugin_source_dir() -> Path:
+    """Bundled Hermes bridge source for the ACT release being installed."""
+    packaged = Path(__file__).resolve().parent / "_bundled" / PLUGIN_NAME
+    if all((packaged / name).is_file() for name in PLUGIN_DISTRIBUTION_FILES):
+        return packaged
+    return gateway_project_dir().parent / "integrations" / "hermes" / PLUGIN_NAME
+
+
+def plugin_install_dir() -> Path:
+    return Path.home() / ".hermes" / "plugins" / PLUGIN_NAME
+
+
+def plugin_release_path() -> Path:
+    """Owner-only manifest pinning the exact bridge files deployed by ACT."""
+    return act_home() / "plugin-release.json"
+
+
+def hermes_agent_log_path() -> Path:
+    """Local Hermes log carrying UltraCode's rotating one-click read URL."""
+    return Path.home() / ".hermes" / "logs" / "agent.log"
 
 
 def launchd_domain() -> str:
@@ -113,6 +158,10 @@ def launchd_domain() -> str:
 
 def launchd_service_target() -> str:
     return f"{launchd_domain()}/{LAUNCHD_LABEL}"
+
+
+def dashboard_launchd_service_target() -> str:
+    return f"{launchd_domain()}/{DASHBOARD_LAUNCHD_LABEL}"
 
 
 # --------------------------------------------------------------------------- #
@@ -164,6 +213,9 @@ class Ops:
     def read_text(self, path: Path) -> str:
         return Path(path).read_text()
 
+    def read_bytes(self, path: Path) -> bytes:
+        return Path(path).read_bytes()
+
 
 @dataclass
 class FakeOps(Ops):
@@ -200,9 +252,9 @@ class FakeOps(Ops):
 
     def copy_file(self, src, dst, *, mode=None):
         self.calls.append(("copy", str(src), str(dst)))
-        # Record the destination as a written file (bytes are not the payload
-        # that matters for these tests — the mode + path are).
-        self.files[str(dst)] = f"<copied from {src}>"
+        # These managed inputs are text files. Preserve their real payload so
+        # integrity/update checks exercise the same hashes as production.
+        self.files[str(dst)] = Path(src).read_text()
         if mode is not None:
             self.modes[str(dst)] = mode
 
@@ -227,6 +279,9 @@ class FakeOps(Ops):
         if str(path) in self.files:
             return self.files[str(path)]
         return self.existing[str(path)]
+
+    def read_bytes(self, path):
+        return self.read_text(path).encode("utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -262,17 +317,23 @@ def _under_source_checkout(interp: str) -> bool:
 
 
 def _build_service_path(interp: str | None = None) -> str:
-    """Reconstruct a sane PATH for the launchd job. launchd provides only
-    ``/usr/bin:/bin:/usr/sbin:/sbin`` — missing Homebrew, the venv, etc. We
-    prepend the interpreter's own bin dir, then layer the user's current PATH,
-    then guarantee the minimal system dirs, de-duplicated and order-preserving.
+    """Build a deterministic, allowlisted PATH for the launchd job.
+
+    Never inherit the installing process's ambient PATH. Codex and other app
+    runtimes inject per-process temporary directories there; baking those into
+    a long-lived service caused false plist drift and expanded executable
+    search into locations ACT does not control.
     """
-    priority: list[str] = []
     interp_bin = str(Path(interp or interpreter_path()).parent)
-    priority.append(interp_bin)
-    current = [p for p in os.environ.get("PATH", "").split(":") if p]
-    minimal = LAUNCHD_MINIMAL_PATH.split(":")
-    return ":".join(dict.fromkeys(priority + current + minimal))
+    stable = [
+        interp_bin,
+        str(Path.home() / ".local" / "bin"),
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        *LAUNCHD_MINIMAL_PATH.split(":"),
+    ]
+    return ":".join(dict.fromkeys(stable))
 
 
 # --------------------------------------------------------------------------- #
@@ -290,6 +351,21 @@ def generate_shim(interpreter: str | None = None) -> str:
         "# Stable entrypoint for the app.act.gateway launchd job. Generated by\n"
         "# `act install`; do not edit by hand — re-run `act install` to refresh.\n"
         f'exec "{interpreter}" -m hermes_gateway "$@"\n'
+    )
+
+
+def generate_dashboard_shim(hermes_executable: Path | None = None) -> str:
+    """Stable loopback-only entrypoint for the full Hermes dashboard.
+
+    The dashboard never binds to the LAN or tailnet. ACT's authenticated
+    gateway is the sole remote exposure surface.
+    """
+    executable = hermes_executable or hermes_dashboard_executable()
+    return (
+        "#!/bin/sh\n"
+        "# Full Hermes dashboard supervised for ACT. Generated by `act install`.\n"
+        f'exec "{executable}" dashboard --host {DASHBOARD_HOST} '
+        f"--port {DASHBOARD_PORT} --no-open --skip-build\n"
     )
 
 
@@ -315,9 +391,7 @@ def generate_plist(
     config_path = config_path or gateway_toml_path()
     out_log = out_log or (logs_dir() / "gateway.out.log")
     err_log = err_log or (logs_dir() / "gateway.err.log")
-    service_path = (
-        service_path if service_path is not None else _build_service_path(interpreter)
-    )
+    service_path = service_path if service_path is not None else _build_service_path(interpreter)
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -354,6 +428,74 @@ def generate_plist(
     <key>KeepAlive</key>
     <true/>
 
+    <!-- Gateway logs may contain request metadata. Owner-only on creation. -->
+    <key>Umask</key>
+    <integer>63</integer>
+
+    <key>StandardOutPath</key>
+    <string>{out_log}</string>
+
+    <key>StandardErrorPath</key>
+    <string>{err_log}</string>
+</dict>
+</plist>
+"""
+
+
+def generate_dashboard_plist(
+    *,
+    shim: Path | None = None,
+    working_dir: Path | None = None,
+    out_log: Path | None = None,
+    err_log: Path | None = None,
+    service_path: str | None = None,
+) -> str:
+    """Return the hardened launchd job for the full Hermes dashboard."""
+    shim = shim or dashboard_shim_path()
+    working_dir = working_dir or (Path.home() / ".hermes")
+    out_log = out_log or (logs_dir() / "hermes-dashboard.out.log")
+    err_log = err_log or (logs_dir() / "hermes-dashboard.err.log")
+    service_path = service_path or _build_service_path(str(hermes_dashboard_executable()))
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{DASHBOARD_LAUNCHD_LABEL}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{shim}</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>{working_dir}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{service_path}</string>
+    </dict>
+
+    <key>LimitLoadToSessionType</key>
+    <array>
+        <string>Aqua</string>
+        <string>Background</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!-- Dashboard output can include ephemeral bootstrap credentials. -->
+    <key>Umask</key>
+    <integer>63</integer>
+
     <key>StandardOutPath</key>
     <string>{out_log}</string>
 
@@ -381,7 +523,7 @@ def generate_gateway_toml(
     overrides are HARD-BAKED: ``seed_mock_data=false``, an ABSOLUTE database
     path, loopback host + port 8788. When APNs is configured only the .p8 PATH
     is recorded — never the key bytes."""
-    db = (db_path or database_path())
+    db = db_path or database_path()
     db = Path(db).expanduser()
     if not db.is_absolute():
         db = Path.home() / db
@@ -413,6 +555,40 @@ def generate_gateway_toml(
         if apns_topic:
             lines.append(f"apns_topic = {_toml_str(apns_topic)}")
     return "\n".join(lines) + "\n"
+
+
+def update_gateway_toml(text: str, overrides: dict[str, str | bool]) -> str:
+    """Update required top-level scalars without discarding operator config.
+
+    ``act install`` previously regenerated the whole file, silently dropping
+    fields such as a custom dashboard URL, allowlists, and clearance policy.
+    This narrow updater preserves every unrelated line and comment while
+    reasserting only install-owned safety values.
+    """
+    # Fail before writing if the existing operator file is not valid TOML.
+    tomllib.loads(text)
+    remaining = dict(overrides)
+    output: list[str] = []
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key in remaining:
+                value = remaining.pop(key)
+                rendered = (
+                    "true" if value is True else "false" if value is False else _toml_str(value)
+                )
+                output.append(f"{key} = {rendered}")
+                continue
+        output.append(line)
+    if remaining:
+        if output and output[-1]:
+            output.append("")
+        output.append("# Safety values maintained by `act install`.")
+        for key, value in remaining.items():
+            rendered = "true" if value is True else "false" if value is False else _toml_str(value)
+            output.append(f"{key} = {rendered}")
+    return "\n".join(output) + "\n"
 
 
 # Bridge defaults — MUST mirror the act-clearance plugin's built-in defaults so
@@ -461,20 +637,23 @@ def generate_act_toml(
     questions = question_tools if question_tools is not None else ACT_DEFAULT_QUESTION_TOOLS
     gated_list = ", ".join(_toml_str(t) for t in gated)
     question_list = ", ".join(_toml_str(t) for t in questions)
-    return "\n".join(
-        [
-            "# Generated by `act install`. ACT<->Hermes bridge config (Phase 3).",
-            "# Read by the act-clearance plugin with precedence ENV > act.toml > default.",
-            f"enabled = {'true' if enabled else 'false'}",
-            f"gateway_url = {_toml_str(f'http://{GATEWAY_HOST}:{GATEWAY_PORT}/v1')}",
-            f"agent_id = {_toml_str(agent_id)}",
-            f"agent_name = {_toml_str(agent_name)}",
-            f"gated_tools = [{gated_list}]",
-            f"question_tools = [{question_list}]",
-            f"question_risk_family = {_toml_str(question_risk_family)}",
-            f"clearance_risk_family = {_toml_str(clearance_risk_family)}",
-        ]
-    ) + "\n"
+    return (
+        "\n".join(
+            [
+                "# Generated by `act install`. ACT<->Hermes bridge config (Phase 3).",
+                "# Read by the act-clearance plugin with precedence ENV > act.toml > default.",
+                f"enabled = {'true' if enabled else 'false'}",
+                f"gateway_url = {_toml_str(f'http://{GATEWAY_HOST}:{GATEWAY_PORT}/v1')}",
+                f"agent_id = {_toml_str(agent_id)}",
+                f"agent_name = {_toml_str(agent_name)}",
+                f"gated_tools = [{gated_list}]",
+                f"question_tools = [{question_list}]",
+                f"question_risk_family = {_toml_str(question_risk_family)}",
+                f"clearance_risk_family = {_toml_str(clearance_risk_family)}",
+            ]
+        )
+        + "\n"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -551,6 +730,209 @@ def disable_plugin_in_config(text: str, plugin: str = PLUGIN_NAME) -> tuple[str,
 
 
 # --------------------------------------------------------------------------- #
+# Managed Hermes plugin release + integrity/update checks.
+# --------------------------------------------------------------------------- #
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _plugin_version(plugin_yaml: str) -> str:
+    """Read the top-level version without adding a runtime YAML dependency."""
+    match = re.search(r"(?m)^version:\s*[\"']?([^\"'\s#]+)", plugin_yaml)
+    if match is None:
+        raise ValueError("plugin.yaml has no valid top-level version")
+    return match.group(1)
+
+
+def _source_plugin_release(source_dir: Path | None = None) -> dict:
+    """Build the release manifest from the trusted files in this ACT checkout."""
+    source = source_dir or plugin_source_dir()
+    missing = [name for name in PLUGIN_DISTRIBUTION_FILES if not (source / name).is_file()]
+    if missing:
+        raise RuntimeError(
+            "act install: bundled Hermes plugin is incomplete; missing " + ", ".join(missing)
+        )
+    plugin_yaml = (source / "plugin.yaml").read_text()
+    if not re.search(rf"(?m)^name:\s*[\"']?{re.escape(PLUGIN_NAME)}[\"']?\s*$", plugin_yaml):
+        raise RuntimeError(f"act install: bundled plugin name is not {PLUGIN_NAME!r}")
+    return {
+        "schema": 1,
+        "name": PLUGIN_NAME,
+        "version": _plugin_version(plugin_yaml),
+        "files": {
+            name: {"sha256": _sha256((source / name).read_bytes())} for name in PLUGIN_MANAGED_FILES
+        },
+    }
+
+
+def _validated_plugin_release(value: object) -> dict:
+    """Return a normalized manifest or raise ValueError for untrusted metadata."""
+    if not isinstance(value, dict):
+        raise ValueError("manifest root is not an object")
+    if value.get("schema") != 1 or value.get("name") != PLUGIN_NAME:
+        raise ValueError("manifest schema or plugin name is invalid")
+    version = value.get("version")
+    files = value.get("files")
+    if not isinstance(version, str) or not version or not isinstance(files, dict):
+        raise ValueError("manifest version or files are invalid")
+    normalized_files: dict[str, dict[str, str]] = {}
+    for name in PLUGIN_MANAGED_FILES:
+        record = files.get(name)
+        digest = record.get("sha256") if isinstance(record, dict) else None
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError(f"manifest digest for {name} is invalid")
+        normalized_files[name] = {"sha256": digest}
+    return {
+        "schema": 1,
+        "name": PLUGIN_NAME,
+        "version": version,
+        "files": normalized_files,
+    }
+
+
+def _install_bridge_plugin(ops: Ops) -> dict:
+    """Deploy the exact ACT-bundled plugin and pin its owner-only hashes."""
+    source = plugin_source_dir()
+    release = _validated_plugin_release(_source_plugin_release(source))
+    destination = plugin_install_dir()
+    ops.mkdir(destination, mode=0o700)
+    ops.chmod(destination, 0o700)
+    for name in PLUGIN_DISTRIBUTION_FILES:
+        ops.copy_file(source / name, destination / name, mode=0o600)
+    # Write this last: a partial copy never receives metadata that claims the
+    # plugin is current. The runtime hook and `act doctor` both consume it.
+    ops.write_text(
+        plugin_release_path(),
+        json.dumps(release, indent=2, sort_keys=True) + "\n",
+        mode=0o600,
+    )
+    return release
+
+
+@dataclass
+class PluginUpdateReport:
+    ok: bool
+    lines: list[str]
+    status: str
+    managed_version: str | None = None
+    installed_version: str | None = None
+    bundled_version: str | None = None
+
+    def text(self) -> str:
+        status = "CURRENT" if self.ok else "ACTION REQUIRED"
+        return f"act plugin-check: {status}\n" + "\n".join(self.lines)
+
+
+def plugin_update_status(ops: Ops | None = None) -> PluginUpdateReport:
+    """Compare installed plugin version + SHA-256 with ACT's release metadata.
+
+    This is strictly read-only. It reports missing files, local tampering/drift,
+    and a newer bundled checkout without printing plugin content or secrets.
+    """
+    ops = ops or Ops()
+    lines: list[str] = []
+    ok = True
+
+    if not ops.exists(plugin_release_path()):
+        return PluginUpdateReport(
+            ok=False,
+            lines=[
+                f"[FAIL] managed release metadata missing at {plugin_release_path()}",
+                "[action] run `act install`, then restart Hermes",
+            ],
+            status="unmanaged",
+        )
+    try:
+        release = _validated_plugin_release(json.loads(ops.read_text(plugin_release_path())))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return PluginUpdateReport(
+            ok=False,
+            lines=[
+                f"[FAIL] managed release metadata is invalid: {exc}",
+                "[action] run `act install`, then restart Hermes",
+            ],
+            status="integrity_problem",
+        )
+
+    missing: list[str] = []
+    drifted: list[str] = []
+    status = "current"
+    installed_version: str | None = None
+    bundled_version: str | None = None
+    for name in PLUGIN_MANAGED_FILES:
+        installed = plugin_install_dir() / name
+        if not ops.exists(installed):
+            missing.append(name)
+            continue
+        if _sha256(ops.read_bytes(installed)) != release["files"][name]["sha256"]:
+            drifted.append(name)
+    if missing:
+        ok = False
+        status = "integrity_problem"
+        lines.append("[FAIL] managed plugin files missing: " + ", ".join(missing))
+    if drifted:
+        ok = False
+        status = "integrity_problem"
+        lines.append("[FAIL] managed plugin integrity drift: " + ", ".join(drifted))
+
+    manifest_path = plugin_install_dir() / "plugin.yaml"
+    if ops.exists(manifest_path):
+        try:
+            installed_version = _plugin_version(ops.read_text(manifest_path))
+        except ValueError as exc:
+            ok = False
+            status = "integrity_problem"
+            lines.append(f"[FAIL] installed plugin version is unreadable: {exc}")
+        else:
+            if installed_version != release["version"]:
+                ok = False
+                status = "integrity_problem"
+                lines.append(
+                    "[FAIL] installed plugin version "
+                    f"{installed_version} does not match managed release {release['version']}"
+                )
+
+    # When running from an ACT source release, also detect that this checkout is
+    # newer than the last deployed manifest. A packaged/runtime-only CLI may not
+    # carry the checkout; the pinned manifest remains sufficient for integrity.
+    source = plugin_source_dir()
+    if source.is_dir():
+        try:
+            bundled = _validated_plugin_release(_source_plugin_release(source))
+        except (OSError, RuntimeError, ValueError) as exc:
+            ok = False
+            status = "integrity_problem"
+            lines.append(f"[FAIL] bundled plugin release is invalid: {exc}")
+        else:
+            bundled_version = bundled["version"]
+            if bundled != release:
+                ok = False
+                if status == "current":
+                    status = "update_available"
+                lines.append(
+                    f"[UPDATE] bundled plugin {bundled['version']} differs from deployed "
+                    f"release {release['version']}"
+                )
+
+    if ok:
+        lines.append(
+            f"[ok] Hermes plugin {PLUGIN_NAME} {release['version']} matches managed SHA-256"
+        )
+    else:
+        lines.append("[action] run `act install`, then restart Hermes")
+    return PluginUpdateReport(
+        ok=ok,
+        lines=lines,
+        status=status,
+        managed_version=release["version"],
+        installed_version=installed_version,
+        bundled_version=bundled_version,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Commands.
 # --------------------------------------------------------------------------- #
 
@@ -560,6 +942,19 @@ def _ensure_layout(ops: Ops) -> None:
         ops.mkdir(d)
     # secrets is sensitive; lock it down.
     ops.chmod(secrets_dir(), 0o700)
+    for log_path in (
+        logs_dir() / "gateway.out.log",
+        logs_dir() / "gateway.err.log",
+        logs_dir() / "hermes-dashboard.out.log",
+        logs_dir() / "hermes-dashboard.err.log",
+    ):
+        if ops.exists(log_path):
+            ops.chmod(log_path, 0o600)
+    # UltraCode's startup log includes its ephemeral dashboard credential. ACT
+    # will refuse to read it unless it is current-user-only, so harden it during
+    # installation when Hermes has already created it.
+    if ops.exists(hermes_agent_log_path()):
+        ops.chmod(hermes_agent_log_path(), 0o600)
 
 
 def _write_configs(ops: Ops, *, apns: dict | None) -> None:
@@ -568,30 +963,46 @@ def _write_configs(ops: Ops, *, apns: dict | None) -> None:
     re-asserted by regenerating from its current node_id (and APNs if newly
     provided)."""
     ops.write_text(shim_path(), generate_shim(), mode=0o755)
+    if ops.exists(hermes_dashboard_executable()):
+        ops.write_text(
+            dashboard_shim_path(),
+            generate_dashboard_shim(),
+            mode=0o755,
+        )
 
-    node_id = "node_act_local"
-    existing_apns: dict = {}
     if ops.exists(gateway_toml_path()):
-        try:
-            raw = tomllib.loads(ops.read_text(gateway_toml_path()))
-            node_id = raw.get("node_id", node_id)
-            for k in ("apns_key_path", "apns_key_id", "apns_team_id", "apns_topic"):
-                if raw.get(k):
-                    existing_apns[k] = raw[k]
-        except Exception:
-            pass
-
-    merged_apns = {**existing_apns, **(apns or {})}
-    ops.write_text(
-        gateway_toml_path(),
-        generate_gateway_toml(
-            node_id=node_id,
-            apns_key_path=merged_apns.get("apns_key_path"),
-            apns_key_id=merged_apns.get("apns_key_id"),
-            apns_team_id=merged_apns.get("apns_team_id"),
-            apns_topic=merged_apns.get("apns_topic"),
-        ),
-    )
+        current = tomllib.loads(ops.read_text(gateway_toml_path()))
+        overrides: dict[str, str | bool] = {
+            "seed_mock_data": False,
+            "database_path": str(database_path()),
+            "gateway_base_url": f"http://{GATEWAY_HOST}:{GATEWAY_PORT}/v1",
+            "bind_host": GATEWAY_HOST,
+            "dashboard_legacy_mount_rewrite": False,
+        }
+        # Migrate only ACT's mistaken UltraCode default. Preserve any genuine
+        # operator-supplied dashboard target.
+        if current.get("dashboard_url") == "http://127.0.0.1:9120":
+            overrides["dashboard_url"] = "http://127.0.0.1:9119"
+        if current.get("dashboard_session_token_log_path") == str(hermes_agent_log_path()):
+            overrides["dashboard_session_token_log_path"] = ""
+        overrides.update(apns or {})
+        refreshed = update_gateway_toml(
+            ops.read_text(gateway_toml_path()),
+            overrides,
+        )
+        ops.write_text(gateway_toml_path(), refreshed, mode=0o600)
+    else:
+        apns_values = apns or {}
+        ops.write_text(
+            gateway_toml_path(),
+            generate_gateway_toml(
+                apns_key_path=apns_values.get("apns_key_path"),
+                apns_key_id=apns_values.get("apns_key_id"),
+                apns_team_id=apns_values.get("apns_team_id"),
+                apns_topic=apns_values.get("apns_topic"),
+            ),
+            mode=0o600,
+        )
 
     if not ops.exists(act_toml_path()):
         ops.write_text(act_toml_path(), generate_act_toml())
@@ -615,8 +1026,85 @@ def _write_plist_and_load(ops: Ops) -> None:
     target = launchd_service_target()
     # Re-bootstrap to pick up plist changes, then kickstart to (re)start.
     ops.run(["launchctl", "bootout", target], check=False)
-    ops.run(["launchctl", "bootstrap", domain, str(plist_path())], check=False)
-    ops.run(["launchctl", "kickstart", "-k", target], check=False)
+    bootstrap_result = None
+    for _attempt in range(5):
+        bootstrap_result = ops.run(
+            ["launchctl", "bootstrap", domain, str(plist_path())],
+            check=False,
+        )
+        if getattr(bootstrap_result, "returncode", 0) == 0:
+            break
+        # launchd can briefly retain the old label after bootout. A bounded
+        # retry prevents `act install` from reporting success with no service.
+        time.sleep(0.2)
+    if bootstrap_result is None or getattr(bootstrap_result, "returncode", 0) != 0:
+        raise RuntimeError("act install: launchd bootstrap failed after 5 attempts")
+    kickstart_result = ops.run(
+        ["launchctl", "kickstart", "-k", target],
+        check=False,
+    )
+    if getattr(kickstart_result, "returncode", 0) != 0:
+        raise RuntimeError("act install: launchd kickstart failed")
+    _wait_for_loopback_service(
+        ops,
+        f"http://{GATEWAY_HOST}:{GATEWAY_PORT}/v1/health",
+        "gateway",
+    )
+
+
+def _wait_for_loopback_service(ops: Ops, url: str, name: str) -> None:
+    """Bounded readiness gate for a launchd service ACT just kickstarted."""
+    for _attempt in range(20):
+        probe = ops.run(
+            ["/usr/bin/curl", "--fail", "--silent", "--max-time", "1", url],
+            check=False,
+            timeout=2,
+        )
+        if getattr(probe, "returncode", 1) == 0:
+            return
+        time.sleep(0.25)
+    raise RuntimeError(f"act install: {name} did not become ready at {url}")
+
+
+def _write_dashboard_plist_and_load(ops: Ops) -> None:
+    """Supervise the full Hermes dashboard when Hermes is installed.
+
+    Older/headless ACT installations may not carry the Hermes desktop CLI; in
+    that case the gateway remains installable and ``doctor`` reports the
+    dashboard as unavailable. When present, the dashboard is a first-class
+    loopback companion service and survives logout/reboot independently of a
+    terminal session.
+    """
+    if not ops.exists(hermes_dashboard_executable()):
+        return
+    ops.write_text(dashboard_plist_path(), generate_dashboard_plist())
+    domain = launchd_domain()
+    target = dashboard_launchd_service_target()
+    ops.run(["launchctl", "bootout", target], check=False)
+    bootstrap_result = None
+    for _attempt in range(5):
+        bootstrap_result = ops.run(
+            ["launchctl", "bootstrap", domain, str(dashboard_plist_path())],
+            check=False,
+        )
+        if getattr(bootstrap_result, "returncode", 0) == 0:
+            break
+        time.sleep(0.2)
+    if bootstrap_result is None or getattr(bootstrap_result, "returncode", 0) != 0:
+        raise RuntimeError(
+            "act install: Hermes dashboard launchd bootstrap failed after 5 attempts"
+        )
+    kickstart_result = ops.run(
+        ["launchctl", "kickstart", "-k", target],
+        check=False,
+    )
+    if getattr(kickstart_result, "returncode", 0) != 0:
+        raise RuntimeError("act install: Hermes dashboard launchd kickstart failed")
+    _wait_for_loopback_service(
+        ops,
+        f"http://{DASHBOARD_HOST}:{DASHBOARD_PORT}/",
+        "Hermes dashboard",
+    )
 
 
 def _enable_bridge(ops: Ops) -> None:
@@ -650,9 +1138,32 @@ def _provision_venv(ops: Ops) -> None:
     checkout's site-packages, so deleting the checkout no longer crash-loops the
     KeepAlive service. Routed through Ops so tests record the calls without
     mutating the machine."""
+    project = gateway_project_dir()
+    source_checkout = (project / "pyproject.toml").is_file() and (
+        project / "src" / "hermes_gateway"
+    ).is_dir()
+    if not source_checkout:
+        # A released ``act`` command is already running from the managed venv.
+        # Recreating that environment from inside itself is unsafe, and an
+        # installed wheel has no project directory to hand back to pip. Its
+        # bundled plugin + current package are already the durable runtime.
+        try:
+            running_managed = Path(sys.executable).resolve() == venv_python().resolve()
+        except OSError:
+            running_managed = False
+        if running_managed:
+            return
+        raise RuntimeError(
+            "act install: packaged CLI is not running from the ACT-managed venv; "
+            f"install it into {venv_dir()} first"
+        )
+
     vdir = venv_dir()
-    ops.run([sys.executable, "-m", "venv", str(vdir)])
-    ops.run([str(vdir / "bin" / "pip"), "install", str(gateway_project_dir())])
+    ops.run([sys.executable, "-m", "venv", str(vdir)], check=True)
+    ops.run(
+        [str(vdir / "bin" / "pip"), "install", str(project)],
+        check=True,
+    )
 
 
 def install(ops: Ops | None = None, *, with_apns: tuple[str, str, str] | None = None) -> None:
@@ -666,6 +1177,9 @@ def install(ops: Ops | None = None, *, with_apns: tuple[str, str, str] | None = 
         key_id, team_id, p8 = with_apns
         apns_meta = _install_apns(ops, key_id, team_id, p8)
     _write_configs(ops, apns=apns_meta)
+    # The Hermes security hook is part of the ACT release, not a manual side
+    # load. Always refresh its files before enabling it in Hermes.
+    _install_bridge_plugin(ops)
     # Refuse to wire up a shim whose interpreter still resolves under the source
     # checkout — that is exactly the durability bug this provisioning fixes.
     baked = interpreter_path()
@@ -676,6 +1190,7 @@ def install(ops: Ops | None = None, *, with_apns: tuple[str, str, str] | None = 
             f"venv at {venv_python()}. The checkout is not a durable runtime."
         )
     _write_plist_and_load(ops)
+    _write_dashboard_plist_and_load(ops)
     _enable_bridge(ops)
 
 
@@ -684,17 +1199,27 @@ def disable(ops: Ops | None = None) -> None:
     Keeps all data."""
     ops = ops or Ops()
     ops.run(["launchctl", "bootout", launchd_service_target()], check=False)
+    ops.run(
+        ["launchctl", "bootout", dashboard_launchd_service_target()],
+        check=False,
+    )
     _disable_bridge(ops)
 
 
 def uninstall(ops: Ops | None = None, *, purge: bool = False) -> None:
     ops = ops or Ops()
     ops.run(["launchctl", "bootout", launchd_service_target()], check=False)
+    ops.run(
+        ["launchctl", "bootout", dashboard_launchd_service_target()],
+        check=False,
+    )
     # Strip the bridge plugin too — removing only the plist+shim would leave
     # act-clearance enabled in ~/.hermes/config.yaml.
     _disable_bridge(ops)
     ops.remove(plist_path())
     ops.remove(shim_path())
+    ops.remove(dashboard_plist_path())
+    ops.remove(dashboard_shim_path())
     if purge:
         ops.rmtree(act_home())
 
@@ -712,7 +1237,8 @@ class DoctorReport:
 def doctor(ops: Ops | None = None) -> DoctorReport:
     """Validate the install: interpreter exists, plist matches what we'd
     generate (drift), who owns port 8788, seed_mock_data is false in the
-    effective config, APNs file present+readable if configured."""
+    effective config, APNs file present+readable if configured, and the Hermes
+    bridge matches ACT's managed plugin release."""
     ops = ops or Ops()
     lines: list[str] = []
     ok = True
@@ -732,7 +1258,30 @@ def doctor(ops: Ops | None = None) -> DoctorReport:
             "`act install` to provision the ACT-owned venv)"
         )
 
-    # 2. Plist drift.
+    # 2. Full Hermes dashboard supervision. A headless installation without
+    # Hermes remains a valid gateway, but once Hermes exists ACT requires the
+    # companion job to be present and drift-free.
+    dashboard_executable = hermes_dashboard_executable()
+    if ops.exists(dashboard_executable):
+        lines.append(f"[ok] Hermes dashboard executable exists: {dashboard_executable}")
+        if ops.exists(dashboard_plist_path()):
+            installed_dashboard = ops.read_text(dashboard_plist_path())
+            if installed_dashboard.strip() == generate_dashboard_plist().strip():
+                lines.append("[ok] Hermes dashboard plist matches generated definition")
+            else:
+                ok = False
+                lines.append(
+                    "[FAIL] Hermes dashboard plist drift: installed plist differs from generated"
+                )
+        else:
+            ok = False
+            lines.append(f"[FAIL] Hermes dashboard plist not installed at {dashboard_plist_path()}")
+    else:
+        lines.append(
+            "[info] Hermes dashboard executable is not installed; dashboard supervision skipped"
+        )
+
+    # 3. Gateway plist drift.
     if ops.exists(plist_path()):
         installed = ops.read_text(plist_path())
         expected = generate_plist()
@@ -745,7 +1294,7 @@ def doctor(ops: Ops | None = None) -> DoctorReport:
         ok = False
         lines.append(f"[FAIL] plist not installed at {plist_path()}")
 
-    # 3. Effective config: seed_mock_data must be false.
+    # 4. Effective config: seed_mock_data must be false.
     if ops.exists(gateway_toml_path()):
         try:
             raw = tomllib.loads(ops.read_text(gateway_toml_path()))
@@ -764,7 +1313,7 @@ def doctor(ops: Ops | None = None) -> DoctorReport:
         else:
             ok = False
             lines.append(f"[FAIL] database_path not absolute: {db!r}")
-        # 4. APNs file present + readable if configured.
+        # 5. APNs file present + readable if configured.
         key_path = raw.get("apns_key_path")
         if key_path:
             if ops.exists(Path(key_path)):
@@ -776,16 +1325,25 @@ def doctor(ops: Ops | None = None) -> DoctorReport:
         ok = False
         lines.append(f"[FAIL] gateway.toml not found at {gateway_toml_path()}")
 
-    # 5. Port ownership (informational; never fails the report).
-    try:
-        res = ops.run(["lsof", "-nP", f"-iTCP:{GATEWAY_PORT}", "-sTCP:LISTEN"], check=False)
-        owner = (getattr(res, "stdout", "") or "").strip()
-        if owner:
-            lines.append(f"[info] port {GATEWAY_PORT} listeners:\n{owner}")
-        else:
-            lines.append(f"[info] nothing listening on port {GATEWAY_PORT}")
-    except Exception:
-        lines.append(f"[info] could not probe port {GATEWAY_PORT}")
+    # 6. Hermes bridge version + integrity/update status.
+    plugin_report = plugin_update_status(ops)
+    lines.extend(plugin_report.lines)
+    ok = ok and plugin_report.ok
+
+    # 7. Port ownership (informational; never fails the report).
+    for name, port in (("gateway", GATEWAY_PORT), ("Hermes dashboard", DASHBOARD_PORT)):
+        try:
+            res = ops.run(
+                ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                check=False,
+            )
+            owner = (getattr(res, "stdout", "") or "").strip()
+            if owner:
+                lines.append(f"[info] {name} port {port} listeners:\n{owner}")
+            else:
+                lines.append(f"[info] nothing listening on {name} port {port}")
+        except Exception:
+            lines.append(f"[info] could not probe {name} port {port}")
 
     return DoctorReport(ok=ok, lines=lines)
 
@@ -797,6 +1355,12 @@ def status(ops: Ops | None = None) -> str:
     res = ops.run(["launchctl", "print", launchd_service_target()], check=False)
     out.append("== launchctl ==")
     out.append((getattr(res, "stdout", "") or "").strip() or "(no output)")
+    dashboard = ops.run(
+        ["launchctl", "print", dashboard_launchd_service_target()],
+        check=False,
+    )
+    out.append("== Hermes dashboard launchctl ==")
+    out.append((getattr(dashboard, "stdout", "") or "").strip() or "(no output)")
     out.append("== health ==")
     try:
         import urllib.request
@@ -806,7 +1370,64 @@ def status(ops: Ops | None = None) -> str:
             out.append(f"{url} -> {resp.status}")
     except Exception as exc:
         out.append(f"health probe failed: {exc}")
+    try:
+        import urllib.request
+
+        dashboard_url = f"http://{DASHBOARD_HOST}:{DASHBOARD_PORT}/"
+        with urllib.request.urlopen(dashboard_url, timeout=2) as resp:  # noqa: S310
+            out.append(f"{dashboard_url} -> {resp.status}")
+    except Exception as exc:
+        out.append(f"dashboard probe failed: {exc}")
     return "\n".join(out)
+
+
+def create_mobile_pairing_bundle() -> dict:
+    """Create the one-time mobile pairing bundle through the loopback API."""
+    import urllib.request
+
+    payload = json.dumps(
+        {
+            "display_name": "ACT Operator Beta",
+            "clearance_channel": "mobile_signed",
+            # Long enough to move from the Mac terminal to the phone camera,
+            # still short-lived and one-time.
+            "ttl_seconds": 600,
+            "requested_permissions": [
+                "read_state",
+                "approve",
+                "intervene",
+                "tui",
+                "browser_assist",
+            ],
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(  # noqa: S310 - fixed loopback target
+        f"http://{GATEWAY_HOST}:{GATEWAY_PORT}/v1/pairing/start",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=3) as response:  # noqa: S310
+        return json.loads(response.read().decode("utf-8"))
+
+
+def render_pairing_qr(bundle: dict) -> str:
+    """Render a one-time pairing bundle as a terminal-safe QR code.
+
+    The compact JSON is the QR payload, so the mobile app can run the same
+    strict validation used by manual import. Nothing is written to disk.
+    """
+    import qrcode
+
+    qr = qrcode.QRCode(
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        border=2,
+    )
+    qr.add_data(json.dumps(bundle, separators=(",", ":")))
+    qr.make(fit=True)
+    output = io.StringIO()
+    qr.print_ascii(out=output, invert=True)
+    return output.getvalue().rstrip()
 
 
 # --------------------------------------------------------------------------- #
@@ -837,7 +1458,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser("doctor", help="validate the install + print a report")
+    sub.add_parser(
+        "plugin-check",
+        help="read-only Hermes plugin version + SHA-256 update check",
+    )
     sub.add_parser("status", help="launchctl print + health probe")
+    p_pair = sub.add_parser("pair", help="create a loopback-only mobile pairing bundle")
+    p_pair.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="print compact JSON for pasting into ACT Settings",
+    )
+    p_pair.add_argument(
+        "--qr",
+        action="store_true",
+        dest="as_qr",
+        help="print a scannable one-time QR bundle (nothing is saved to disk)",
+    )
     return parser
 
 
@@ -846,7 +1484,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "install":
         with_apns = tuple(args.with_apns) if args.with_apns else None
         install(with_apns=with_apns)  # type: ignore[arg-type]
-        print(f"act: installed {LAUNCHD_LABEL}; configs under {act_home()}")
+        print(
+            f"act: installed {LAUNCHD_LABEL}; configs under {act_home()}; "
+            "restart Hermes if it was already running"
+        )
         return 0
     if args.command == "disable":
         disable()
@@ -860,8 +1501,26 @@ def main(argv: list[str] | None = None) -> int:
         report = doctor()
         print(report.text())
         return 0 if report.ok else 1
+    if args.command == "plugin-check":
+        report = plugin_update_status()
+        print(report.text())
+        return 0 if report.ok else 1
     if args.command == "status":
         print(status())
+        return 0
+    if args.command == "pair":
+        bundle = create_mobile_pairing_bundle()
+        if args.as_json and args.as_qr:
+            raise SystemExit("choose either --json or --qr")
+        if args.as_json:
+            print(json.dumps(bundle, separators=(",", ":")))
+        elif args.as_qr:
+            print("Scan this one-time QR in ACT Settings. Keep it private.")
+            print(render_pairing_qr(bundle))
+            print(f"Expires: {bundle['expires_at']}")
+        else:
+            print("Paste this one-time bundle into ACT Settings (or use `act pair --qr`):")
+            print(json.dumps(bundle, indent=2))
         return 0
     return 2
 
