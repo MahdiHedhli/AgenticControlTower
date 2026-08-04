@@ -24,23 +24,48 @@ class ObservabilityStoreMixin:
         notification_id: str | None = None,
         voice_session_id: str | None = None,
     ) -> dict[str, Any]:
-        created_at = utc_iso()
-        previous_hash = self.latest_audit_hash()
         audit_event_id = new_id("aud")
-        event_hash = content_hash(
-            {
-                "audit_event_id": audit_event_id,
-                "event_type": event_type,
-                "actor_type": actor_type,
-                "actor_id": actor_id,
-                "node_id": node_id,
-                "request_id": request_id,
-                "previous_hash": previous_hash,
-                "payload_redacted": payload_redacted or {},
-                "created_at": created_at,
-            }
-        )
         with self.connect() as db:
+            # Reading the chain head and appending to it MUST be ONE transaction.
+            #
+            # This previously called self.latest_audit_hash(), which opens its own
+            # connection and runs the SELECT in autocommit (Python's sqlite3 only
+            # implicitly BEGINs before DML, never before a SELECT), and then opened
+            # a *second* connection here to INSERT. Two concurrent writers therefore
+            # read the same head and both appended with that same previous_hash,
+            # forking the chain. Production carries 21 such forks among ~11k events.
+            # Every individual event's own hash still verified, so this looked like
+            # tamper evidence failing when it was only concurrency -- which is worse
+            # than useless for a control ADR-0007 sells as tamper detection.
+            #
+            # BEGIN IMMEDIATE takes the write lock up front, so the head we read is
+            # still the head when we insert. It is a file lock, so this holds across
+            # processes too, not merely across this process's threads -- which
+            # matters because more than one gateway has been pointed at this DB.
+            # The explicit BEGIN does not collide with the implicit one from
+            # store.connect()'s `with connection:`: once autocommit is off sqlite3
+            # issues no BEGIN of its own, and that outer block still commits.
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT hash FROM audit_events ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+            previous_hash = row["hash"] if row else None
+            # Stamped only once the write lock is held, so created_at cannot run
+            # backwards relative to sequence the way the forked pairs do.
+            created_at = utc_iso()
+            event_hash = content_hash(
+                {
+                    "audit_event_id": audit_event_id,
+                    "event_type": event_type,
+                    "actor_type": actor_type,
+                    "actor_id": actor_id,
+                    "node_id": node_id,
+                    "request_id": request_id,
+                    "previous_hash": previous_hash,
+                    "payload_redacted": payload_redacted or {},
+                    "created_at": created_at,
+                }
+            )
             db.execute(
                 """
                 INSERT INTO audit_events (
