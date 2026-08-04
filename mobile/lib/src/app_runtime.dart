@@ -3,7 +3,6 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 import 'clearance/clearance_proof_verifier.dart' hide base64UrlDecodeNoPadding;
 import 'clearance/tower_key.dart';
@@ -13,6 +12,7 @@ import 'security/secure_enclave_signer.dart';
 import 'api/gateway_api_client.dart';
 import 'api/gateway_event_stream_client.dart';
 import 'api/tui_stream_client.dart';
+import 'async_guard.dart';
 import 'config/gateway_config.dart';
 import 'models/core_models.dart';
 import 'operator_error.dart';
@@ -121,35 +121,18 @@ class HermesAppRuntime extends ChangeNotifier {
   DateTime? _accessTokenExpiresAt;
   Timer? _accessTokenRefreshTimer;
   Future<bool>? _refreshInFlight;
+  /// The gateway refused a refresh: the pairing itself is gone, not just the
+  /// access token. Latches the terminal stream status so the reconnect loop's
+  /// next auth failure cannot overwrite it with "re-authenticating".
+  bool _streamPairingRejected = false;
   PairingSessionModel? _lastPairing;
 
-  /// Build the runtime for `main()`. Everything awaited here is local and
-  /// cheap, and every step is bounded, so this always completes and the first
-  /// frame is never gated on the network, on APNs, or on a native callback.
-  static Future<HermesAppRuntime> create() async {
-    final preferences = await _preferencesOrNull();
-    final runtime = HermesAppRuntime(
-      configStore: preferences == null
-          ? InMemoryGatewayConfigStore()
-          : SharedPreferencesGatewayConfigStore(preferences),
-      keyStore: preferences == null
-          ? InMemorySecureKeyStore()
-          : PlatformAwareSecureKeyStore(preferences),
-    );
-    await runtime.initializeBounded();
-    return runtime;
-  }
-
-  static Future<SharedPreferences?> _preferencesOrNull() async {
-    try {
-      return await SharedPreferences.getInstance()
-          .timeout(platformChannelTimeout);
-    } on Object {
-      // Degraded but rendering: an unreachable preference store must not cost
-      // the operator the whole UI.
-      return null;
-    }
-  }
+  // There is deliberately no `create()` here. Assembling the runtime and
+  // deciding what may gate the first frame lives in one place — `bootstrap.dart`
+  // — so the "nothing awaited before runApp()" invariant has a single testable
+  // owner instead of two boot paths that can drift apart. This class supplies
+  // the bounds (`platformChannelTimeout`, `pushTokenRequestTimeout`,
+  // `defaultBootTimeout`); bootstrap.dart applies them.
 
   /// [initialize] under a last-resort bound. Never throws, never exceeds the
   /// boot timeout, and never leaves the caller without a runtime to render.
@@ -662,7 +645,13 @@ class HermesAppRuntime extends ChangeNotifier {
   @override
   void dispose() {
     _cancelAccessTokenRefresh();
-    _eventSubscription?.cancel();
+    // `cancel()` returns a future that can complete with an error (the stream's
+    // onCancel runs arbitrary teardown). `dispose()` is synchronous, so that
+    // future is discarded and its rejection escapes to the root zone — an
+    // unhandled async error blamed on whatever ran next. Claim it here; a
+    // teardown failure is not actionable and must not be allowed to escape.
+    unawaited(cancelQuietly(_eventSubscription));
+    _eventSubscription = null;
     super.dispose();
   }
 
@@ -673,9 +662,11 @@ class HermesAppRuntime extends ChangeNotifier {
       _eventStreamConnected = false;
       return;
     }
-    await _eventSubscription?.cancel();
+    await cancelQuietly(_eventSubscription);
     _eventStreamStatus = 'Live stream connecting';
     _eventStreamConnected = false;
+    // A deliberate (re)start is a fresh verdict on the pairing.
+    _streamPairingRejected = false;
     _eventSubscription = GatewayEventStreamClient(
       config: _config,
       // Read live, and refresh first if the token is at its expiry. The client
@@ -708,14 +699,33 @@ class HermesAppRuntime extends ChangeNotifier {
   }
 
   /// Report why an attempt failed. The stream client owns the retry.
+  ///
+  /// Once [_streamPairingRejected] is set the pairing is known to be dead, so
+  /// an auth failure is no longer news: keep the terminal message rather than
+  /// flipping the dashboard back to "re-authenticating" on every backoff
+  /// window. That oscillation is the same misleading state the terminal
+  /// message exists to end.
   void _onStreamConnectError(GatewayStreamConnectError error) {
     final detail = operatorErrorMessage(error.error, context: 'eventStream');
     _eventStreamConnected = false;
-    _eventStreamStatus = error.isAuthFailure
-        ? 'Live stream re-authenticating'
-        : 'Live stream reconnecting. $detail';
-    notifyListeners();
+    if (error.isAuthFailure) {
+      if (!_streamPairingRejected) {
+        _eventStreamStatus = 'Live stream re-authenticating';
+      }
+    } else {
+      _eventStreamStatus = 'Live stream reconnecting. $detail';
+    }
+    // This runs inside the stream client's error handler, which is driven from
+    // an `unawaited` task: a `notifyListeners()` on a runtime disposed while an
+    // attempt was in flight would escape to the root zone from there.
+    _notifyQuietly();
   }
+
+  /// Entry point for [_onStreamConnectError], which is otherwise only reachable
+  /// from inside the stream client's reconnect task.
+  @visibleForTesting
+  void debugReportStreamConnectError(GatewayStreamConnectError error) =>
+      _onStreamConnectError(error);
 
   /// Whether the stored access token is at or past its refresh point.
   ///
@@ -752,16 +762,44 @@ class HermesAppRuntime extends ChangeNotifier {
   /// and never expire, which is why every REST call kept returning 200 while
   /// the WebSocket upgrade 403'd indefinitely. Returns true when a fresh token
   /// is in hand, which reconnects the stream immediately.
+  ///
+  /// Never throws. The stream client calls this from inside its own `catch`
+  /// block, on a task started with `unawaited`, so a throw here would not be
+  /// caught by that `try` — it would escape to the root zone as an unhandled
+  /// async error *and* leave the stream controller unclosed.
   Future<bool> _refreshAccessTokenForStream() async {
-    final refreshed = await _refreshAccessTokenOnce();
-    // A refresh the gateway rejects means the pairing itself is gone. Say so
-    // rather than leaving the dashboard on "Live stream connecting" forever.
-    _eventStreamStatus = refreshed
-        ? 'Live stream re-authenticating'
-        : 'Live stream unauthorized — pair this device again';
-    notifyListeners();
-    return refreshed;
+    try {
+      final refreshed = await _refreshAccessTokenOnce();
+      _streamPairingRejected = !refreshed;
+      _eventStreamConnected = false;
+      // A refresh the gateway rejects means the pairing itself is gone. Say so,
+      // terminally, rather than leaving the dashboard on "Live stream
+      // connecting"/"re-authenticating" forever with nothing the operator can
+      // act on.
+      _eventStreamStatus = refreshed
+          ? 'Live stream re-authenticating'
+          : 'Live stream signed out. Pair this device again in Settings.';
+      _notifyQuietly();
+      return refreshed;
+    } on Object catch (error) {
+      _eventStreamStatus = 'Live stream re-authentication failed. '
+          '${operatorErrorMessage(error, context: 'refreshTokenAndRestart')}';
+      _eventStreamConnected = false;
+      // Not the plain call: the commonest way into this catch is a
+      // `notifyListeners()` on a runtime that was disposed while the refresh
+      // was in flight, and repeating it here would throw straight back out. A
+      // net that can itself throw is not a net (see `error_net.dart`).
+      _notifyQuietly();
+      return false;
+    }
   }
+
+  /// Fire-and-forget entry point for [_refreshAccessTokenForStream], which is
+  /// otherwise only reachable from the stream client's error handler. Exists so
+  /// the guards above have a test that can await them.
+  @visibleForTesting
+  Future<bool> debugRefreshAccessTokenForStream() =>
+      _refreshAccessTokenForStream();
 
   /// Refresh, coalescing concurrent callers onto one request.
   ///
@@ -818,6 +856,14 @@ class HermesAppRuntime extends ChangeNotifier {
     );
   }
 
+  void _notifyQuietly() {
+    try {
+      notifyListeners();
+    } on Object {
+      // The runtime is already disposed; there is no listener left to tell.
+    }
+  }
+
   /// Exchange the refresh token for a fresh access token (signed request).
   /// Returns true on success. Persists the rotated tokens.
   Future<bool> refreshAccessToken() async {
@@ -855,7 +901,10 @@ class HermesAppRuntime extends ChangeNotifier {
   Future<void> _stopEventStream() async {
     final subscription = _eventSubscription;
     _eventSubscription = null;
-    await subscription?.cancel();
+    // Same reason as `dispose()`: this runs inside `clearPairing()` and
+    // `_restartEventStream()`, where a rejected cancel() would abort the very
+    // teardown it is part of and leave the runtime half-torn-down.
+    await cancelQuietly(subscription);
   }
 
   void _handleGatewayEvent(GatewayEvent event) {
@@ -866,6 +915,7 @@ class HermesAppRuntime extends ChangeNotifier {
       _recentEvents.removeRange(30, _recentEvents.length);
     }
     _eventStreamConnected = true;
+    _streamPairingRejected = false;
     _eventStreamStatus = 'Live: ${event.type}';
     _eventRevision += 1;
     notifyListeners();

@@ -2,11 +2,13 @@ import 'package:flutter/material.dart';
 
 import '../app_runtime.dart';
 import '../models/alpha_models.dart';
+import '../models/approval_options.dart';
 import '../operator_error.dart';
 import '../repositories/alpha_repository.dart';
 import '../routes.dart';
 import '../viewmodels/alpha_viewmodels.dart';
 import '../widgets/alpha_components.dart';
+import '../widgets/load_failure.dart';
 import '../widgets/screen_shell.dart';
 
 class ApprovalDetailScreen extends StatefulWidget {
@@ -24,8 +26,14 @@ class ApprovalDetailScreen extends StatefulWidget {
 }
 
 class _ApprovalDetailScreenState extends State<ApprovalDetailScreen> {
-  late Future<ApprovalAlpha> _approval;
-  String _approvalId = 'appr-shell';
+  Future<ApprovalAlpha>? _approval;
+  // Nullable, and with no default. It used to default to `'appr-shell'` — the
+  // *mock fixture's* first approval id — so an argument-less push asked the live
+  // tower for a record that only exists in the demo data, and in demo mode
+  // `MockAlphaRepository.loadApproval` answered any unknown id with that same
+  // record anyway. Both halves of that are fixed; there is no honest approval to
+  // show without an argument, so the screen shows none.
+  String? _approvalId;
   String? _draftResponse;
   bool _busy = false;
   bool _loadedRoute = false;
@@ -53,17 +61,24 @@ class _ApprovalDetailScreenState extends State<ApprovalDetailScreen> {
   void didChangeDependencies() {
     super.didChangeDependencies();
     final argument = ModalRoute.of(context)?.settings.arguments;
-    final approvalId = argument is String ? argument : 'appr-shell';
+    final approvalId =
+        argument is String && argument.isNotEmpty ? argument : null;
     if (!_loadedRoute || approvalId != _approvalId) {
       _approvalId = approvalId;
-      _approval = _viewModel.load(_approvalId);
+      _approval = approvalId == null
+          ? null
+          : claimLoadErrors(
+              _viewModel.load(approvalId),
+              context: 'approval',
+            );
       _loadedRoute = true;
     }
   }
 
   void _runtimeChanged() {
     final runtime = widget.runtime;
-    if (!_loadedRoute || runtime == null) {
+    final approvalId = _approvalId;
+    if (!_loadedRoute || runtime == null || approvalId == null) {
       return;
     }
     if (_seenEventRevision == runtime.eventRevision) {
@@ -74,17 +89,27 @@ class _ApprovalDetailScreenState extends State<ApprovalDetailScreen> {
     final lastEvent = runtime.lastEvent;
     final eventApprovalId = lastEvent?.payload['approval_id'] as String?;
     if (lastEvent == null ||
-        eventApprovalId == _approvalId ||
+        eventApprovalId == approvalId ||
         lastEvent.type == 'approval.requested' ||
         lastEvent.type == 'approval.resolved') {
       setState(() {
-        _approval = _viewModel.load(_approvalId);
+        _approval = claimLoadErrors(
+          _viewModel.load(approvalId),
+          context: 'approval',
+        );
       });
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    if (_approvalId == null) {
+      return const ScreenShell(
+        title: 'Approval',
+        selectedRoute: HermesRoutes.inbox,
+        body: Center(child: Text('No approval selected.')),
+      );
+    }
     return ScreenShell(
       title: 'Approval',
       selectedRoute: HermesRoutes.inbox,
@@ -137,11 +162,12 @@ class _ApprovalDetailScreenState extends State<ApprovalDetailScreen> {
                       ),
                 ),
               ),
-              const SectionHeader(title: 'Operator Constraints'),
+              const SectionHeader(title: 'Offered Decision Options'),
               AlphaPanel(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: approval.constraints
+                      .map(humanizeApprovalOption)
                       .map(
                         (constraint) => Padding(
                           padding: const EdgeInsets.only(bottom: 8),
@@ -228,14 +254,15 @@ class _ApprovalDetailScreenState extends State<ApprovalDetailScreen> {
       return;
     }
     final repository = widget.runtime?.approvalResponsesRepository;
-    if (repository == null) {
+    final approvalId = _approvalId;
+    if (repository == null || approvalId == null) {
       _saveDraftResponse(trimmed);
       return;
     }
     setState(() => _busy = true);
     try {
       await repository.modified(
-        _approvalId,
+        approvalId,
         alternateDirective: trimmed,
         constraints: [
           {
@@ -267,14 +294,15 @@ class _ApprovalDetailScreenState extends State<ApprovalDetailScreen> {
 
   Future<void> _submitPolicyProposal() async {
     final repository = widget.runtime?.approvalResponsesRepository;
-    if (repository == null) {
+    final approvalId = _approvalId;
+    if (repository == null || approvalId == null) {
       _saveDraftResponse('Policy proposal drafted locally');
       return;
     }
     setState(() => _busy = true);
     try {
       await repository.proposePolicy(
-        _approvalId,
+        approvalId,
         confirmationPhrase: 'PROPOSE POLICY',
         constraints: [
           {
@@ -305,13 +333,14 @@ class _ApprovalDetailScreenState extends State<ApprovalDetailScreen> {
 
   Future<void> _requestMoreInfo() async {
     final repository = widget.runtime?.approvalResponsesRepository;
-    if (repository == null) {
+    final approvalId = _approvalId;
+    if (repository == null || approvalId == null) {
       return;
     }
     setState(() => _busy = true);
     try {
       await repository.needsInfo(
-        _approvalId,
+        approvalId,
         userMessage: 'Please provide more detail before the mobile decision.',
       );
       if (mounted) {

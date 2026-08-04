@@ -1,16 +1,32 @@
 import 'dart:convert';
 
+import '../api/gateway_api_client.dart';
 import '../models/alpha_models.dart';
 import '../models/core_models.dart';
 import 'agents_repository.dart';
 import 'alpha_repository.dart';
 import 'approvals_repository.dart';
 import 'dashboard_repository.dart';
-import 'mock_alpha_repository.dart';
 import 'missions_repository.dart';
 import 'notifications_repository.dart';
 import 'tua_repository.dart';
 
+/// The paired device's view of the fleet: every answer here comes from the
+/// control tower, or is an honest refusal.
+///
+/// This class used to hold a `MockAlphaRepository fallback`, default-constructed
+/// into the constructor so `app_runtime` got one whether it asked or not, and
+/// four members read from it. A paired operator therefore saw invented fleet
+/// state — an agent that does not exist, a "security alert" nobody raised,
+/// terminal output nobody ran — with no mock indicator, no error, and no empty
+/// state. On a control plane that is worse than an outage: an outage is visible,
+/// and fabricated state is not.
+///
+/// The field is gone rather than merely unused. A live repository that *can*
+/// reach demo fixtures will eventually reach them again; one that cannot hold a
+/// reference to them cannot. Absence is now said with
+/// [FleetRecordNotFoundException] / [LiveDataUnavailableException], and every
+/// other failure propagates.
 class GatewayAlphaRepository implements AlphaRepository {
   const GatewayAlphaRepository({
     required this.dashboardRepository,
@@ -19,7 +35,6 @@ class GatewayAlphaRepository implements AlphaRepository {
     required this.missionsRepository,
     required this.notificationsRepository,
     required this.tuaRepository,
-    this.fallback = const MockAlphaRepository(),
   });
 
   final DashboardRepository dashboardRepository;
@@ -28,12 +43,10 @@ class GatewayAlphaRepository implements AlphaRepository {
   final MissionsRepository missionsRepository;
   final NotificationsRepository notificationsRepository;
   final TuaRepository tuaRepository;
-  final AlphaRepository fallback;
 
   @override
   Future<HomeAlphaSnapshot> loadHome() async {
     final snapshot = await dashboardRepository.loadSnapshot();
-    final fallbackHome = await fallback.loadHome();
     final assistance = await _loadOpenAssistanceInbox();
     final agents = snapshot.agents.map(_agentFromGateway).toList();
     final approvals =
@@ -52,8 +65,13 @@ class GatewayAlphaRepository implements AlphaRepository {
         snapshot.missions.map((mission) => _missionFromGateway(mission)).toList();
     final activeMissions =
         missions.where((mission) => mission.state != MissionState.complete).toList();
+    // "Online" counts agents the tower positively reported as up. An agent whose
+    // status this build cannot read is not evidence of an online agent, so it is
+    // not counted as one.
     final onlineAgents = agents
-        .where((agent) => agent.status != AgentRunStatus.offline)
+        .where((agent) =>
+            agent.status != AgentRunStatus.offline &&
+            agent.status != AgentRunStatus.unknown)
         .length
         .toString();
 
@@ -102,7 +120,7 @@ class GatewayAlphaRepository implements AlphaRepository {
       pendingApprovals: approvals,
       activeMissions: activeMissions,
       agents: agents,
-      activity: fallbackHome.activity,
+      activity: _activityFromNotifications(snapshot.notifications),
       notifications: notifications,
     );
   }
@@ -113,6 +131,21 @@ class GatewayAlphaRepository implements AlphaRepository {
     return agents.map(_agentFromGateway).toList();
   }
 
+  /// One agent from the live fleet, or an honest "it is not in the fleet".
+  ///
+  /// This used to end in `return fallback.loadAgent(agentId)`. The mock it
+  /// delegated to is `firstWhere(..., orElse: () => _agents.first)`, which can
+  /// never decline — so a stale notification, an expired deep link, or an agent
+  /// that was retired mid-session rendered a **fully populated running agent**
+  /// ("Repo Sentinel" on node "work-vm-02", three notifications, one approval)
+  /// on a paired device talking to a healthy tower. No mock indicator, no error,
+  /// no empty state; the operator had no way to tell it was invented.
+  ///
+  /// The list load above already carries the other two states: a transport
+  /// failure propagates ("can't reach the tower"), and a [GatewayApiException]
+  /// propagates with the tower's own status. Reaching the end of the loop means
+  /// the tower answered and this id is simply not in what it returned — the one
+  /// state neither of those can express, so it gets its own.
   @override
   Future<FleetAgent> loadAgent(String agentId) async {
     final agents = await loadAgents();
@@ -121,7 +154,7 @@ class GatewayAlphaRepository implements AlphaRepository {
         return agent;
       }
     }
-    return fallback.loadAgent(agentId);
+    throw FleetRecordNotFoundException(kind: 'agent', id: agentId);
   }
 
   @override
@@ -148,18 +181,36 @@ class GatewayAlphaRepository implements AlphaRepository {
 
   /// Real, operator-actionable TUA assistance requests as inbox items, each
   /// carrying its true requestId so the TUA screen can open a real session.
-  /// Best-effort: a gateway without /tua/requests degrades to no items rather
-  /// than failing the whole inbox.
+  ///
+  /// This used to end in a bare `on Object { return const []; }`. Because it
+  /// feeds both [loadInbox] and [loadHome], **every** refusal — a 500, an
+  /// expired token, a gateway that is not listening at all — was rendered to the
+  /// operator as "you have no items". That is the same dishonesty the TUA screen
+  /// fix addressed, one layer down, and down here it silently defeats the
+  /// screen-level guard: the future resolves successfully, so `hasError` can
+  /// never fire and `LoadFailurePanel` can never render.
+  ///
+  /// The discriminator is the one the TUA fix uses. A [GatewayApiException]
+  /// exists only because a response came back, so it already proves the tower
+  /// answered; a 404 on this route is an older gateway that has no
+  /// `/tua/requests` at all, which is a genuine "no assistance items" and stays
+  /// empty. Everything else — 5xx, auth, and any transport failure
+  /// (`ClientException` / `SocketException`, which never reach this catch
+  /// clause) — propagates so the screens can say what actually happened.
   Future<List<InboxItem>> _loadOpenAssistanceInbox() async {
+    final List<AssistanceRequestModel> requests;
     try {
-      final requests = await tuaRepository.listRequests();
-      return requests
-          .where((request) => _isOpenAssistance(request.state))
-          .map(_inboxFromAssistanceRequest)
-          .toList();
-    } on Object {
-      return const [];
+      requests = await tuaRepository.listRequests();
+    } on GatewayApiException catch (error) {
+      if (error.statusCode == 404) {
+        return const [];
+      }
+      rethrow;
     }
+    return requests
+        .where((request) => _isOpenAssistance(request.state))
+        .map(_inboxFromAssistanceRequest)
+        .toList();
   }
 
   @override
@@ -204,15 +255,73 @@ class GatewayAlphaRepository implements AlphaRepository {
   Future<void> stopAgent(String sessionId, String agentId) =>
       approvalsRepository.stopAgent(sessionId, agentId);
 
+  /// Not served from here. The paired app reads assistance sessions through
+  /// [TuaRepository] (see `TuaScreen._loadSession`); this member exists for the
+  /// unpaired demo repository.
+  ///
+  /// It used to `return fallback.loadAssistanceSession(sessionId)`, handing back
+  /// a hand-written conversation between "Repo Sentinel" and the operator with
+  /// the *caller's real session id* stamped on it, so it read as specific to
+  /// whatever the operator had just opened. Refusing is the only honest answer:
+  /// reaching this on a paired device means a screen took the demo path, and the
+  /// operator must see that rather than a plausible transcript.
+  // `async` so the refusal arrives as a rejected future rather than a
+  // synchronous throw at the call site — callers treat these as loads and hand
+  // them to `FutureBuilder`/`claimLoadErrors`, which can only see the former.
   @override
-  Future<AssistanceSessionAlpha> loadAssistanceSession(String sessionId) {
-    return fallback.loadAssistanceSession(sessionId);
+  Future<AssistanceSessionAlpha> loadAssistanceSession(String sessionId) async {
+    throw const LiveDataUnavailableException('assistance session');
   }
 
+  /// Not served from here — [TuiRepository] and `TuiStreamClient` carry the live
+  /// relay. Same history as [loadAssistanceSession], and worse content: the
+  /// fixture is a fabricated shell transcript (`git status`, `39 passed`, real-
+  /// looking commit hashes) under a `hermes@work-vm-02` prompt. Terminal output
+  /// an operator reads as evidence must never be invented.
   @override
-  Future<TerminalSessionAlpha> loadTerminalSession(String sessionId) {
-    return fallback.loadTerminalSession(sessionId);
+  Future<TerminalSessionAlpha> loadTerminalSession(String sessionId) async {
+    throw const LiveDataUnavailableException('terminal session');
   }
+}
+
+/// Recent activity, from the tower's own notification records.
+///
+/// This used to be `(await fallback.loadHome()).activity` — unconditionally, on
+/// the success path, for every paired operator. The home screen's "Recent
+/// Activity" list was therefore always the mock's four hardcoded rows, including
+/// a fabricated **"Security alert — PromptFence Guard flagged a route
+/// advertisement"**, rendered directly beneath genuinely live stats and agents
+/// and indistinguishable from them.
+///
+/// The tower exposes no separate activity feed, so the honest source is the
+/// notification records `loadHome` has already fetched. When there are none the
+/// section is genuinely empty — which is a true statement about the fleet, and
+/// the only kind worth showing.
+List<ActivityEvent> _activityFromNotifications(
+  List<NotificationRecord> notifications,
+) {
+  return notifications
+      .map(
+        (notification) => ActivityEvent(
+          title: notification.title ?? notification.category,
+          detail: notification.body ?? notification.state,
+          timeLabel: _timeAgo(notification.createdAt),
+          severity: _severityFromNotification(notification),
+        ),
+      )
+      .toList();
+}
+
+/// Severity straight from what the tower said, never guessed upward or downward.
+String _severityFromNotification(NotificationRecord notification) {
+  if (notification.category == 'security_alert') {
+    return 'critical';
+  }
+  return switch (notification.urgency) {
+    'critical' => 'critical',
+    'high' || 'warn' || 'warning' => 'warn',
+    _ => 'info',
+  };
 }
 
 FleetAgent _agentFromGateway(GatewayAgent agent) {
@@ -328,7 +437,12 @@ AgentRunStatus _statusFromGateway(String status) {
     'warning' => AgentRunStatus.warning,
     'error' => AgentRunStatus.warning,
     'idle' => AgentRunStatus.idle,
-    _ => AgentRunStatus.online,
+    // Was `_ => AgentRunStatus.online`. A status this build does not know —
+    // from a newer gateway, or an older one — was painted healthy green and
+    // counted in the dashboard's "Online" tile. That is an invented claim about
+    // fleet health, made in the optimistic direction, which is the direction
+    // that hides trouble.
+    _ => AgentRunStatus.unknown,
   };
 }
 
@@ -342,7 +456,8 @@ MissionState _missionStateFromGateway(String state) {
     'completed' => MissionState.complete,
     'failed' => MissionState.failed,
     'cancelled' => MissionState.cancelled,
-    _ => MissionState.running,
+    // Was `_ => MissionState.running`, asserting progress with no evidence.
+    _ => MissionState.unknown,
   };
 }
 

@@ -124,10 +124,21 @@ final class SecureEnclaveSigner {
     let stored = loadKey()
     let isEnclave = stored?.isEnclave ?? available
     let context = LAContext()
-    var authError: NSError?
+    // `biometryAvailable` must mean *biometry*, not "some device
+    // authentication exists". `.deviceOwnerAuthentication` is satisfied by a
+    // passcode alone, so it reported true on a simulator with no enrolled
+    // face — and callers that use it to decide whether a biometric prompt can
+    // be answered were told yes, then met a passcode field.
+    // `.deviceOwnerAuthenticationWithBiometrics` is the honest question, and
+    // `biometryType` is only meaningful once it has been asked.
+    var biometryError: NSError?
     let biometryAvailable = context.canEvaluatePolicy(
+      .deviceOwnerAuthenticationWithBiometrics, error: &biometryError)
+    var authError: NSError?
+    let deviceAuthAvailable = context.canEvaluatePolicy(
       .deviceOwnerAuthentication, error: &authError)
     result([
+      "deviceAuthAvailable": deviceAuthAvailable,
       "secureEnclaveAvailable": available,
       "hasKey": stored != nil,
       "backend": isEnclave ? "secure_enclave_p256" : "software_p256_dev",

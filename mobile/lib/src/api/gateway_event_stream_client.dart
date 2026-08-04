@@ -116,13 +116,25 @@ class GatewayEventStreamClient {
           // still require signed HTTP decisions.
           if (!cancelled) {
             final failure = GatewayStreamConnectError.from(error);
-            onConnectError?.call(failure);
-            final reauthenticate = onAuthFailure;
-            if (failure.isAuthFailure &&
-                !reauthenticated &&
-                reauthenticate != null) {
-              reauthenticated = true;
-              retryNow = await reauthenticate();
+            // Guarded on its own: this is *inside* the catch clause, so a throw
+            // from either callback is not caught by the `try` above. It would
+            // escape `run()` — which nothing awaits — into the root zone as an
+            // unhandled async error, and skip `controller.close()`, leaving
+            // every listener waiting on a stream that can never end.
+            try {
+              onConnectError?.call(failure);
+              final reauthenticate = onAuthFailure;
+              if (failure.isAuthFailure &&
+                  !reauthenticated &&
+                  reauthenticate != null) {
+                reauthenticated = true;
+                retryNow = await reauthenticate();
+              }
+            } on Object {
+              // A reporting/re-auth callback that fails tells us nothing more
+              // than the connection failure we are already handling. Keep
+              // reconnecting.
+              retryNow = false;
             }
           }
         }
@@ -168,6 +180,11 @@ class GatewayEventStreamClient {
     if (connector != null) {
       return connector(uri);
     }
+    // The `WebSocketChannel.ready` unhandled-rejection guard that used to live
+    // here moved into the connectors: the io connector no longer uses
+    // `WebSocketChannel` at all (it opens `dart:io`'s socket so a refused
+    // upgrade keeps its HTTP status), and the web connector claims `ready`
+    // itself. See `gateway_socket_connector_web.dart`.
     return connectGatewayWebSocket(uri);
   }
 

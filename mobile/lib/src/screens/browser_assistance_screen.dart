@@ -5,6 +5,7 @@ import '../models/core_models.dart';
 import '../operator_error.dart';
 import '../routes.dart';
 import '../widgets/alpha_components.dart';
+import '../widgets/load_failure.dart';
 import '../widgets/screen_shell.dart';
 
 class BrowserAssistanceScreen extends StatefulWidget {
@@ -36,7 +37,10 @@ class _BrowserAssistanceScreenState extends State<BrowserAssistanceScreen> {
       _sessions = Future.value(const []);
       return;
     }
-    _sessions = repository.listSessions();
+    _sessions = claimLoadErrors(
+      repository.listSessions(),
+      context: 'browser-assistance',
+    );
   }
 
   @override
@@ -78,9 +82,11 @@ class _BrowserAssistanceScreenState extends State<BrowserAssistanceScreen> {
               ),
               const SectionHeader(title: 'Sessions'),
               if (snapshot.hasError)
-                AlphaPanel(
-                    child: Text(operatorErrorMessage(snapshot.error!,
-                        context: 'browser-assistance')))
+                LoadFailurePanel(
+                  error: snapshot.error!,
+                  context_: 'browser-assistance',
+                  onRetry: () => setState(_refresh),
+                )
               else if (snapshot.connectionState == ConnectionState.waiting)
                 const Center(child: CircularProgressIndicator())
               else if (sessions.isEmpty)
@@ -156,37 +162,62 @@ class _BrowserAssistanceScreenState extends State<BrowserAssistanceScreen> {
     );
   }
 
-  Future<void> _recordNote(BrowserAssistanceSessionModel session) async {
+  void _recordNote(BrowserAssistanceSessionModel session) {
     final repository = widget.runtime.browserAssistanceRepository;
     if (repository == null) {
       return;
     }
-    setState(() => _busy = true);
-    try {
-      await repository.recordEvent(
+    _runGatewayAction(
+      () => repository.recordEvent(
         session.browserSessionId,
         note: 'Operator reviewed browser context from mobile.',
-      );
-      setState(_refresh);
-    } finally {
-      if (mounted) {
-        setState(() => _busy = false);
-      }
-    }
+      ),
+    );
   }
 
-  Future<void> _returnControl(BrowserAssistanceSessionModel session) async {
+  void _returnControl(BrowserAssistanceSessionModel session) {
     final repository = widget.runtime.browserAssistanceRepository;
     if (repository == null) {
       return;
     }
-    setState(() => _busy = true);
-    try {
-      await repository.returnControl(
+    _runGatewayAction(
+      () => repository.returnControl(
         session.browserSessionId,
         summary: 'Operator reviewed browser context and returned control.',
-      );
-      setState(_refresh);
+      ),
+    );
+  }
+
+  /// Run one operator action against the gateway and always report the verdict.
+  ///
+  /// Failure mode this closes: both handlers used to be `try { await …; }
+  /// finally { _busy = false; }` — a `finally` with no `catch`. They are wired
+  /// to `onPressed`, a `VoidCallback`, so the returned future is discarded and
+  /// a POST to an unreachable gateway escaped as an *unhandled async error*.
+  /// The operator saw nothing at all: no message, no panel, just a button that
+  /// re-enabled itself as though the note had been recorded.
+  ///
+  /// Same shape as `tua_screen`/`voice_screen` `_runGatewayAction`: success
+  /// refreshes, failure says one readable sentence, `_busy` always resets.
+  Future<void> _runGatewayAction(Future<void> Function() action) async {
+    setState(() => _busy = true);
+    try {
+      await action();
+      if (mounted) {
+        // Inside the try in the old code, so a failure skipped it silently.
+        // Only a *successful* action refreshes — and it still does.
+        setState(_refresh);
+      }
+    } on Object catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              operatorErrorMessage(error, context: 'browser-assistance'),
+            ),
+          ),
+        );
+      }
     } finally {
       if (mounted) {
         setState(() => _busy = false);

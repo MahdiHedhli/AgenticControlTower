@@ -1,18 +1,15 @@
-import 'dart:async';
+import 'src/bootstrap.dart';
+import 'src/error_net.dart';
 
-import 'package:flutter/material.dart';
-
-import 'src/app_runtime.dart';
-import 'src/app.dart';
-
-Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  // Local, bounded setup only. Anything awaited here delays the first frame,
-  // and until runApp() runs iOS keeps showing the (black) launch storyboard.
-  final runtime = await HermesAppRuntime.create();
-  runApp(HermesMobileApp(runtime: runtime));
-  // Network and APNs bootstrap starts only once the UI is actually on screen.
-  WidgetsBinding.instance.addPostFrameCallback((_) {
-    unawaited(runtime.startBackgroundBootstrap());
-  });
+/// Nothing may be awaited here beyond [bootstrapAndRun], which is budgeted so
+/// the first frame can never be gated on push registration, a platform channel
+/// or the network. See `src/bootstrap.dart` and `app_boot_test.dart`.
+///
+/// [installLastResortErrorNet] runs first and is not awaited: it only assigns
+/// `PlatformDispatcher.onError`, so an error thrown during bootstrap itself is
+/// already covered. It records and re-reports; it never swallows. See
+/// `src/error_net.dart`.
+Future<void> main() {
+  installLastResortErrorNet();
+  return bootstrapAndRun();
 }

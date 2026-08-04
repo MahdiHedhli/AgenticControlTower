@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../api/gateway_api_client.dart';
 import '../app_runtime.dart';
 import '../models/alpha_models.dart';
 import '../models/core_models.dart';
@@ -8,6 +9,7 @@ import '../repositories/alpha_repository.dart';
 import '../routes.dart';
 import '../viewmodels/alpha_viewmodels.dart';
 import '../widgets/alpha_components.dart';
+import '../widgets/load_failure.dart';
 import '../widgets/screen_shell.dart';
 
 class TuaScreen extends StatefulWidget {
@@ -27,6 +29,7 @@ class TuaScreen extends StatefulWidget {
 class _TuaScreenState extends State<TuaScreen> {
   late final TuaViewModel _viewModel;
   late Future<void> _load;
+  String? _contextId;
   final _replyController = TextEditingController();
   bool _loadedRoute = false;
   AssistanceSessionModel? _gatewaySession;
@@ -45,11 +48,17 @@ class _TuaScreenState extends State<TuaScreen> {
     if (_loadedRoute) {
       return;
     }
-    final contextId = ModalRoute.of(context)?.settings.arguments as String?;
-    _load = (contextId == null || contextId.isEmpty)
-        ? Future<void>.value()
-        : _loadSession(contextId);
+    _contextId = ModalRoute.of(context)?.settings.arguments as String?;
+    _load = _startLoad();
     _loadedRoute = true;
+  }
+
+  Future<void> _startLoad() {
+    final contextId = _contextId;
+    if (contextId == null || contextId.isEmpty) {
+      return Future<void>.value();
+    }
+    return claimLoadErrors(_loadSession(contextId), context: 'tua');
   }
 
   @override
@@ -66,6 +75,13 @@ class _TuaScreenState extends State<TuaScreen> {
       body: FutureBuilder<void>(
         future: _load,
         builder: (context, snapshot) {
+          if (snapshot.hasError) {
+            return LoadFailurePanel(
+              error: snapshot.error!,
+              context_: 'tua',
+              onRetry: () => setState(() => _load = _startLoad()),
+            );
+          }
           if (snapshot.connectionState != ConnectionState.done) {
             return const Center(child: CircularProgressIndicator());
           }
@@ -126,6 +142,20 @@ class _TuaScreenState extends State<TuaScreen> {
     return _viewModel.session;
   }
 
+  /// Resolve the route argument into an assistance session.
+  ///
+  /// Both lookups used to end in a bare `on Object { return; }`. Against a
+  /// gateway that is not listening that turned an **outage** into the
+  /// "Assistance session unavailable" empty state — the screen told the
+  /// operator there was nothing here when the truth was that we could not
+  /// reach the tower, and the `hasError` branch could never fire. That is the
+  /// same dishonesty class as a silent mock-data fallback.
+  ///
+  /// Only an answer *from* the tower saying the record does not exist (HTTP
+  /// 404, carried on [GatewayApiException.statusCode]) is a legitimate empty.
+  /// Everything else — 5xx, auth, a `ClientException`/`SocketException` from
+  /// the transport — propagates to `claimLoadErrors` and renders
+  /// `LoadFailurePanel`.
   Future<void> _loadSession(String contextId) async {
     final repository = widget.runtime?.tuaRepository;
     if (repository == null) {
@@ -136,8 +166,13 @@ class _TuaScreenState extends State<TuaScreen> {
       _gatewaySession = await repository.getSession(contextId);
       _gatewayMode = true;
       return;
-    } on Object {
-      // Approval routes pass an approval id, not an assistance session id.
+    } on GatewayApiException catch (error) {
+      // Expected and benign: approval routes pass an approval id, not an
+      // assistance session id, so the tower answers 404 and we try the
+      // request list below. Any other answer is a real failure.
+      if (!_isNotFound(error)) {
+        rethrow;
+      }
     }
     try {
       final requests = await repository.listRequests();
@@ -149,8 +184,8 @@ class _TuaScreenState extends State<TuaScreen> {
         }
       }
       if (matched == null) {
-        // Paired but no real request matches this id — show an explicit empty
-        // state rather than leaking mock assistance data.
+        // The tower answered and has no request under this id — genuinely
+        // empty. Show the explicit empty state, never mock assistance data.
         return;
       }
       _gatewaySession = await repository.createSession(
@@ -158,11 +193,21 @@ class _TuaScreenState extends State<TuaScreen> {
         initialMessage: 'Opened from Agentic Control Tower.',
       );
       _gatewayMode = true;
-    } on Object {
-      // Paired but the gateway call failed — surface empty/error, never mock.
+    } on GatewayApiException catch (error) {
+      // The request vanished between the list and the create — empty, not an
+      // outage. Anything else the tower said is a failure worth showing.
+      if (!_isNotFound(error)) {
+        rethrow;
+      }
       return;
     }
   }
+
+  /// A real "no such record" answer from the tower, as opposed to never having
+  /// reached it. [GatewayApiException] is thrown only after a response came
+  /// back, so its presence already proves the tower is up; the status code
+  /// separates not-found from every other refusal.
+  bool _isNotFound(GatewayApiException error) => error.statusCode == 404;
 
   void _sendReply() {
     final body = _replyController.text.trim();

@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import 'api/gateway_api_client.dart';
+import 'repositories/alpha_repository.dart';
 import 'security/secure_enclave_channel.dart';
 
 /// Render a caught error as one short, human-readable line for operator UI.
@@ -21,6 +22,22 @@ String operatorErrorMessage(Object error, {String? context}) {
 }
 
 String _describe(Object error) {
+  // Absence, said out loud. These two must never read like a connectivity
+  // problem: the tower was reached, and the honest answer is that the record is
+  // gone (or was never live here). Rendering them as "can't reach the control
+  // tower" would send the operator to Settings to fix a network that is fine;
+  // rendering them as a populated screen — which is what the repository used to
+  // do — is worse still.
+  if (error is FleetRecordNotFoundException) {
+    return switch (error.kind) {
+      'agent' => 'That agent is no longer in this fleet.',
+      'approval' => 'That approval is no longer in the queue.',
+      _ => 'The control tower no longer has that record.',
+    };
+  }
+  if (error is LiveDataUnavailableException) {
+    return 'The control tower has no live ${error.surface} for this device.';
+  }
   if (error is SecureEnclaveException) {
     return "Couldn't create a secure key on this device.";
   }

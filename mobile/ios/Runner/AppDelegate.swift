@@ -39,6 +39,22 @@ import UserNotifications
   }
 
   private func registerForPushNotifications(_ application: UIApplication) {
+    // `requestAuthorization` puts a SpringBoard alert in front of the app until
+    // it is answered. Nothing inside the process can answer it — including an
+    // integration test, which is *in* this process — so the app freezes and the
+    // test hangs rather than failing. Reinstalling resets the authorization to
+    // notDetermined, so this hits at unpredictable points in a suite run.
+    //
+    // The e2e driver sets SIMCTL_CHILD_ACT_SUPPRESS_PUSH_PROMPT=1, which
+    // CoreSimulator forwards to the launched app as ACT_SUPPRESS_PUSH_PROMPT.
+    // Nothing sets it outside that harness, so device and release behaviour are
+    // unchanged. Losing push here costs nothing: APNs does not exist on the
+    // Simulator at all.
+    guard ProcessInfo.processInfo.environment["ACT_SUPPRESS_PUSH_PROMPT"] != "1"
+    else {
+      NSLog("ACT: push permission prompt suppressed (e2e harness)")
+      return
+    }
     UNUserNotificationCenter.current()
       .requestAuthorization(options: [.alert, .badge, .sound]) { granted, _ in
         guard granted else { return }

@@ -1,6 +1,22 @@
 import '../models/alpha_models.dart';
 import 'alpha_repository.dart';
 
+/// The unpaired demo fleet.
+///
+/// This is a sanctioned fallback and stays: it is reachable only from
+/// `HermesAppRuntime.alphaRepository` when `isPaired` is false, and the app says
+/// so out loud — Settings renders `dataModeLabel`, which is literally
+/// "Mock alpha data" in this mode, and `pairing_test.dart` asserts that label is
+/// on screen. The operator cannot mistake it for the fleet.
+///
+/// What did *not* stay is its inability to decline. [loadAgent] and
+/// [loadApproval] were `firstWhere(..., orElse: () => _list.first)`, so an
+/// unknown id silently became a *different, real-looking record* — and because
+/// the live repository used to delegate here on its not-found path, that
+/// substitution reached paired devices. Even confined to demo mode it is the
+/// wrong shape: `approveOnce`/`deny` route through [loadApproval], so an
+/// unknown id produced a success result describing an approval the operator was
+/// never looking at. A demo may be fake; it may not be incoherent.
 class MockAlphaRepository implements AlphaRepository {
   const MockAlphaRepository();
 
@@ -55,8 +71,12 @@ class MockAlphaRepository implements AlphaRepository {
 
   @override
   Future<FleetAgent> loadAgent(String agentId) async {
-    return _agents.firstWhere((agent) => agent.id == agentId,
-        orElse: () => _agents.first);
+    for (final agent in _agents) {
+      if (agent.id == agentId) {
+        return agent;
+      }
+    }
+    throw FleetRecordNotFoundException(kind: 'agent', id: agentId);
   }
 
   @override
@@ -67,10 +87,12 @@ class MockAlphaRepository implements AlphaRepository {
 
   @override
   Future<ApprovalAlpha> loadApproval(String approvalId) async {
-    return _approvals.firstWhere(
-      (approval) => approval.id == approvalId,
-      orElse: () => _approvals.first,
-    );
+    for (final approval in _approvals) {
+      if (approval.id == approvalId) {
+        return approval;
+      }
+    }
+    throw FleetRecordNotFoundException(kind: 'approval', id: approvalId);
   }
 
   @override
@@ -270,6 +292,15 @@ const _missions = [
   ),
 ];
 
+/// Demo approvals.
+///
+/// `constraints` carries the gateway's own option tokens, exactly as
+/// `_approvalFromGateway` fills it from `approval.options`, because that is
+/// what the field means and what the "Offered Decision Options" section renders
+/// (through `humanizeApprovalOption`). It used to hold human sentences like
+/// "read-only first", which forced `ApprovalDetailViewModel._hasOption` to guess
+/// at option availability from the *node name* — and that guess was applied to
+/// live approvals too. Saying it here in the demo data is what let the guess go.
 const _approvals = [
   ApprovalAlpha(
     id: 'appr-shell',
@@ -285,9 +316,11 @@ const _approvals = [
     payloadPreview: 'command: python manage.py makemigrations --merge',
     expiresIn: '04:12',
     constraints: [
-      'read-only first',
-      'ask again before writing',
-      'only this repo'
+      'approve_once',
+      'approve_for_session',
+      'approve_for_agent',
+      'modify',
+      'deny',
     ],
   ),
   ApprovalAlpha(
@@ -302,7 +335,7 @@ const _approvals = [
     summary: 'Agent wants to submit a feedback form with a generated summary.',
     payloadPreview: 'target: docs.vendor.example/feedback',
     expiresIn: '08:45',
-    constraints: ['show payload', 'no auth changes'],
+    constraints: ['approve_once', 'needs_info', 'deny'],
   ),
   ApprovalAlpha(
     id: 'appr-network',
@@ -316,7 +349,7 @@ const _approvals = [
     summary: 'Security agent wants to inspect a newly advertised subnet route.',
     payloadPreview: 'scope: 100.92.14.0/24, read-only scan',
     expiresIn: '02:19',
-    constraints: ['read-only first', 'ask again before writing'],
+    constraints: ['approve_once', 'needs_info', 'deny'],
   ),
 ];
 

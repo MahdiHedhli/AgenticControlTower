@@ -20,6 +20,11 @@ dev_dependencies:
   flutter_lints: ^5.0.0
   flutter_test:
     sdk: flutter
+  integration_test:
+    sdk: flutter
+  # Transitively available via flutter_test; declared so the e2e support
+  # library may use @isTest on its scenario() wrapper.
+  meta: ^1.15.0
 
 flutter:
   uses-material-design: true

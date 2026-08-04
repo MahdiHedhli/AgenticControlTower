@@ -6,6 +6,7 @@ import '../repositories/alpha_repository.dart';
 import '../routes.dart';
 import '../viewmodels/alpha_viewmodels.dart';
 import '../widgets/alpha_components.dart';
+import '../widgets/load_failure.dart';
 import '../widgets/screen_shell.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -32,7 +33,8 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
-    _snapshot = HomeViewModel(_repository).load();
+    _snapshot =
+        claimLoadErrors(HomeViewModel(_repository).load(), context: 'home');
     widget.runtime?.addListener(_runtimeChanged);
   }
 
@@ -50,7 +52,10 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_seenEventRevision != runtime.eventRevision) {
       _seenEventRevision = runtime.eventRevision;
       setState(() {
-        _snapshot = HomeViewModel(_repository).load();
+        _snapshot = claimLoadErrors(
+          HomeViewModel(_repository).load(),
+          context: 'home',
+        );
       });
       return;
     }
@@ -66,6 +71,18 @@ class _HomeScreenState extends State<HomeScreen> {
         future: _snapshot,
         builder: (context, snapshot) {
           final data = snapshot.data;
+          if (snapshot.hasError) {
+            return LoadFailurePanel(
+              error: snapshot.error!,
+              context_: 'home',
+              onRetry: () => setState(
+                () => _snapshot = claimLoadErrors(
+                  HomeViewModel(_repository).load(),
+                  context: 'home',
+                ),
+              ),
+            );
+          }
           if (data == null) {
             return const Center(child: CircularProgressIndicator());
           }
@@ -91,19 +108,28 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
               const SectionHeader(title: 'Agent Fleet'),
               AlphaPanel(
-                child: Column(
-                  children: data.agents.take(4).map((agent) {
-                    return ListTile(
-                      contentPadding: EdgeInsets.zero,
-                      title: Text(agent.name),
-                      subtitle: Text('${agent.team} - ${agent.currentMission}'),
-                      trailing: AgentStatusPill(status: agent.status),
-                      onTap: () => Navigator.of(context).pushNamed(
-                        HermesRoutes.agentDetail,
-                        arguments: agent.id,
-                      ),
-                    );
-                  }).toList(),
+                // ListTile paints its background and ink splashes on the
+                // nearest Material ancestor. AlphaPanel is a coloured
+                // DecoratedBox, so without a Material *inside* it the framework
+                // asserts "ink splashes may be invisible" every time the fleet
+                // renders — and the taps show no feedback.
+                child: Material(
+                  type: MaterialType.transparency,
+                  child: Column(
+                    children: data.agents.take(4).map((agent) {
+                      return ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: Text(agent.name),
+                        subtitle:
+                            Text('${agent.team} - ${agent.currentMission}'),
+                        trailing: AgentStatusPill(status: agent.status),
+                        onTap: () => Navigator.of(context).pushNamed(
+                          HermesRoutes.agentDetail,
+                          arguments: agent.id,
+                        ),
+                      );
+                    }).toList(),
+                  ),
                 ),
               ),
               const SectionHeader(title: 'Recent Activity'),

@@ -11,6 +11,15 @@ enum AgentRunStatus {
   warning,
   failed,
   completed,
+
+  /// The tower reported a status this build does not recognise.
+  ///
+  /// Exists because the wire mapper's fallback used to be
+  /// `_ => AgentRunStatus.online` — a newer or older gateway's unfamiliar status
+  /// rendered as a healthy green agent *and* was counted in the dashboard's
+  /// "Online" tile. Not knowing is not the same as being fine, and guessing
+  /// upward is the direction that hides trouble.
+  unknown,
 }
 
 enum MissionState {
@@ -22,6 +31,10 @@ enum MissionState {
   complete,
   failed,
   cancelled,
+
+  /// Same reason as [AgentRunStatus.unknown]: the mapper defaulted to
+  /// `MissionState.running`, asserting progress it had no evidence of.
+  unknown,
 }
 
 enum InboxKind {
