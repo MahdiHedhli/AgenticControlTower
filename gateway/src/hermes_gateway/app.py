@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 
 from .capabilities import require_device_capability, require_runtime_capability
 from .capability_registry import (
@@ -122,6 +126,8 @@ from .tui import (
 
 DEFAULT_PERMISSIONS = ["read_state", "chat", "approve", "intervene"]
 
+logger = logging.getLogger("hermes_gateway")
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
     ClearanceChannelPolicy.from_settings(resolved_settings)
@@ -187,6 +193,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         description="Self-hosted control tower gateway for agentic backends.",
         lifespan=lifespan,
     )
+    @app.exception_handler(RequestValidationError)
+    async def _log_rejected_request_body(
+        request: Request, exc: RequestValidationError
+    ) -> Response:
+        """A 422 on a machine-to-machine endpoint is a CONTRACT BREAK, not user error.
+
+        The bridge's `_post_context` fails open and swallows 4xx, so when the
+        installed plugin started sending `bridge_plugin_name` /
+        `bridge_plugin_version` and `extra="forbid"` rejected the whole body,
+        every heartbeat since 01:49 was dropped in silence and the app's
+        Fleet/Agents/Missions showed four-hour-old state as current. Nothing
+        anywhere said so: uvicorn's access line records `422` with no reason.
+        Log the offending field names at WARNING so the NEXT contract break is
+        visible in gateway.err.log within one request instead of being
+        reconstructed from a frozen UI.
+
+        Field NAMES only — never the values, which can carry request payload
+        content (ADR-0005).
+        """
+        fields = sorted(
+            {
+                ".".join(str(part) for part in error.get("loc", ()) if part != "body")
+                or "<body>"
+                for error in exc.errors()
+            }
+        )
+        logger.warning(
+            "rejected request body: %s %s (422) offending_fields=%s",
+            request.method,
+            request.url.path,
+            ",".join(fields) or "<unknown>",
+        )
+        return await request_validation_exception_handler(request, exc)
+
     app.state.settings = resolved_settings
     app.state.store = store
     app.state.tui_manager = tui_manager
@@ -558,6 +598,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 target=payload.current_target,
                 node_ref=payload.node_id,
                 capabilities=[capability.model_dump() for capability in payload.capabilities],
+                extensions=payload.extensions,
             ),
             request_id=_request_id(request),
         )

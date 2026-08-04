@@ -58,6 +58,10 @@ class RuntimeWorkState:
     operation: str | None = None
     target: str | None = None
     capabilities: list[dict[str, Any]] | None = None
+    #: Namespaced additive metadata from the caller (e.g. the bridge plugin's
+    #: name/version heartbeat). Runtime-agnostic: the adapter carries it, it does
+    #: not interpret it.
+    extensions: dict[str, dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -227,6 +231,7 @@ class HermesRuntimeAdapter:
                 current_target=work_state.target,
                 node_id=work_state.node_ref,
                 capabilities=work_state.capabilities or [],
+                extensions=work_state.extensions or {},
             ),
             request_id=request_id,
         )
@@ -507,6 +512,13 @@ class HermesRuntimeAdapter:
                 "mission_id": payload.mission_id,
                 "agent_status": payload.agent_status,
                 "mission_state": payload.mission_state,
+                # DELIBERATE: bridge metadata is persisted to the AUDIT TRAIL and
+                # nowhere else. It is a "which plugin build is talking to me"
+                # heartbeat, not agent state, so it does not belong on the agents
+                # row — and persisting it there would mean a schema migration on a
+                # live database for a diagnostic. `act audit` can answer the
+                # question; the fleet view does not need to.
+                **({"extensions": payload.extensions} if payload.extensions else {}),
             },
         )
         self.store.create_event(

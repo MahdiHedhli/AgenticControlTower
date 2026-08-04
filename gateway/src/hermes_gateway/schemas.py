@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Permission = Literal[
     "read_state",
@@ -313,6 +313,14 @@ class Mission(BaseModel):
     updated_at: datetime
 
 
+#: Top-level keys carrying bridge-plugin metadata are folded into
+#: ``RuntimeContextRequest.extensions["bridge"]`` instead of being rejected.
+#: Deliberately a namespace prefix and not a list of two field names: the whole
+#: point of the escape hatch is that the *next* bridge field does not need a
+#: gateway release to be accepted.
+BRIDGE_METADATA_PREFIX = "bridge_"
+
+
 class RuntimeContextRequest(StrictModel):
     agent_id: str
     display_name: str | None = None
@@ -326,6 +334,49 @@ class RuntimeContextRequest(StrictModel):
     current_target: str | None = None
     node_id: str | None = None
     capabilities: list[Capability] = Field(default_factory=list)
+    #: Namespaced additive metadata, same shape and same contract as
+    #: ``CreateApprovalRequest.extensions``: a bridge may put anything under its
+    #: own namespace without the gateway needing a matching release. Every other
+    #: unknown field is still a 422 — ``extra="forbid"`` is unchanged here and
+    #: everywhere else.
+    extensions: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _fold_bridge_metadata(cls, data: Any) -> Any:
+        """Absorb legacy flat ``bridge_*`` keys into ``extensions["bridge"]``.
+
+        The deployed act-clearance plugin posts ``bridge_plugin_name`` and
+        ``bridge_plugin_version`` as top-level fields on every context push, so
+        ``extra="forbid"`` rejected the whole body before the route ran and the
+        fleet view froze on hours-old state. This runs *before* the extra-field
+        check, which is what makes acceptance possible without relaxing
+        ``StrictModel``.
+        """
+        if not isinstance(data, dict):
+            return data
+        bridge_keys = [
+            key
+            for key in data
+            if isinstance(key, str)
+            and key.startswith(BRIDGE_METADATA_PREFIX)
+            and len(key) > len(BRIDGE_METADATA_PREFIX)
+        ]
+        if not bridge_keys:
+            return data
+        data = dict(data)
+        extensions = dict(data.get("extensions") or {})
+        # An explicit extensions["bridge"] wins: it is the newer, intended shape.
+        folded = {
+            key.removeprefix(BRIDGE_METADATA_PREFIX): data.pop(key) for key in bridge_keys
+        }
+        bridge_namespace = dict(folded)
+        existing = extensions.get("bridge")
+        if isinstance(existing, dict):
+            bridge_namespace.update(existing)
+        extensions["bridge"] = bridge_namespace
+        data["extensions"] = extensions
+        return data
 
 
 class RuntimeContextResponse(BaseModel):
