@@ -1,6 +1,6 @@
 name: act-clearance
-version: "0.1.0"
-description: "Route risky Hermes tool calls through the Agentic Control Tower for operator approval on a paired Secure-Enclave phone. Registers a pre_tool_call hook that raises an ACT clearance and BLOCKS the tool until the operator approves (fail-closed on deny/expiry/timeout/gateway error). Default-off: requires ACT_CLEARANCE_ENABLED=1 in addition to plugins.enabled."
+version: "0.1.3"
+description: "Route risky Hermes tool calls through the Agentic Control Tower for operator approval on a paired Secure-Enclave phone. Registers a pre_tool_call hook that raises an ACT clearance and BLOCKS the tool until the operator approves (fail-closed on deny/expiry/timeout/gateway error), plus a local-interactive-only `hermes act-pair` QR ceremony. Default-off: requires ACT_CLEARANCE_ENABLED=1 in addition to plugins.enabled."
 author: "Agentic Control Tower (ACT-MOBILE-BETA)"
 kind: standalone
 hooks:

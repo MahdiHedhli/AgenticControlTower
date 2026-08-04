@@ -41,6 +41,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -62,6 +63,11 @@ _DEFAULT_GATED_TOOLS = (
 _DEFAULT_QUESTION_TOOLS = "clarify,ask_operator,ask_user"
 _DEFAULT_QUESTION_RISK_FAMILY = "read_only"
 _DEFAULT_CLEARANCE_RISK_FAMILY = "external_effect"
+# Scope names the tower accepts on a clearance. Anything else is dropped.
+_VALID_SCOPES = ("once", "session", "agent", "permanent")
+_PLUGIN_NAME = "act-clearance"
+_PLUGIN_VERSION = "0.1.3"
+_PLUGIN_MANAGED_FILES = ("__init__.py", "plugin.yaml")
 
 # launchd Label of the supervised gateway (must match act_cli.LAUNCHD_LABEL).
 _GATEWAY_LAUNCHD_LABEL = "app.act.gateway"
@@ -71,8 +77,63 @@ _TRUTHY = {"1", "true", "yes", "on"}
 
 # --- config: ENV > act.toml > built-in default ------------------------------
 
+
 def _act_toml_path() -> Path:
     return Path.home() / ".hermes" / "act" / "act.toml"
+
+
+def _plugin_release_path() -> Path:
+    return Path.home() / ".hermes" / "act" / "plugin-release.json"
+
+
+def _runtime_update_violation() -> Optional[str]:
+    """Verify the loaded hook is the release ACT installed.
+
+    The hard-coded runtime version catches the important hot-update case: the
+    plugin files and manifest may already be new while a long-running Hermes
+    process still has the prior Python module in memory. File hashes also make
+    local drift fail closed at the risky-tool boundary.
+    """
+    try:
+        release = json.loads(_plugin_release_path().read_text())
+    except FileNotFoundError:
+        return (
+            "managed release metadata is missing; run `act install` and restart Hermes"
+        )
+    except (OSError, ValueError, TypeError):
+        return "managed release metadata is unreadable; run `act install` and restart Hermes"
+    if not isinstance(release, dict):
+        return (
+            "managed release metadata is invalid; run `act install` and restart Hermes"
+        )
+    if release.get("schema") != 1 or release.get("name") != _PLUGIN_NAME:
+        return (
+            "managed release identity is invalid; run `act install` and restart Hermes"
+        )
+    managed_version = release.get("version")
+    if managed_version != _PLUGIN_VERSION:
+        return (
+            f"loaded version {_PLUGIN_VERSION} is stale (installed {managed_version!r}); "
+            "restart Hermes"
+        )
+    files = release.get("files")
+    if not isinstance(files, dict):
+        return (
+            "managed release file list is invalid; run `act install` and restart Hermes"
+        )
+    plugin_dir = Path(__file__).resolve().parent
+    for name in _PLUGIN_MANAGED_FILES:
+        record = files.get(name)
+        expected = record.get("sha256") if isinstance(record, dict) else None
+        if not isinstance(expected, str) or len(expected) != 64:
+            return f"managed digest for {name} is invalid; run `act install`"
+        try:
+            actual = hashlib.sha256((plugin_dir / name).read_bytes()).hexdigest()
+        except OSError:
+            return f"managed plugin file {name} is missing; run `act install`"
+        if actual != expected:
+            return f"managed plugin file {name} has integrity drift; run `act install`"
+    return None
 
 
 _TOML_CACHE: Dict[str, Any] = {"loaded": False, "data": {}}
@@ -126,15 +187,35 @@ def _enabled() -> bool:
 
 
 def _gateway() -> str:
-    return (_cfg("ACT_GATEWAY_URL", "gateway_url", _DEFAULT_GATEWAY) or _DEFAULT_GATEWAY).rstrip("/")
+    return (
+        _cfg("ACT_GATEWAY_URL", "gateway_url", _DEFAULT_GATEWAY) or _DEFAULT_GATEWAY
+    ).rstrip("/")
 
 
 def _agent_id() -> str:
     return _cfg("ACT_CLEARANCE_AGENT_ID", "agent_id", "hermes_agent") or "hermes_agent"
 
 
+def _suggested_scopes() -> List[str]:
+    """Scopes offered to the operator on the phone.
+
+    Default stays "once" so enabling standing grants is an explicit opt-in: a
+    scope the plugin never asks for is a scope the operator can never be shown,
+    however well the tower enforces it. Unknown scope names are dropped rather
+    than forwarded, and "once" is always offered so there is never a request the
+    operator can only answer with a standing grant.
+    """
+    raw = _cfg("ACT_CLEARANCE_SUGGESTED_SCOPES", "suggested_scopes", "once") or "once"
+    scopes = [s.strip() for s in raw.split(",") if s.strip() in _VALID_SCOPES]
+    if "once" not in scopes:
+        scopes.insert(0, "once")
+    return scopes
+
+
 def _agent_name() -> str:
-    return _cfg("ACT_CLEARANCE_AGENT_NAME", "agent_name", "Hermes Agent") or "Hermes Agent"
+    return (
+        _cfg("ACT_CLEARANCE_AGENT_NAME", "agent_name", "Hermes Agent") or "Hermes Agent"
+    )
 
 
 def _control_capabilities() -> List[Dict[str, str]]:
@@ -168,14 +249,22 @@ def _is_in(env_name: str, toml_key: str, default: str, tool: str) -> bool:
 
 def _question_risk_family() -> str:
     return (
-        _cfg("ACT_QUESTION_RISK_FAMILY", "question_risk_family", _DEFAULT_QUESTION_RISK_FAMILY)
+        _cfg(
+            "ACT_QUESTION_RISK_FAMILY",
+            "question_risk_family",
+            _DEFAULT_QUESTION_RISK_FAMILY,
+        )
         or _DEFAULT_QUESTION_RISK_FAMILY
     ).strip()
 
 
 def _clearance_risk_family() -> str:
     return (
-        _cfg("ACT_CLEARANCE_RISK_FAMILY", "clearance_risk_family", _DEFAULT_CLEARANCE_RISK_FAMILY)
+        _cfg(
+            "ACT_CLEARANCE_RISK_FAMILY",
+            "clearance_risk_family",
+            _DEFAULT_CLEARANCE_RISK_FAMILY,
+        )
         or _DEFAULT_CLEARANCE_RISK_FAMILY
     ).strip()
 
@@ -196,10 +285,15 @@ def _poll() -> float:
 
 # --- HTTP (stdlib) ----------------------------------------------------------
 
-def _request(method: str, path: str, payload: Optional[Dict[str, Any]], timeout: float) -> Dict[str, Any]:
+
+def _request(
+    method: str, path: str, payload: Optional[Dict[str, Any]], timeout: float
+) -> Dict[str, Any]:
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {"Content-Type": "application/json"} if data is not None else {}
-    req = urllib.request.Request(f"{_gateway()}{path}", data=data, headers=headers, method=method)
+    req = urllib.request.Request(
+        f"{_gateway()}{path}", data=data, headers=headers, method=method
+    )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         body = resp.read().decode("utf-8")
     return json.loads(body) if body else {}
@@ -233,12 +327,20 @@ def _content_hash(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _params_fingerprint(payload_redacted: Dict[str, Any], extensions: Optional[Dict[str, Any]]) -> str:
-    return _content_hash({"payload_redacted": payload_redacted, "extensions": extensions or {}})
+def _params_fingerprint(
+    payload_redacted: Dict[str, Any], extensions: Optional[Dict[str, Any]]
+) -> str:
+    return _content_hash(
+        {"payload_redacted": payload_redacted, "extensions": extensions or {}}
+    )
 
 
 def _derived_short_code(approval_id: str, params_fingerprint: str) -> str:
-    return hashlib.sha256(f"{approval_id}:{params_fingerprint}".encode()).hexdigest()[:10].upper()
+    return (
+        hashlib.sha256(f"{approval_id}:{params_fingerprint}".encode())
+        .hexdigest()[:10]
+        .upper()
+    )
 
 
 def _clearance_violation(
@@ -280,6 +382,7 @@ def _clearance_violation(
 
 # --- redaction --------------------------------------------------------------
 
+
 def _redacted_payload(tool_name: str, args: Any) -> Dict[str, Any]:
     keys: List[str] = []
     if isinstance(args, dict):
@@ -304,12 +407,21 @@ def _block(message: str) -> Dict[str, str]:
 
 # --- monitoring: push real agent/session into ACT ---------------------------
 
+
 def _post_context(**fields: Any) -> None:
     """Best-effort agent/session/mission upsert. Monitoring fails OPEN (never
     blocks the agent)."""
     if not _enabled():
         return
-    payload: Dict[str, Any] = {"agent_id": _agent_id(), "display_name": _agent_name()}
+    payload: Dict[str, Any] = {
+        "agent_id": _agent_id(),
+        "display_name": _agent_name(),
+        # Heartbeat lets the signed mobile status endpoint distinguish updated
+        # files from the older module a long-running Hermes process may still
+        # have loaded in memory.
+        "bridge_plugin_name": _PLUGIN_NAME,
+        "bridge_plugin_version": _PLUGIN_VERSION,
+    }
     payload.update({k: v for k, v in fields.items() if v is not None})
     try:
         _post("/runtime/context", payload, timeout=5.0)
@@ -360,6 +472,7 @@ def _on_session_end(
 
 
 # --- control: interactive question relay (TUA) ------------------------------
+
 
 def _question_text(tool_name: str, args: Any) -> str:
     if isinstance(args, dict):
@@ -417,7 +530,9 @@ def _relay_question(tool_name: str, args: Any, session_id: str) -> Dict[str, str
 _SESSION_BOILERPLATE = "Opened from Agentic Control Tower."
 
 
-def _poll_question_answer(request_id: str, timeout_s: float, poll_s: float) -> Optional[str]:
+def _poll_question_answer(
+    request_id: str, timeout_s: float, poll_s: float
+) -> Optional[str]:
     """Block until the operator answers. The answer is the operator's typed
     message (the createSession boilerplate is ignored). A session returned/closed
     without a typed reply falls back to the return summary."""
@@ -440,14 +555,20 @@ def _poll_question_answer(request_id: str, timeout_s: float, poll_s: float) -> O
             return replies[-1]
         state = latest.get("state") or (result.get("request") or {}).get("state")
         if state in ("returned_to_agent", "closed"):
-            return result.get("return_summary") or "Operator returned control without a message."
+            return (
+                result.get("return_summary")
+                or "Operator returned control without a message."
+            )
         time.sleep(poll_s)
     return None
 
 
 # --- control: clearance gate (existing, fail-closed) ------------------------
 
-def _relay_clearance(tool_name: str, args: Any, session_id: str) -> Optional[Dict[str, str]]:
+
+def _relay_clearance(
+    tool_name: str, args: Any, session_id: str
+) -> Optional[Dict[str, str]]:
     risk_family = _clearance_risk_family()
     timeout_s = _timeout()
     payload_redacted = _redacted_payload(tool_name, args)
@@ -471,7 +592,7 @@ def _relay_clearance(tool_name: str, args: Any, session_id: str) -> Optional[Dic
                 "agent_id": _agent_id(),
                 "session_id": session_id or "hermes_session",
                 "expires_in_seconds": int(timeout_s) + 30,
-                "suggested_scopes": ["once"],
+                "suggested_scopes": _suggested_scopes(),
                 "params_fingerprint": expected_fingerprint,
                 "extensions": extensions,
                 "operator_message": f"Hermes agent requests to run '{tool_name}'.",
@@ -488,7 +609,9 @@ def _relay_clearance(tool_name: str, args: Any, session_id: str) -> Optional[Dic
     poll_s = _poll()
     while time.monotonic() < deadline:
         try:
-            status = _post("/hermes/tools/approval_status", {"approval_id": approval_id})
+            status = _post(
+                "/hermes/tools/approval_status", {"approval_id": approval_id}
+            )
         except (urllib.error.URLError, OSError, ValueError):
             time.sleep(poll_s)
             continue
@@ -496,7 +619,9 @@ def _relay_clearance(tool_name: str, args: Any, session_id: str) -> Optional[Dic
         if state == "approved":
             violation = _clearance_violation(status, approval_id, expected_fingerprint)
             if violation is not None:
-                return _block(f"clearance verification failed (fail-closed): {violation}")
+                return _block(
+                    f"clearance verification failed (fail-closed): {violation}"
+                )
             return None  # allow — verified clearance
         if state in {"denied", "expired", "cancelled"}:
             return _block(f"operator {state} this action on their phone")
@@ -643,7 +768,9 @@ def _on_pre_tool_call(
         _current_session["id"] = session_id
 
     # 1) Interactive question: route the agent's question to the phone.
-    if _is_in("ACT_QUESTION_TOOLS", "question_tools", _DEFAULT_QUESTION_TOOLS, tool_name):
+    if _is_in(
+        "ACT_QUESTION_TOOLS", "question_tools", _DEFAULT_QUESTION_TOOLS, tool_name
+    ):
         return _relay_question(tool_name, args, session_id)
 
     # 2) Monitoring: reflect that the agent is now running this tool (fail-open).
@@ -661,13 +788,21 @@ def _on_pre_tool_call(
         return intervention
 
     # 4) Clearance gate for risky tools (fail-closed).
-    if _is_in("ACT_CLEARANCE_GATED_TOOLS", "gated_tools", _DEFAULT_GATED_TOOLS, tool_name):
+    if _is_in(
+        "ACT_CLEARANCE_GATED_TOOLS", "gated_tools", _DEFAULT_GATED_TOOLS, tool_name
+    ):
+        update_violation = _runtime_update_violation()
+        if update_violation is not None:
+            return _block(
+                f"plugin update check failed (fail-closed): {update_violation}"
+            )
         return _relay_clearance(tool_name, args, session_id)
 
     return None
 
 
 # --- self-heal: cheap is-it-up probe + launchctl kickstart -----------------
+
 
 def _health_url() -> str:
     """Derive the gateway health endpoint from the configured gateway URL.
@@ -715,12 +850,83 @@ def _self_heal_gateway() -> None:
         pass
 
 
+def _local_interactive_terminal() -> bool:
+    """Pairing secrets may only be rendered to a directly attached terminal."""
+    return bool(sys.stdin.isatty() and sys.stdout.isatty())
+
+
+def _run_local_pairing_cli() -> None:
+    """Run ACT's one-time QR ceremony without exposing it as an agent tool.
+
+    This handler is reachable only as ``hermes act-pair``. It is intentionally
+    not a slash command: Hermes plugin slash commands are gateway-dispatchable
+    from chat platforms, where returning an enrollment secret would cross the
+    local-operator trust boundary.
+    """
+    if not _local_interactive_terminal():
+        raise SystemExit(
+            "act-pair: refusing to render an enrollment secret without a local "
+            "interactive terminal"
+        )
+
+    violation = _runtime_update_violation()
+    if violation is not None:
+        raise SystemExit(f"act-pair: {violation}")
+
+    act_cli = Path.home() / ".hermes" / "act" / "venv" / "bin" / "act"
+    if not act_cli.is_file() or not os.access(act_cli, os.X_OK):
+        raise SystemExit(f"act-pair: managed ACT CLI is unavailable at {act_cli}")
+
+    print("This QR can enroll a new operator device with ACT clearance authority.")
+    print("It is one-time, expires after 10 minutes, and must remain private.")
+    if input("Type PAIR to generate it locally: ").strip() != "PAIR":
+        print("Pairing cancelled.")
+        return
+
+    completed = subprocess.run(
+        [str(act_cli), "pair", "--qr"],
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise SystemExit(f"act-pair: ACT exited with status {completed.returncode}")
+
+
+def _register_pairing_cli(ctx) -> None:
+    def setup(_subparser) -> None:
+        # No JSON/export flag by design. The plugin surface renders only a
+        # short-lived QR to a local interactive terminal.
+        return None
+
+    def handler(_args) -> None:
+        _run_local_pairing_cli()
+
+    ctx.register_cli_command(
+        "act-pair",
+        help="Generate a local, one-time ACT mobile pairing QR.",
+        setup_fn=setup,
+        handler_fn=handler,
+        description=(
+            "Operator-only ACT pairing ceremony. Requires a local interactive "
+            "terminal and explicit confirmation; never exposed as an agent tool "
+            "or gateway slash command."
+        ),
+    )
+
+
 def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("on_session_end", _on_session_end)
     ctx.register_hook("transform_terminal_output", _on_transform_terminal_output)
+    # Operator-only bootstrap convenience. Keep this a top-level local CLI
+    # command; register_command() would also expose it through remote gateways.
+    try:
+        _register_pairing_cli(ctx)
+    except Exception:
+        # A convenience command must never prevent the clearance hooks from
+        # loading on an older or partially compatible Hermes runtime.
+        pass
     # Self-heal: once enabled, ensure the supervised gateway is actually up. This
     # is a cheap is-it-up + kickstart on a background thread — non-blocking and
     # fully error-swallowing so it can never raise into the Hermes register path.

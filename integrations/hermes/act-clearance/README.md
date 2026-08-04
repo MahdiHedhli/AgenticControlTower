@@ -12,19 +12,47 @@ first-class control surface for the real Hermes agent. Three planes:
   and block until the operator answers on the phone; the operator's typed reply is
   returned to the agent.
 
-Default-OFF: every hook is a no-op unless `ACT_CLEARANCE_ENABLED=1` (and the plugin is in
-Hermes `plugins.enabled`), so installing the files cannot disrupt a live agent.
+Default-OFF: every hook is a no-op unless `ACT_CLEARANCE_ENABLED=1` or the ACT
+config enables it (and the plugin is in Hermes `plugins.enabled`), so installing
+the files alone cannot disrupt a live agent.
 
 See [docs/implementation/act-010-hermes-control-bridge.md](../../../docs/implementation/act-010-hermes-control-bridge.md)
 (bridge) and [act-009](../../../docs/implementation/act-009-hermes-clearance-plugin.md)
 (clearance) for design + verification.
 
-## Install
+## Install and update
 
 ```sh
-cp -r integrations/hermes/act-clearance ~/.hermes/plugins/act-clearance
-hermes plugins enable act-clearance          # adds it to plugins.enabled (opt-in)
+act install
+act plugin-check
 ```
+
+`act install` copies the bundled plugin into `~/.hermes/plugins/act-clearance`,
+writes an owner-only SHA-256 release manifest, and enables the plugin. Restart
+Hermes after an update so its in-memory module matches the installed release.
+`act plugin-check` is read-only; `act doctor` runs the same version and integrity
+check. The ACT mobile Settings screen also compares the managed, installed, and
+Hermes-loaded versions and alerts when an install or restart is recommended.
+
+Risky tool calls fail closed when the managed manifest is missing, a plugin file
+has drifted, or Hermes still has an older plugin version loaded.
+
+## Pair a phone from Hermes
+
+```sh
+hermes act-pair
+```
+
+This operator-only command requires a directly attached interactive terminal,
+warns that the QR grants clearance authority, requires typing `PAIR`, and then
+renders ACT's one-time 10-minute QR locally. It intentionally offers no JSON or
+redirection mode.
+
+Pairing is **not** registered as an agent tool or `/slash` command. Hermes makes
+plugin slash commands available to gateway sessions such as Discord and Slack;
+returning a device-enrollment secret through those surfaces would cross the
+local-operator trust boundary and could expose it to chat history, logs, or an
+untrusted prompt.
 
 ## Run (default-off until you set the env gate)
 
