@@ -58,6 +58,15 @@ def test_deny_approval(client: TestClient) -> None:
 
 
 def test_scoped_approval_decision_records_session_scope(client: TestClient) -> None:
+    """The decision RECORDS session scope. It does not APPLY it.
+
+    ``create_approval`` here declares ``risk_family="destructive"``, which is
+    above the standing-grant exclusion floor, so ``mint_grant_for_decision``
+    refuses and ``approval_grants`` stays empty. ``applied_scope`` used to echo
+    ``session`` back anyway — the phone said "approved for this session" for an
+    authority that was never granted (0 grant rows against 131 approvals in
+    production). The refusal policy is unchanged; only the reporting is honest.
+    """
     paired = pair_device(client)
     approval = create_approval(client, action_id="act_session_scope")
 
@@ -76,8 +85,12 @@ def test_scoped_approval_decision_records_session_scope(client: TestClient) -> N
     )
 
     assert response.status_code == 200
-    assert response.json()["state"] == "approved"
-    assert response.json()["applied_scope"] == "session"
+    body = response.json()
+    assert body["state"] == "approved"
+    assert body["requested_scope"] == "session"
+    assert body["applied_scope"] == "once"
+    assert body["grant_minted"] is False
+    assert body["grant_refused_reason"] == "risk_family_excluded"
 
     detail = signed_request(
         client,
@@ -110,8 +123,13 @@ def test_scoped_approval_decision_records_agent_scope(client: TestClient) -> Non
     )
 
     assert response.status_code == 200
-    assert response.json()["state"] == "approved"
-    assert response.json()["applied_scope"] == "agent"
+    body = response.json()
+    assert body["state"] == "approved"
+    # Same story as the session-scope case: recorded, refused, reported honestly.
+    assert body["requested_scope"] == "agent"
+    assert body["applied_scope"] == "once"
+    assert body["grant_minted"] is False
+    assert body["grant_refused_reason"] == "risk_family_excluded"
 
 
 def test_params_fingerprint_is_returned_and_bound_to_decision(client: TestClient) -> None:

@@ -3092,8 +3092,9 @@ def _transition_approval(
     # explicit, hard-expiring, revocable grant instead of leaving
     # decision_scope as a write nothing ever reads.
     grant: dict[str, Any] | None = None
+    grant_refused_reason: str | None = None
     if target_state == "approved":
-        grant = mint_grant_for_decision(
+        grant, grant_refused_reason = mint_grant_for_decision(
             store=store,
             settings=settings,
             approval=approval,
@@ -3131,10 +3132,28 @@ def _transition_approval(
         event_type="approval.resolved",
         payload={"approval_id": approval_id, "state": target_state, "scope": scope},
     )
+    # Report the scope that was ACTUALLY applied, not the one that was asked for.
+    # `applied_scope=scope` was unconditional, so an operator tapping "approve for
+    # this session" on a request whose risk family can never carry standing
+    # authority got `applied_scope: "session"` back and the phone said the session
+    # was approved — while `approval_grants` stayed empty (0 rows lifetime against
+    # 131 approvals). What actually happened in that case is a one-time approval,
+    # so that is what we say. `grant_minted` + `grant_refused_reason` make the
+    # difference between "you asked for once" and "the gateway refused standing
+    # authority, here is why" legible to the client rather than inferable.
+    #
+    # NOT a policy change: the refusal itself is untouched, only the reporting of
+    # it. Which requests may carry standing authority stays an operator decision.
+    # Only an approval can apply a scope, so deny/expire/cancel keep reporting
+    # exactly what they reported before ("once" and null respectively).
+    applied_scope = scope if (grant is not None or target_state != "approved") else "once"
     return ApprovalDecisionResponse(
         approval_id=approval_id,
         state=target_state,  # type: ignore[arg-type]
-        applied_scope=scope,  # type: ignore[arg-type]
+        applied_scope=applied_scope,  # type: ignore[arg-type]
+        requested_scope=scope,  # type: ignore[arg-type]
+        grant_minted=grant is not None,
+        grant_refused_reason=grant_refused_reason,
     )
 
 

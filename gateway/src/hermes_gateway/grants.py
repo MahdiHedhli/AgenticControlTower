@@ -31,7 +31,7 @@ Device revocation cascades to standing grants, in two independent layers:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 from .capability_registry import RISK_FAMILY_RANKS
 from .clearance_policy import (
@@ -316,6 +316,20 @@ def standing_grant_block_reason(
 # ---------------------------------------------------------------------------
 
 
+class GrantOutcome(NamedTuple):
+    """What a decision actually did about standing authority.
+
+    ``refused_reason`` exists because the caller must be able to tell the
+    operator the truth. "No grant" has two very different meanings — ``once``
+    asked for none, or a grantable scope was refused by policy — and collapsing
+    them to ``None`` is what let the API report a session-wide approval that had
+    not been granted.
+    """
+
+    grant: dict[str, Any] | None
+    refused_reason: str | None
+
+
 def mint_grant_for_decision(
     *,
     store: SQLiteStore,
@@ -324,16 +338,17 @@ def mint_grant_for_decision(
     scope: str | None,
     request_id: str,
     decided_by_device_id: str | None,
-) -> dict[str, Any] | None:
+) -> GrantOutcome:
     """Create the standing grant implied by an approval decision.
 
-    Returns the grant, or ``None`` when the decision does not (or must not)
-    produce one. Refusals for a reason the operator would care about are
+    Returns the grant, or a refusal reason when the decision does not (or must
+    not) produce one. Refusals for a reason the operator would care about are
     audited as ``capability_grant_refused``; plain ``once`` is not, because
-    "no standing authority" is the normal case, not an event.
+    "no standing authority" is the normal case, not an event — and it comes
+    back with a ``None`` reason for exactly that reason.
     """
     if scope not in GRANTABLE_SCOPES:
-        return None
+        return GrantOutcome(None, None)
 
     reason = standing_grant_block_reason(
         store=store,
@@ -365,7 +380,7 @@ def mint_grant_for_decision(
                 "risk_family": approval.get("risk_family"),
             },
         )
-        return None
+        return GrantOutcome(None, reason)
 
     scoped = _scope_key_fields_for_decision(approval, scope)
     grant = store.create_approval_grant(
@@ -419,7 +434,7 @@ def mint_grant_for_decision(
             "expires_at": grant["expires_at"],
         },
     )
-    return grant
+    return GrantOutcome(grant, None)
 
 
 def _scope_key_fields_for_decision(approval: dict[str, Any], scope: str) -> dict[str, Any]:

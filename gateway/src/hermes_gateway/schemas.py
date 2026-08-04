@@ -519,7 +519,21 @@ class ApprovalDecisionRequest(StrictModel):
 class ApprovalDecisionResponse(BaseModel):
     approval_id: str
     state: ApprovalState
+    #: What the gateway ACTUALLY applied. On an approval this is the requested
+    #: scope only when a standing grant was really minted; otherwise ``once``,
+    #: because a one-time approval is what happened. It used to echo the request
+    #: unconditionally, so "approve for this session" reported success while
+    #: ``approval_grants`` stayed empty.
     applied_scope: ApprovalScope | None = None
+    #: What the operator asked for, kept alongside so a client can show
+    #: "you asked for session, you got once" without guessing.
+    requested_scope: ApprovalScope | None = None
+    grant_minted: bool = False
+    #: Why standing authority was refused (e.g. ``risk_family_excluded``,
+    #: ``channel_requirement``, ``standing_grants_disabled``). ``None`` when a
+    #: grant was minted, and also when ``once`` was requested — asking for no
+    #: standing authority is not a refusal.
+    grant_refused_reason: str | None = None
 
 
 class LocalTerminalApprovalDecisionRequest(StrictModel):

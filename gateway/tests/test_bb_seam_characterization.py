@@ -376,7 +376,14 @@ class TestCurrentChannelPolicy:
         assert result["applied_scope"] == "once"
 
     def test_decisions_endpoint_records_arbitrary_scope(self, client: TestClient) -> None:
-        """POST /v1/approvals/{id}/decisions records requested scope."""
+        """POST /v1/approvals/{id}/decisions records the requested scope.
+
+        RECORDS it — ``decision_scope`` — which is not the same as APPLYING it.
+        This fixture's risk family is ``external_effect``, which is
+        mobile-mandatory and therefore can never carry standing authority, so
+        no grant is minted and ``applied_scope`` is ``once``. It used to echo
+        ``session`` back regardless.
+        """
         paired = pair_device(client)
         approval = create_approval(client, action_id="act_channel_decisions")
 
@@ -397,7 +404,10 @@ class TestCurrentChannelPolicy:
         assert response.status_code == 200
         result = response.json()
         assert result["state"] == "approved"
-        assert result["applied_scope"] == "session"
+        assert result["requested_scope"] == "session"
+        assert result["applied_scope"] == "once"
+        assert result["grant_minted"] is False
+        assert result["grant_refused_reason"] == "channel_requirement"
 
     def test_deny_endpoint_creates_denied_state(self, client: TestClient) -> None:
         """POST /v1/approvals/{id}/deny creates denied state."""
