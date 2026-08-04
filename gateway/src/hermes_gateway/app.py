@@ -128,6 +128,67 @@ DEFAULT_PERMISSIONS = ["read_state", "chat", "approve", "intervene"]
 
 logger = logging.getLogger("hermes_gateway")
 
+#: Caps on what one rejected request body may write into ``gateway.err.log``.
+#: A 422's field names are CALLER-CONTROLLED TEXT: under ``extra="forbid"``
+#: pydantic puts the caller's own unknown JSON key into ``loc``, and the
+#: unauthenticated endpoints (``POST /v1/pairing/start``) validate the body
+#: before anything authenticates. Bound it on every axis — characters per name,
+#: names per request, and (via escaping) which characters may appear at all.
+MAX_LOGGED_FIELD_NAME_CHARS = 64
+MAX_LOGGED_FIELD_NAMES = 10
+MAX_LOGGED_PATH_CHARS = 128
+
+#: Fields whose CHILD keys are caller-chosen namespaces rather than
+#: schema-defined names. ADR-0005 is "field NAMES only, never values", and a
+#: namespace the caller invented is its data, not our schema — so a ``loc`` path
+#: stops at the field and the caller's key never reaches a log record.
+CALLER_KEYED_FIELDS = frozenset({"extensions"})
+
+
+def _sanitize_log_fragment(value: object, *, limit: int = MAX_LOGGED_FIELD_NAME_CHARS) -> str:
+    """Make one caller-derived fragment safe to place in a log record.
+
+    Two things a raw field name does to ``gateway.err.log``. A ``\\n`` plus a
+    fake level prefix forges whole records byte-identical in form to real
+    gateway output — proven against ``POST /v1/pairing/start``, which needs no
+    credentials, so anyone who can reach the port can write the file this
+    project cites as forensic evidence. And a name is unbounded, so a single
+    200 KB JSON key wrote ~200 KB of log: an unauthenticated disk-fill and
+    log-rotation-defeat amplifier.
+
+    ``repr`` closes the first — every control character comes back as an escape
+    sequence, so a record separator cannot be spelled at all. The two slices
+    close the second, before *and* after escaping, so neither the input nor its
+    escape expansion is unbounded.
+    """
+    text = value if isinstance(value, str) else str(value)
+    truncated = len(text) > limit
+    # Slice first: escaping 200 KB only to throw it away is the amplifier again.
+    escaped = repr(text[:limit])[1:-1]
+    if len(escaped) > limit:
+        escaped = escaped[:limit]
+        truncated = True
+    return f"{escaped}~truncated" if truncated else escaped
+
+
+def _rejected_field_names(errors: list[Any]) -> list[str]:
+    """Sanitized, deduplicated dotted field names from a validation error."""
+    names: set[str] = set()
+    for error in errors:
+        parts: list[str] = []
+        for part in error.get("loc", ()):
+            if part == "body":
+                continue
+            parts.append(_sanitize_log_fragment(part))
+            if part in CALLER_KEYED_FIELDS:
+                # Everything below here is a caller-invented namespace, not a
+                # field name. "extensions.<redacted>" says where the break is
+                # without logging the caller's key.
+                parts.append("<redacted>")
+                break
+        names.add(".".join(parts) or "<body>")
+    return sorted(names)
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
     ClearanceChannelPolicy.from_settings(resolved_settings)
@@ -210,20 +271,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         reconstructed from a frozen UI.
 
         Field NAMES only — never the values, which can carry request payload
-        content (ADR-0005).
+        content (ADR-0005). And every fragment that reaches the record is
+        caller-controlled, so all of them go through
+        :func:`_sanitize_log_fragment` first: on an unauthenticated endpoint a
+        field name carrying ``\\n`` forged whole WARNING/INFO records into this
+        very file, and an unbounded one wrote its own length to disk. One
+        request must produce exactly one log line, of bounded size.
         """
-        fields = sorted(
-            {
-                ".".join(str(part) for part in error.get("loc", ()) if part != "body")
-                or "<body>"
-                for error in exc.errors()
-            }
-        )
+        fields = _rejected_field_names(exc.errors())
+        shown = fields[:MAX_LOGGED_FIELD_NAMES]
+        overflow = len(fields) - len(shown)
         logger.warning(
-            "rejected request body: %s %s (422) offending_fields=%s",
-            request.method,
-            request.url.path,
-            ",".join(fields) or "<unknown>",
+            "rejected request body: %s %s (422) offending_fields=%s%s",
+            _sanitize_log_fragment(request.method, limit=16),
+            # Path params are caller text too, and a matched route can carry a
+            # percent-decoded newline in one.
+            _sanitize_log_fragment(request.url.path, limit=MAX_LOGGED_PATH_CHARS),
+            ",".join(shown) or "<unknown>",
+            f" (+{overflow} more)" if overflow else "",
         )
         return await request_validation_exception_handler(request, exc)
 
