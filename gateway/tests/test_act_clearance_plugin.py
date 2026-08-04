@@ -24,6 +24,13 @@ from hermes_gateway.clearance_contract import (
     build_params_fingerprint,
     build_short_code,
 )
+from hermes_gateway.capability_registry import RISK_FAMILY_RANKS
+from hermes_gateway.clearance_policy import (
+    ALL_RISK_FAMILIES,
+    LOW_RISK_FAMILIES,
+    MOBILE_MANDATORY_RISK_FAMILIES,
+)
+from hermes_gateway.grants import GRANT_UNGRANTABLE_RISK_FAMILIES
 from hermes_gateway.security import canonical_json, content_hash
 
 _PLUGIN_PATH = (
@@ -198,3 +205,47 @@ def test_relay_clearance_verification_binds_short_code(
     assert result is not None
     assert result["action"] == "block"
     assert "short_code mismatch" in result["message"]
+
+
+# --- PARITY: risk-family vocabulary -----------------------------------------
+#
+# The plugin classifies each gated tool into a tower risk family and compares
+# families by rank, so it mirrors the canonical ladder. A family added or
+# re-ranked on the gateway side without the mirror being updated would silently
+# mis-classify every clearance, so pin them together here.
+
+
+def test_risk_family_rank_parity() -> None:
+    assert plugin._RISK_FAMILY_RANKS == RISK_FAMILY_RANKS
+
+
+def test_mobile_mandatory_family_parity() -> None:
+    assert set(plugin._MOBILE_MANDATORY_RISK_FAMILIES) == MOBILE_MANDATORY_RISK_FAMILIES
+
+
+def test_plugin_tool_families_are_real_tower_families() -> None:
+    assert set(plugin._TOOL_RISK_FAMILIES.values()) <= ALL_RISK_FAMILIES
+
+
+def test_gated_tools_are_never_grant_eligible_by_default() -> None:
+    """Every tool the plugin gates must, absent a per-call read-only proof, land
+    in a family the tower refuses to satisfy from a standing grant. This is the
+    invariant the honest per-tool map must not accidentally break."""
+    for tool, family in plugin._TOOL_RISK_FAMILIES.items():
+        assert family in GRANT_UNGRANTABLE_RISK_FAMILIES, tool
+
+
+def test_provably_read_only_shell_command_is_grant_eligible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The point of the change: `git status` on a shell tool must classify into a
+    family the tower CAN mint a standing grant for."""
+    # Hermetic: never read the developer's real ~/.hermes/act/act.toml or env.
+    monkeypatch.setitem(plugin._TOML_CACHE, "loaded", True)
+    monkeypatch.setitem(plugin._TOML_CACHE, "data", {})
+    for key in list(plugin.os.environ):
+        if key.startswith("ACT_CLEARANCE_"):
+            monkeypatch.delenv(key, raising=False)
+    family = plugin._risk_family_for_tool("terminal", {"command": "git status"})
+    assert family in LOW_RISK_FAMILIES
+    assert family not in GRANT_UNGRANTABLE_RISK_FAMILIES

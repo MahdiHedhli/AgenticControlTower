@@ -632,7 +632,14 @@ def generate_act_toml(
     Hermes bridges with NO env once this file exists and ``enabled = true``.
 
     Precedence at read time is ENV > act.toml > plugin default; this writer
-    emits the act.toml layer. Values default to the plugin's own built-ins."""
+    emits the act.toml layer. Values default to the plugin's own built-ins.
+
+    ``clearance_risk_family`` is the floor for gated tools the plugin's per-tool
+    risk map does not classify — NOT a blanket family for every tool. It was the
+    blanket once, and stamping the blanket value here is exactly why the plugin
+    refuses to read it as one: an installed default must not be able to override
+    the honest per-tool classification (or the per-call read-only downgrade that
+    makes standing grants reachable at all)."""
     gated = gated_tools if gated_tools is not None else ACT_DEFAULT_GATED_TOOLS
     questions = question_tools if question_tools is not None else ACT_DEFAULT_QUESTION_TOOLS
     gated_list = ", ".join(_toml_str(t) for t in gated)
@@ -649,6 +656,10 @@ def generate_act_toml(
                 f"gated_tools = [{gated_list}]",
                 f"question_tools = [{question_list}]",
                 f"question_risk_family = {_toml_str(question_risk_family)}",
+                "# Floor for gated tools the plugin's per-tool risk map does not",
+                "# know about. It does NOT flatten the map or override the plugin's",
+                "# per-call read-only classification; use `min_risk_family` for a",
+                "# blanket tighten-only floor across every gated tool.",
                 f"clearance_risk_family = {_toml_str(clearance_risk_family)}",
             ]
         )

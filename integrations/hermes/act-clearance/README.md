@@ -37,6 +37,52 @@ Hermes-loaded versions and alerts when an install or restart is recommended.
 Risky tool calls fail closed when the managed manifest is missing, a plugin file
 has drifted, or Hermes still has an older plugin version loaded.
 
+## Risk classification (what the operator can actually grant)
+
+Each gated tool is classified by its **capability ceiling**, not its typical use:
+
+| Tools | Risk family |
+| --- | --- |
+| `delete_file`, `write_file`, `edit_file`, `apply_patch` | `destructive` |
+| `git_push`, `send_email`, `browser_submit` | `external_effect` |
+| `terminal`, `bash`, `shell`, `execute_command`, `run_command`, `execute_code` | `external_effect` (**floor** — the ceiling is unbounded) |
+| anything else gated | `external_effect` |
+
+All of those are mobile-mandatory, so the tower will never satisfy them from a
+standing grant — approving "for this session" on the phone correctly yields
+nothing but a single-use clearance.
+
+**The exception that makes standing grants usable:** when a shell tool's command
+is *provably* read-only it is classified `read_only` for that call, which is
+grant-eligible. "Provably" is a fail-closed allowlist, not a filter:
+
+- an allowlist of characters — any shell metacharacter, escape, newline, control
+  character, or non-ASCII codepoint rejects the command outright, so a pipeline
+  or `;`-chain can never be classified read-only even if every element is safe;
+- an allowlist of programs (`git`, `ls`, `cat`, `head`, `tail`, `wc`, `du`,
+  `pwd`, `which`, `file`, `stat`), git subcommands (`status`, `log`, `diff`,
+  `branch`, `show`, `rev-parse`, `describe`, `remote`), and **flags per
+  program** — a flag nobody allowlisted is simply not classifiable;
+- no top-level `git` flags at all, which forecloses `-c` config injection,
+  `--exec-path`, `-C` and `--git-dir` retargeting;
+- operands that look like credential paths (`.env`, `.ssh`, `id_rsa`, `.pem`,
+  `token`, `secret`, …) fall back to the floor;
+- `execute_code` is never classified: no allowlist over source text can prove a
+  program read-only.
+
+Anything the classifier does not positively recognise — including an unparsable,
+missing, non-string, or ambiguous command argument — stays at the floor.
+
+Overrides (ENV > `act.toml`) may **tighten only**:
+
+- `ACT_CLEARANCE_RISK_FAMILY_<TOOL>` / `[tool_risk_families]` — per tool;
+- `ACT_CLEARANCE_MIN_RISK_FAMILY` / `min_risk_family` — blanket floor;
+- `ACT_CLEARANCE_RISK_FAMILY` / `clearance_risk_family` — floor for **unclassified**
+  tools only. It is not a blanket: `act install` stamps it with the historical
+  value, and honouring that as a blanket would silently restore the original bug.
+
+A family name that is unknown, or that would lower a tool's family, is ignored.
+
 ## Pair a phone from Hermes
 
 ```sh

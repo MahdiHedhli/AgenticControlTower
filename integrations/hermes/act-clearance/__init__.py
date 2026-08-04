@@ -29,10 +29,13 @@ gateway is also kept up via a best-effort self-heal on register().
 Env: ACT_CLEARANCE_ENABLED, ACT_GATEWAY_URL (default http://127.0.0.1:8788/v1),
 ACT_CLEARANCE_AGENT_ID (default hermes_agent), ACT_CLEARANCE_AGENT_NAME,
 ACT_CLEARANCE_GATED_TOOLS, ACT_QUESTION_TOOLS (default clarify,ask_operator,ask_user),
-ACT_QUESTION_RISK_FAMILY, ACT_CLEARANCE_RISK_FAMILY, ACT_CLEARANCE_TIMEOUT,
+ACT_QUESTION_RISK_FAMILY, ACT_CLEARANCE_RISK_FAMILY (floor for UNCLASSIFIED gated
+tools only), ACT_CLEARANCE_RISK_FAMILY_<TOOL> (per-tool tighten-only override),
+ACT_CLEARANCE_MIN_RISK_FAMILY (blanket tighten-only floor), ACT_CLEARANCE_TIMEOUT,
 ACT_CLEARANCE_POLL.
 act.toml keys: enabled, gateway_url, agent_id, agent_name, gated_tools,
-question_tools, question_risk_family, clearance_risk_family.
+question_tools, question_risk_family, clearance_risk_family, min_risk_family,
+[tool_risk_families] (per-tool table).
 """
 
 from __future__ import annotations
@@ -40,6 +43,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -62,11 +67,13 @@ _DEFAULT_GATED_TOOLS = (
 )
 _DEFAULT_QUESTION_TOOLS = "clarify,ask_operator,ask_user"
 _DEFAULT_QUESTION_RISK_FAMILY = "read_only"
+# Floor for a gated tool the map below does not know about. An unclassified
+# risky tool must never land in a grant-eligible family.
 _DEFAULT_CLEARANCE_RISK_FAMILY = "external_effect"
 # Scope names the tower accepts on a clearance. Anything else is dropped.
 _VALID_SCOPES = ("once", "session", "agent", "permanent")
 _PLUGIN_NAME = "act-clearance"
-_PLUGIN_VERSION = "0.1.3"
+_PLUGIN_VERSION = "0.1.4"
 _PLUGIN_MANAGED_FILES = ("__init__.py", "plugin.yaml")
 
 # launchd Label of the supervised gateway (must match act_cli.LAUNCHD_LABEL).
@@ -258,17 +265,6 @@ def _question_risk_family() -> str:
     ).strip()
 
 
-def _clearance_risk_family() -> str:
-    return (
-        _cfg(
-            "ACT_CLEARANCE_RISK_FAMILY",
-            "clearance_risk_family",
-            _DEFAULT_CLEARANCE_RISK_FAMILY,
-        )
-        or _DEFAULT_CLEARANCE_RISK_FAMILY
-    ).strip()
-
-
 def _timeout() -> float:
     try:
         return float(os.getenv("ACT_CLEARANCE_TIMEOUT", "180"))
@@ -281,6 +277,551 @@ def _poll() -> float:
         return float(os.getenv("ACT_CLEARANCE_POLL", "2"))
     except ValueError:
         return 2.0
+
+
+# --- risk classification: per-tool families + read-only shell classifier -----
+#
+# Why this exists: a blanket ``external_effect`` on every gated tool was both
+# dishonest and useless. Dishonest because `delete_file` is not the same risk as
+# `git status`; useless because `external_effect` is in the tower's
+# MOBILE_MANDATORY_RISK_FAMILIES, so EVERY clearance this plugin raised was
+# structurally ineligible for a standing grant — the operator could pick "for
+# this session" on the phone and the tower would refuse it
+# (capability_grant_refused / channel_requirement). This module now says what
+# each tool can actually do, and computes a per-call downgrade for shell
+# invocations that are PROVABLY read-only.
+
+#: Mirror of hermes_gateway.capability_registry.RISK_FAMILY_RANKS. Duplicated
+#: (not imported) because this plugin is stdlib-only and loads inside an
+#: arbitrary Hermes venv with no ACT package on sys.path. A parity test in the
+#: ACT repo pins the two together — change BOTH sides.
+_RISK_FAMILY_RANKS: Dict[str, int] = {
+    "observe": 0,
+    "read_only": 1,
+    "routine": 2,
+    "external_effect": 3,
+    "destructive": 4,
+    "credential_or_secret": 5,
+    "safety_critical": 6,
+    "irreversible": 7,
+}
+
+#: Families the tower will never satisfy from a standing grant (mirror of
+#: clearance_policy.MOBILE_MANDATORY_RISK_FAMILIES). Informational here: the
+#: plugin does not enforce it, it just must not pretend a tool is below it.
+_MOBILE_MANDATORY_RISK_FAMILIES = frozenset(
+    {
+        "external_effect",
+        "destructive",
+        "credential_or_secret",
+        "safety_critical",
+        "irreversible",
+    }
+)
+
+#: Per-tool CAPABILITY CEILING — what the tool *can* do, not what this call is
+#: likely doing. Rationale per group:
+#:
+#: * Shell / arbitrary execution: the ceiling is unbounded (any binary, any
+#:   network egress, any deletion), so ``external_effect`` is a FLOOR rather than
+#:   a description. Ranking them ``irreversible`` would be more honest about the
+#:   ceiling but would make every terminal call read as maximally severe on the
+#:   phone and destroy the signal that separates them from ``delete_file``;
+#:   ``external_effect`` is already mobile-mandatory, so nothing is unlocked by
+#:   the lower rank. Individual invocations that are provably read-only are
+#:   downgraded per-call by :func:`_is_provably_read_only_command`.
+#: * Local file mutation: ``destructive`` rather than ``irreversible``.
+#:   ``irreversible`` is the top of the tower's ladder and is reserved for
+#:   effects with no local undo path at all; a clobbered or deleted working-tree
+#:   file destroys prior content, which is exactly what ``destructive`` names.
+#:   Both sit above the tower's standing-grant exclusion floor
+#:   (rank >= destructive), so the security outcome is identical and the lower of
+#:   the two keeps ``irreversible`` meaningful for things that truly cannot be
+#:   undone.
+#: * Effects that leave this machine: ``external_effect``, the family the tower
+#:   defines for exactly that.
+_TOOL_RISK_FAMILIES: Dict[str, str] = {
+    "terminal": "external_effect",
+    "bash": "external_effect",
+    "shell": "external_effect",
+    "execute_command": "external_effect",
+    "run_command": "external_effect",
+    "execute_code": "external_effect",
+    "write_file": "destructive",
+    "edit_file": "destructive",
+    "apply_patch": "destructive",
+    "delete_file": "destructive",
+    "git_push": "external_effect",
+    "send_email": "external_effect",
+    "browser_submit": "external_effect",
+}
+
+#: Family -> scalar risk_level sent alongside it. The tower prefers a valid
+#: ``risk_family`` and only falls back to ``risk_level``, but shipping
+#: ``risk_level="high"`` next to ``risk_family="read_only"`` would be a lie to
+#: the notification composer, so the two are derived from one source.
+_RISK_LEVEL_FOR_FAMILY: Dict[str, str] = {
+    "observe": "low",
+    "read_only": "low",
+    "routine": "medium",
+    "external_effect": "high",
+    "destructive": "critical",
+    "credential_or_secret": "critical",
+    "safety_critical": "critical",
+    "irreversible": "critical",
+}
+
+#: Tools whose arguments carry a SHELL COMMAND LINE that the classifier below can
+#: reason about. ``execute_code`` is deliberately absent: its payload is a
+#: program in a general-purpose language, and no allowlist over source text can
+#: prove that read-only.
+_SHELL_CLASSIFIABLE_TOOLS = frozenset(
+    {"terminal", "bash", "shell", "execute_command", "run_command"}
+)
+
+#: Argument keys that may carry the command string. Exactly one must be present.
+_SHELL_COMMAND_KEYS = ("command", "cmd")
+
+#: Every other key permitted to appear alongside it. An unrecognised key may
+#: change execution semantics (``shell``, ``env``, ``stdin``, ``args``...), and an
+#: unknown key means we cannot claim to know what will run — so its presence
+#: fails closed to the floor.
+_SHELL_BENIGN_ARG_KEYS = frozenset(
+    {
+        "command",
+        "cmd",
+        "cwd",
+        "workdir",
+        "working_directory",
+        "directory",
+        "timeout",
+        "timeout_ms",
+        "timeout_seconds",
+        "description",
+        "explanation",
+        "session_id",
+    }
+)
+
+#: ALLOWLIST of characters a provably-read-only command may contain. Everything
+#: else — every shell metacharacter (``; | & $ ` > < ( ) { } [ ] * ? ~ ! #``),
+#: the backslash escape, newline/carriage return, control characters, and every
+#: non-ASCII codepoint (so NBSP / RTL-override / homoglyph tricks cannot smuggle
+#: anything past the parser) — is rejected. An allowlist is used rather than a
+#: denylist precisely because the denylist can never be finished.
+_SAFE_COMMAND_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
+    " _-./:=,+@'\""
+)
+
+_MAX_COMMAND_CHARS = 2048
+_MAX_COMMAND_TOKENS = 32
+
+#: Substrings that make an operand look like it addresses a credential store.
+#: Reading a secret has no side effect, but the tower has a dedicated
+#: ``credential_or_secret`` family and calling such a read "read_only" would be
+#: the same category error this change exists to fix. Deliberately over-broad:
+#: a false positive costs a standing grant, a false negative leaks a key.
+_SENSITIVE_OPERAND_MARKERS = (
+    ".env",
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".kube",
+    ".docker",
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    "credential",
+    "secret",
+    "passwd",
+    "password",
+    "shadow",
+    "keychain",
+    "keyring",
+    "token",
+    "apikey",
+    "api_key",
+)
+
+_NUMERIC_SHORT_FLAG = re.compile(r"-[0-9]{1,6}")
+
+
+def _cmd_spec(
+    flags: Any = (),
+    operands: bool = False,
+    numeric_short_flags: bool = False,
+) -> Dict[str, Any]:
+    return {
+        "flags": frozenset(flags),
+        "operands": operands,
+        "numeric_short_flags": numeric_short_flags,
+    }
+
+
+#: Read-only programs and the ONLY flags each may carry.
+#:
+#: Per-program flag ALLOWLISTS, not a denylist of dangerous flags. A denylist has
+#: to enumerate ``-o/--output``, ``--exec``, ``-exec``, ``--write``, ``-i``,
+#: ``--upload-pack``, ``--ext-diff``, pager/editor overrides, and whatever the
+#: next release of the tool adds — and a single miss is an arbitrary write. An
+#: allowlist is wrong in the safe direction: a flag nobody thought about is
+#: simply not classifiable, and the call falls back to the floor.
+_READ_ONLY_PROGRAMS: Dict[str, Dict[str, Any]] = {
+    "pwd": _cmd_spec(),
+    "which": _cmd_spec(flags=("-a",), operands=True),
+    "file": _cmd_spec(flags=("-b", "-i", "-h", "-L"), operands=True),
+    # No flags: macOS `stat -f` takes a format string and GNU `stat -f` reports a
+    # filesystem; neither is worth the parsing surface.
+    "stat": _cmd_spec(operands=True),
+    "ls": _cmd_spec(
+        flags=(
+            "-l",
+            "-a",
+            "-A",
+            "-la",
+            "-al",
+            "-lA",
+            "-h",
+            "-lh",
+            "-hl",
+            "-lah",
+            "-1",
+            "-t",
+            "-r",
+            "-S",
+            "-R",
+            "-F",
+            "-d",
+            "-ltr",
+            "-lrt",
+            "--color=never",
+            "--color=auto",
+        ),
+        operands=True,
+    ),
+    "wc": _cmd_spec(flags=("-l", "-w", "-c", "-m"), operands=True),
+    "du": _cmd_spec(flags=("-h", "-s", "-sh", "-hs", "-c", "-a", "-d"), operands=True),
+    "cat": _cmd_spec(flags=("-n", "-b", "-s"), operands=True),
+    "head": _cmd_spec(
+        flags=("-n", "-c", "-q", "-v"), operands=True, numeric_short_flags=True
+    ),
+    # `-f` (follow) is absent on purpose: it never returns.
+    "tail": _cmd_spec(
+        flags=("-n", "-c", "-q", "-v"), operands=True, numeric_short_flags=True
+    ),
+}
+
+#: git is special-cased: argv[1] must be one of these subcommands, and NO
+#: top-level git flag is accepted at all. That single rule kills ``git -c
+#: core.pager=...`` / ``-c alias.x=!sh`` config injection, ``--exec-path``,
+#: ``-C``, ``--git-dir`` and ``--work-tree`` retargeting in one line rather than
+#: leaving them to be individually remembered.
+#:
+#: Residual risk, accepted and documented: git honours the *repository's*
+#: ``.git/config`` (pager, external diff drivers), so running git inside a
+#: hostile repository is not provably side-effect-free no matter what this
+#: classifier does. ``--no-ext-diff`` is allowlisted so a caller can say so, and
+#: git run non-interactively does not spawn a pager. Cloning a hostile repo is
+#: itself a gated action.
+_GIT_SUBCOMMANDS: Dict[str, Dict[str, Any]] = {
+    "status": _cmd_spec(
+        flags=(
+            "-s",
+            "--short",
+            "--porcelain",
+            "-b",
+            "--branch",
+            "--long",
+            "--no-color",
+            "-uno",
+            "-unormal",
+            "-uall",
+            "--untracked-files=no",
+            "--untracked-files=normal",
+            "--untracked-files=all",
+        )
+    ),
+    "log": _cmd_spec(
+        flags=(
+            "--oneline",
+            "--stat",
+            "--numstat",
+            "--shortstat",
+            "--name-only",
+            "--name-status",
+            "--graph",
+            "--decorate",
+            "--no-decorate",
+            "--no-color",
+            "--abbrev-commit",
+            "--no-merges",
+            "--merges",
+            "--first-parent",
+            "--reverse",
+            "--no-ext-diff",
+            "-n",
+            "--date=short",
+            "--date=iso",
+            "--date=relative",
+            "--pretty=oneline",
+            "--pretty=short",
+            "--pretty=medium",
+            "--pretty=full",
+        ),
+        operands=True,
+        numeric_short_flags=True,
+    ),
+    "diff": _cmd_spec(
+        flags=(
+            "--stat",
+            "--numstat",
+            "--shortstat",
+            "--cached",
+            "--staged",
+            "--name-only",
+            "--name-status",
+            "--no-color",
+            "--no-ext-diff",
+            "--check",
+            "-w",
+            "--ignore-all-space",
+        ),
+        operands=True,
+    ),
+    "show": _cmd_spec(
+        flags=(
+            "--stat",
+            "--numstat",
+            "--name-only",
+            "--name-status",
+            "--oneline",
+            "--no-color",
+            "--no-ext-diff",
+            "--pretty=oneline",
+            "--pretty=short",
+        ),
+        operands=True,
+    ),
+    # No operands: `git branch <name>` CREATES a branch, and `-d/-m/-u` are
+    # absent from the flag allowlist.
+    "branch": _cmd_spec(
+        flags=(
+            "-a",
+            "--all",
+            "-r",
+            "--remotes",
+            "-v",
+            "-vv",
+            "--list",
+            "--show-current",
+            "--no-color",
+        )
+    ),
+    "rev-parse": _cmd_spec(
+        flags=(
+            "--abbrev-ref",
+            "--short",
+            "--show-toplevel",
+            "--git-dir",
+            "--is-inside-work-tree",
+            "--verify",
+            "--quiet",
+        ),
+        operands=True,
+    ),
+    "describe": _cmd_spec(
+        flags=("--tags", "--always", "--dirty", "--long"), operands=True
+    ),
+    # No operands: `git remote add|remove|set-url` are all positional.
+    "remote": _cmd_spec(flags=("-v", "--verbose")),
+}
+
+
+def _rank(family: str) -> int:
+    """Rank of a family; an unknown name ranks at the floor, never below it."""
+    return _RISK_FAMILY_RANKS.get(family, _RISK_FAMILY_RANKS["external_effect"])
+
+
+def _is_sensitive_operand(token: str) -> bool:
+    lowered = token.lower()
+    return any(marker in lowered for marker in _SENSITIVE_OPERAND_MARKERS)
+
+
+def _tokens_match_spec(tokens: List[str], spec: Dict[str, Any]) -> bool:
+    operands_only = False
+    for token in tokens:
+        if not token:  # an explicitly empty quoted argument
+            return False
+        if token == "--":
+            if operands_only or not spec["operands"]:
+                return False
+            operands_only = True
+            continue
+        if not operands_only and token.startswith("-"):
+            if token in spec["flags"]:
+                continue
+            if spec["numeric_short_flags"] and _NUMERIC_SHORT_FLAG.fullmatch(token):
+                continue
+            return False
+        if not spec["operands"]:
+            return False
+        if _is_sensitive_operand(token):
+            return False
+    return True
+
+
+def _is_provably_read_only_command(command: Any) -> bool:
+    """Is this command line PROVABLY free of side effects?
+
+    Fail-closed by construction: every gate is an allowlist and the function
+    returns ``False`` for anything it does not positively recognise. In
+    particular a chain or pipeline can never be classified read-only even when
+    every element looks safe, because the character allowlist rejects the
+    operators outright — the command is never split on ``;``/``|``/``&&`` and
+    re-checked element-wise, which is the usual way this kind of classifier is
+    defeated.
+    """
+    if not isinstance(command, str):
+        return False
+    if not command or len(command) > _MAX_COMMAND_CHARS:
+        return False
+    if any(ch not in _SAFE_COMMAND_CHARS for ch in command):
+        return False
+    if not command.strip():
+        return False
+    try:
+        tokens = shlex.split(command)
+    except ValueError:  # unbalanced quoting
+        return False
+    if not tokens or len(tokens) > _MAX_COMMAND_TOKENS:
+        return False
+
+    program, rest = tokens[0], tokens[1:]
+    if program == "git":
+        if not rest or rest[0].startswith("-"):
+            return False  # no top-level git flags, ever
+        spec = _GIT_SUBCOMMANDS.get(rest[0])
+        return spec is not None and _tokens_match_spec(rest[1:], spec)
+    spec = _READ_ONLY_PROGRAMS.get(program)
+    return spec is not None and _tokens_match_spec(rest, spec)
+
+
+def _extract_shell_command(args: Any) -> Optional[str]:
+    """The command string these tool args will run, or ``None`` if we cannot say.
+
+    Reads the same tool-argument mapping that ``_redacted_payload`` fingerprints,
+    so classification and the clearance are computed from one source of truth.
+    The extracted string is used for classification ONLY: it is never logged,
+    never added to ``payload_redacted``, and never sent to the gateway — the
+    redaction invariant (tool name + argument KEYS) is unchanged.
+    """
+    if not isinstance(args, dict):
+        return None
+    if any(str(key) not in _SHELL_BENIGN_ARG_KEYS for key in args):
+        return None
+    present = [key for key in _SHELL_COMMAND_KEYS if key in args]
+    if len(present) != 1:
+        return None
+    value = args[present[0]]
+    if not isinstance(value, str):
+        return None
+    return value
+
+
+def _unclassified_floor() -> str:
+    """Family for a gated tool :data:`_TOOL_RISK_FAMILIES` does not know about.
+
+    This is what the legacy ``ACT_CLEARANCE_RISK_FAMILY`` / act.toml
+    ``clearance_risk_family`` key now means, and it is deliberately NOT wired up
+    as a blanket floor over every tool. ``act install`` STAMPS that key with the
+    historical blanket value (``clearance_risk_family = "external_effect"`` is
+    sitting in the live act.toml right now), so honouring it as "raise every tool
+    to at least this" would re-break the exact workflow this change exists to
+    fix — the per-tool map and the read-only classifier would be overridden back
+    to a mobile-mandatory family on every install. An operator who genuinely
+    wants a blanket floor says so with ``min_risk_family``, which nothing stamps.
+
+    Clamped upward at :data:`_DEFAULT_CLEARANCE_RISK_FAMILY`: an unclassified
+    risky tool must never be configurable into a grant-eligible family.
+    """
+    configured = _cfg("ACT_CLEARANCE_RISK_FAMILY", "clearance_risk_family", None)
+    if isinstance(configured, str) and configured.strip() in _RISK_FAMILY_RANKS:
+        candidate = configured.strip()
+        if _rank(candidate) > _rank(_DEFAULT_CLEARANCE_RISK_FAMILY):
+            return candidate
+    return _DEFAULT_CLEARANCE_RISK_FAMILY
+
+
+def _classified_risk_family(tool_name: str, args: Any) -> str:
+    """Baseline family for THIS call, before operator overrides."""
+    baseline = _TOOL_RISK_FAMILIES.get(tool_name) or _unclassified_floor()
+    if tool_name not in _SHELL_CLASSIFIABLE_TOOLS:
+        return baseline
+    command = _extract_shell_command(args)
+    if command is None:
+        return baseline
+    return "read_only" if _is_provably_read_only_command(command) else baseline
+
+
+def _risk_family_env_key(tool_name: str) -> str:
+    suffix = "".join(ch if ch.isalnum() else "_" for ch in tool_name).upper()
+    return f"ACT_CLEARANCE_RISK_FAMILY_{suffix}"
+
+
+def _tighten_candidates(tool_name: str) -> List[str]:
+    """Operator knobs that may RAISE this tool's family, most specific first.
+
+    Per-tool: ``ACT_CLEARANCE_RISK_FAMILY_<TOOL>`` (ENV) or the act.toml
+    ``[tool_risk_families]`` table. Blanket: ``ACT_CLEARANCE_MIN_RISK_FAMILY``
+    (ENV) or act.toml ``min_risk_family``. Both follow the existing
+    ENV > act.toml precedence; both are tighten-only (see
+    :func:`_risk_family_for_tool`).
+    """
+    candidates: List[str] = []
+    env_val = os.getenv(_risk_family_env_key(tool_name))
+    if env_val is not None and env_val.strip():
+        candidates.append(env_val.strip())
+    else:
+        table = _act_toml().get("tool_risk_families")
+        if isinstance(table, dict):
+            toml_val = table.get(tool_name)
+            if isinstance(toml_val, str) and toml_val.strip():
+                candidates.append(toml_val.strip())
+    minimum = _cfg("ACT_CLEARANCE_MIN_RISK_FAMILY", "min_risk_family", None)
+    if isinstance(minimum, str) and minimum.strip():
+        candidates.append(minimum.strip())
+    return candidates
+
+
+def _risk_family_for_tool(tool_name: str, args: Any = None) -> str:
+    """THE risk family this plugin asserts for a gated tool call.
+
+    Configuration may TIGHTEN and never loosen: a candidate is applied only when
+    it names a real tower family AND ranks strictly above what is resolved so
+    far. An unknown family name, or one that would downgrade the call, is
+    ignored rather than honoured — otherwise ``min_risk_family = "read_only"``
+    in a stale act.toml would silently make every gated tool grant-eligible,
+    which is the failure mode a clearance plugin must not have.
+    """
+    resolved = _classified_risk_family(tool_name, args)
+    for candidate in _tighten_candidates(tool_name):
+        if candidate in _RISK_FAMILY_RANKS and _rank(candidate) > _rank(resolved):
+            resolved = candidate
+    return resolved
+
+
+def _risk_level_for_family(family: str) -> str:
+    return _RISK_LEVEL_FOR_FAMILY.get(family, "high")
 
 
 # --- HTTP (stdlib) ----------------------------------------------------------
@@ -569,7 +1110,10 @@ def _poll_question_answer(
 def _relay_clearance(
     tool_name: str, args: Any, session_id: str
 ) -> Optional[Dict[str, str]]:
-    risk_family = _clearance_risk_family()
+    # Honest per-tool family (capability ceiling), with a per-call downgrade to
+    # read_only when the shell command is provably side-effect-free. This is what
+    # decides whether the tower can honour a standing grant at all.
+    risk_family = _risk_family_for_tool(tool_name, args)
     timeout_s = _timeout()
     payload_redacted = _redacted_payload(tool_name, args)
     extensions: Dict[str, Dict[str, Any]] = {}
@@ -585,7 +1129,7 @@ def _relay_clearance(
             "/hermes/tools/approval_requested",
             {
                 "requested_tool": tool_name,
-                "risk_level": "high",
+                "risk_level": _risk_level_for_family(risk_family),
                 "risk_family": risk_family,
                 "summary": f"Hermes agent requests to run '{tool_name}'.",
                 "payload_redacted": payload_redacted,
