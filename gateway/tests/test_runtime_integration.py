@@ -44,7 +44,13 @@ def test_runtime_approval_round_trip_delivers_signed_mobile_decision(
     assert result.status_code == 200
     body = result.json()
     assert body["state"] == "approved"
-    assert body["selected_scope"] == "session"
+    # `selected_scope` is read from the stored `decision_scope`, and this is the
+    # surface the AGENT reads. The fixture's risk family is `destructive`, which
+    # can never carry standing authority, so no grant was minted — this used to
+    # tell the agent it had session-wide authority that did not exist anywhere
+    # in `approval_grants`. What the operator's tap actually bought is one
+    # approval, and that is what the agent is now told.
+    assert body["selected_scope"] == "once"
     assert body["responses"][0]["decision_type"] == "approve_session"
 
 

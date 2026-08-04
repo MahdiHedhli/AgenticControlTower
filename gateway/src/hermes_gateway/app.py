@@ -3139,23 +3139,22 @@ def _transition_approval(
         "human_mobile",
         "human_local",
     }
-    store.resolve_approval(
-        approval_id,
-        target_state,
-        decision_scope=scope,
-        decision_actor_device_id=principal.device_id,
-        decision_metadata={
-            "decision": decision,
-            "state": target_state,
-            **decision_metadata(channel_decision),
-        },
-        approved_by=approved_by,
-        human_approved=human_approved,
-    )
     # Standing grants: a decision carrying a scope other than "once" is the
     # operator saying "and don't ask me again for this". Persist that as an
     # explicit, hard-expiring, revocable grant instead of leaving
     # decision_scope as a write nothing ever reads.
+    #
+    # This runs BEFORE resolve_approval, which is the whole of the fix for the
+    # surfaces 5bd73792 did not reach. Only the grant outcome can say which
+    # scope was applied, so nothing written before it can be honest about the
+    # scope — and resolve_approval's write is what GET /v1/approvals/{id}, the
+    # approval.resolved event and the runtime adapter's selected_scope all read
+    # back. Fixing it at the write makes every reader agree for free; patching
+    # the readers would have been three places to keep in step, forever.
+    #
+    # Nothing in minting depends on the approval already being resolved: the
+    # policy gate reads settings, the deciding device and the in-memory approval
+    # dict, and the audit events these two emit already came out grant-first.
     grant: dict[str, Any] | None = None
     grant_refused_reason: str | None = None
     if target_state == "approved":
@@ -3167,6 +3166,25 @@ def _transition_approval(
             request_id=request_id,
             decided_by_device_id=principal.device_id,
         )
+    # The scope that was ACTUALLY applied. An approval that minted no grant got
+    # a one-time approval, whatever was asked for. Deny / expire / cancel keep
+    # recording exactly what they recorded before: only an approval can apply a
+    # scope, and changing what a refusal records is not this fix's business.
+    applied_scope = scope if (grant is not None or target_state != "approved") else "once"
+    store.resolve_approval(
+        approval_id,
+        target_state,
+        decision_scope=applied_scope,
+        requested_scope=scope,
+        decision_actor_device_id=principal.device_id,
+        decision_metadata={
+            "decision": decision,
+            "state": target_state,
+            **decision_metadata(channel_decision),
+        },
+        approved_by=approved_by,
+        human_approved=human_approved,
+    )
     event_type = {
         "approved": "approval_decision",
         "denied": "approval_decision",
@@ -3184,9 +3202,16 @@ def _transition_approval(
         request_id=request_id,
         payload_redacted={
             "decision": decision,
-            "scope": scope,
+            # `scope` is the APPLIED scope, so a reader who only knows the old
+            # key is not misled; `requested_scope` and `applied_scope` name
+            # both halves explicitly so the record says which is which rather
+            # than leaving it to be inferred from `grant_id`.
+            "scope": applied_scope,
+            "requested_scope": scope,
+            "applied_scope": applied_scope,
             "state": target_state,
             "grant_id": grant["grant_id"] if grant else None,
+            "grant_refused_reason": grant_refused_reason,
             **decision_metadata(channel_decision),
         },
     )
@@ -3195,7 +3220,14 @@ def _transition_approval(
         agent_id=approval["agent_id"],
         session_id=approval["session_id"],
         event_type="approval.resolved",
-        payload={"approval_id": approval_id, "state": target_state, "scope": scope},
+        payload={
+            "approval_id": approval_id,
+            "state": target_state,
+            "scope": applied_scope,
+            "requested_scope": scope,
+            "applied_scope": applied_scope,
+            "grant_minted": grant is not None,
+        },
     )
     # Report the scope that was ACTUALLY applied, not the one that was asked for.
     # `applied_scope=scope` was unconditional, so an operator tapping "approve for
@@ -3211,7 +3243,11 @@ def _transition_approval(
     # it. Which requests may carry standing authority stays an operator decision.
     # Only an approval can apply a scope, so deny/expire/cancel keep reporting
     # exactly what they reported before ("once" and null respectively).
-    applied_scope = scope if (grant is not None or target_state != "approved") else "once"
+    #
+    # `applied_scope` is computed once, above the write, and every surface —
+    # this response, the stored row, the event and the audit record — is built
+    # from that one value. Four surfaces cannot disagree about a number they do
+    # not each derive.
     return ApprovalDecisionResponse(
         approval_id=approval_id,
         state=target_state,  # type: ignore[arg-type]

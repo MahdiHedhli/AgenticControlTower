@@ -58,7 +58,7 @@ def test_deny_approval(client: TestClient) -> None:
 
 
 def test_scoped_approval_decision_records_session_scope(client: TestClient) -> None:
-    """The decision RECORDS session scope. It does not APPLY it.
+    """A session-scope decision records the scope it APPLIED, which is `once`.
 
     ``create_approval`` here declares ``risk_family="destructive"``, which is
     above the standing-grant exclusion floor, so ``mint_grant_for_decision``
@@ -66,6 +66,10 @@ def test_scoped_approval_decision_records_session_scope(client: TestClient) -> N
     ``session`` back anyway — the phone said "approved for this session" for an
     authority that was never granted (0 grant rows against 131 approvals in
     production). The refusal policy is unchanged; only the reporting is honest.
+
+    ``decision_scope`` on the stored row is the same fix one layer down: 5bd7379
+    made only the decision RESPONSE honest, and this assertion pinned the lie
+    surviving in the place the phone actually re-reads it.
     """
     paired = pair_device(client)
     approval = create_approval(client, action_id="act_session_scope")
@@ -100,7 +104,8 @@ def test_scoped_approval_decision_records_session_scope(client: TestClient) -> N
         device_id=paired["device"]["device_id"],
     )
     assert detail.status_code == 200
-    assert detail.json()["decision_scope"] == "session"
+    assert detail.json()["decision_scope"] == "once"
+    assert detail.json()["requested_scope"] == "session"
     assert approval_event_exists(client, paired, approval["approval_id"], "approved")
 
 

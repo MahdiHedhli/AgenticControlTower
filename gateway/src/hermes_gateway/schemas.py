@@ -465,7 +465,14 @@ class ApprovalRequest(BaseModel):
     state: ApprovalState
     expires_at: datetime
     options: list[str]
+    #: The scope that was APPLIED — what the gateway actually acted on. It is
+    #: ``once`` whenever no standing grant was minted, however the decision was
+    #: spelled, because a one-time approval is what the operator got.
     decision_scope: ApprovalScope | None = None
+    #: What was ASKED for, so the row can say "you asked for session, you got
+    #: once" without a client inferring it. ``None`` when no scope was requested
+    #: (expire / cancel, and standing-grant auto-satisfaction).
+    requested_scope: ApprovalScope | None = None
     decided_at: datetime | None = None
     decision_metadata: dict[str, Any] | None = None
     # Authority provenance (additive, defaulted).

@@ -253,6 +253,7 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
                     state TEXT NOT NULL,
                     options_json TEXT NOT NULL,
                     decision_scope TEXT,
+                    requested_scope TEXT,
                     decision_actor_device_id TEXT,
                     decision_metadata_json TEXT NOT NULL DEFAULT '{}',
                     requested_at TEXT NOT NULL,
@@ -645,6 +646,11 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
             _ensure_column(db, "approval_requests", "aircraft", "TEXT")
             _ensure_column(db, "approval_requests", "requested_by", "TEXT")
             self._ensure_column(db, "approval_requests", "decision_scope", "TEXT")
+            # decision_scope now means the scope that was APPLIED; this keeps
+            # what was asked for, so the honest row loses no audit information.
+            # Nullable and additive: existing rows read back NULL, which is
+            # correct — nothing recorded a requested scope before this column.
+            self._ensure_column(db, "approval_requests", "requested_scope", "TEXT")
             self._ensure_column(db, "approval_requests", "decision_actor_device_id", "TEXT")
             self._ensure_column(
                 db,
@@ -1266,11 +1272,26 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
         state: str,
         *,
         decision_scope: str | None = None,
+        requested_scope: str | None = None,
         decision_actor_device_id: str | None = None,
         decision_metadata: dict[str, Any] | None = None,
         approved_by: str | None = None,
         human_approved: bool = False,
     ) -> None:
+        """Stamp the decision onto an approval row.
+
+        ``decision_scope`` is the scope that was APPLIED — the one the gateway
+        actually acted on. It used to receive the scope that was REQUESTED,
+        which is where the "approved for this session" lie outlived
+        5bd73792's fix to the decision response: this column is what
+        ``GET /v1/approvals/{id}``, the ``approval.resolved`` event and the
+        runtime adapter's ``selected_scope`` all read.
+
+        ``requested_scope`` keeps what the operator asked for, so making the
+        row honest costs no audit information. ``NULL`` means no scope was
+        requested at all (expire / cancel, and standing-grant auto-satisfaction,
+        where nobody asked for anything).
+        """
         decided_at = utc_iso()
         with self.connect() as db:
             db.execute(
@@ -1278,6 +1299,7 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
                 UPDATE approval_requests
                 SET state = ?,
                     decision_scope = ?,
+                    requested_scope = ?,
                     decision_actor_device_id = ?,
                     decision_metadata_json = ?,
                     decided_at = ?,
@@ -1288,6 +1310,7 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
                 (
                     state,
                     decision_scope,
+                    requested_scope,
                     decision_actor_device_id,
                     json.dumps(decision_metadata or {}),
                     decided_at,
