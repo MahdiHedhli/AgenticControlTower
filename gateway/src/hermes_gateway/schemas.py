@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, Literal
 
@@ -352,6 +353,28 @@ class RuntimeContextRequest(StrictModel):
         fleet view froze on hours-old state. This runs *before* the extra-field
         check, which is what makes acceptance possible without relaxing
         ``StrictModel``.
+
+        EVERY value read here is unvalidated caller data — this runs before
+        pydantic has checked anything — so nothing may be coerced on trust.
+        ``dict(data.get("extensions") or {})`` broke both ways: it raised
+        **TypeError** on a truthy non-mapping (``[1,2]``, ``5``, ``true``),
+        which pydantic does NOT convert to a 422 the way it converts
+        ValueError, so it escaped as a 500 with a traceback; and it silently
+        replaced a *falsy* non-mapping (``null``, ``""``, ``[]``, ``0``,
+        ``false``) with ``{}`` and returned 200 for a body the schema itself
+        rejects. The deployed plugin sends ``bridge_*`` on every request, so
+        all production traffic takes this branch. The tell either way is the
+        asymmetry: the same malformed ``extensions`` WITHOUT a ``bridge_`` key
+        returns a clean 422, because then the validator returns early and the
+        real contract applies.
+
+        So: type-check, and hand anything that is not a namespace mapping back
+        UNTOUCHED for pydantic's ordinary ``dict[str, dict[str, Any]]``
+        validation to reject. Returning it rather than raising is what makes
+        the two paths identical — same status, same ``loc``, same message, with
+        or without ``bridge_*`` — because it is literally the same validation
+        doing the rejecting. The legacy spelling is a spelling, never a change
+        of contract.
         """
         if not isinstance(data, dict):
             return data
@@ -365,16 +388,32 @@ class RuntimeContextRequest(StrictModel):
         if not bridge_keys:
             return data
         data = dict(data)
-        extensions = dict(data.get("extensions") or {})
-        # An explicit extensions["bridge"] wins: it is the newer, intended shape.
+        # Popped before any early return: on a body that is going to 422 anyway
+        # these must not survive to raise a second, misleading `extra_forbidden`
+        # error next to the real one.
         folded = {
             key.removeprefix(BRIDGE_METADATA_PREFIX): data.pop(key) for key in bridge_keys
         }
-        bridge_namespace = dict(folded)
+        if "extensions" not in data:
+            data["extensions"] = {"bridge": folded}
+            return data
+        raw_extensions = data["extensions"]
+        if not isinstance(raw_extensions, Mapping):
+            return data
+        extensions: dict[str, Any] = dict(raw_extensions)
         existing = extensions.get("bridge")
-        if isinstance(existing, dict):
-            bridge_namespace.update(existing)
-        extensions["bridge"] = bridge_namespace
+        if "bridge" not in extensions:
+            extensions["bridge"] = folded
+        elif isinstance(existing, Mapping):
+            # An explicit extensions["bridge"] wins: it is the newer, intended
+            # shape. Merged into a fresh dict so the caller's mapping is neither
+            # mutated nor required to be a `dict`.
+            extensions["bridge"] = {**folded, **existing}
+        else:
+            # A "bridge" namespace that is not an object. Leave it exactly as
+            # sent, rather than overwriting invalid input with something that
+            # validates.
+            return data
         data["extensions"] = extensions
         return data
 
