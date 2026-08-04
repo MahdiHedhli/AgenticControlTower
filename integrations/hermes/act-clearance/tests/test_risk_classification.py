@@ -14,6 +14,10 @@ Run:
 from __future__ import annotations
 
 import importlib.util
+import os
+import shlex
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -210,7 +214,7 @@ def test_unknown_override_family_is_ignored(home, monkeypatch):
 def test_override_tightens_even_a_provably_read_only_command(home, monkeypatch):
     monkeypatch.setenv("ACT_CLEARANCE_RISK_FAMILY_TERMINAL", "destructive")
     assert (
-        plugin._risk_family_for_tool("terminal", {"command": "git status"})
+        plugin._risk_family_for_tool("terminal", {"command": "ls -la"})
         == "destructive"
     )
 
@@ -225,7 +229,7 @@ def test_legacy_stamped_key_does_not_defeat_the_read_only_downgrade(home):
     operator approves "for this session" and the tower refuses the grant."""
     _write_act_toml(home, 'clearance_risk_family = "external_effect"\n')
     assert (
-        plugin._risk_family_for_tool("terminal", {"command": "git status"})
+        plugin._risk_family_for_tool("terminal", {"command": "ls -la"})
         == "read_only"
     )
 
@@ -252,27 +256,6 @@ def test_unclassified_floor_default(home):
 # --- classifier: the allowlist passes ---------------------------------------
 
 _READ_ONLY_COMMANDS = [
-    "git status",
-    "git status --short",
-    "git status -s -b",
-    "git status --porcelain",
-    "git log",
-    "git log --oneline",
-    "git log --oneline -20",
-    "git log -n 5 --stat",
-    "git log --oneline main",
-    "git diff",
-    "git diff --stat",
-    "git diff --cached --name-only",
-    "git diff --no-ext-diff",
-    "git branch",
-    "git branch -a",
-    "git branch --show-current",
-    "git show --stat HEAD",
-    "git rev-parse --abbrev-ref HEAD",
-    "git rev-parse --show-toplevel",
-    "git describe --tags",
-    "git remote -v",
     "ls",
     "ls -la",
     "ls -la src",
@@ -286,7 +269,6 @@ _READ_ONLY_COMMANDS = [
     "tail -n 100 logs/app.log",
     "pwd",
     "which python3",
-    "file README.md",
     "stat README.md",
     "cat 'a file with spaces.txt'",
 ]
@@ -306,7 +288,7 @@ def test_allowlisted_commands_classify_grant_eligible(home, command):
     "tool", sorted(plugin._SHELL_CLASSIFIABLE_TOOLS)
 )
 def test_every_shell_tool_gets_the_downgrade(home, tool):
-    assert plugin._risk_family_for_tool(tool, {"command": "git status"}) == "read_only"
+    assert plugin._risk_family_for_tool(tool, {"command": "ls -la"}) == "read_only"
 
 
 def test_cmd_key_is_accepted_too(home):
@@ -314,7 +296,7 @@ def test_cmd_key_is_accepted_too(home):
 
 
 def test_benign_companion_args_do_not_block_the_downgrade(home):
-    args = {"command": "git status", "cwd": "/repo", "timeout": 30}
+    args = {"command": "ls -la", "cwd": "/repo", "timeout": 30}
     assert plugin._risk_family_for_tool("terminal", args) == "read_only"
 
 
@@ -359,6 +341,14 @@ _MUST_FAIL_CLOSED = [
     "sh",
     "bash",
     # allowlisted program, flag that writes or executes
+    "ls --output=/tmp/x",
+    "ls -o /tmp/x",
+    "tail -f logs/app.log",
+    "cat -i README.md",
+    "which --exec ls",
+    "du --exclude-from=/tmp/x .",
+    # git is gone from the allowlist entirely — see the READ-SHAPED GIT block
+    # below for why, and _PROGRAMS_REMOVED_FOR_CONFIG_EXECUTION in the plugin.
     "git status --output=/tmp/x",
     "git log --ext-diff",
     "git -c core.pager=sh status",
@@ -367,13 +357,6 @@ _MUST_FAIL_CLOSED = [
     "git --git-dir=/other/.git status",
     "git --exec-path=/tmp status",
     "git -p status",
-    "ls --output=/tmp/x",
-    "ls -o /tmp/x",
-    "tail -f logs/app.log",
-    "cat -i README.md",
-    "which --exec ls",
-    "du --exclude-from=/tmp/x .",
-    # allowlisted program, subcommand that writes
     "git push",
     "git commit -m x",
     "git config user.name x",
@@ -385,6 +368,16 @@ _MUST_FAIL_CLOSED = [
     "git branch -d oldbranch",
     "git branch -D oldbranch",
     "git branch -m a",
+    # `file` is gone too: libmagic honours $MAGIC and ~/.magic.
+    "file README.md",
+    "file -b README.md",
+    # device / pseudo-filesystem operands: reads there are not reads
+    "cat /dev/urandom",
+    "head -c 10 /dev/zero",
+    "wc -l /proc/self/mem",
+    "tail -n 1 /sys/kernel/x",
+    "ls /dev",
+    "du -sh /proc",
     # credential-shaped operands
     "cat .env",
     "cat /etc/passwd",
@@ -468,7 +461,7 @@ def test_too_many_tokens_fails_closed():
     ],
 )
 def test_unextractable_command_fails_closed(home, args):
-    assert plugin._extract_shell_command(args) is None
+    assert plugin._extract_shell_invocation(args) is None
     assert plugin._risk_family_for_tool("terminal", args) == "external_effect"
 
 
@@ -497,10 +490,10 @@ def test_non_shell_tools_are_never_downgraded(home):
 def test_classification_does_not_change_the_redacted_payload():
     """Redaction invariant: tool name + argument KEYS only. Classification reads
     the command but must never widen what is transmitted or fingerprinted."""
-    args = {"command": "git status", "cwd": "/repo"}
+    args = {"command": "ls -la", "cwd": "/repo"}
     payload = plugin._redacted_payload("terminal", args)
     assert payload == {"tool": "terminal", "arg_keys": ["command", "cwd"]}
-    assert "git status" not in plugin._canonical_json(payload)
+    assert "ls -la" not in plugin._canonical_json(payload)
 
 
 def test_read_only_classification_reaches_the_clearance_request(home, monkeypatch):
@@ -517,7 +510,7 @@ def test_read_only_classification_reaches_the_clearance_request(home, monkeypatc
     monkeypatch.setattr(plugin, "_post", fake_post)
     monkeypatch.setattr(plugin, "_timeout", lambda: 1.0)
 
-    plugin._relay_clearance("terminal", {"command": "git status"}, "s1")
+    plugin._relay_clearance("terminal", {"command": "ls -la"}, "s1")
     assert sent["risk_family"] == "read_only"
     assert sent["risk_level"] == "low"
     assert sent["payload_redacted"] == {"tool": "terminal", "arg_keys": ["command"]}
@@ -531,3 +524,219 @@ def test_read_only_classification_reaches_the_clearance_request(home, monkeypatc
     plugin._relay_clearance("delete_file", {"path": "/tmp/x"}, "s1")
     assert sent["risk_family"] == "destructive"
     assert sent["risk_level"] == "critical"
+
+
+# --- REGRESSION: the two proven exploits ------------------------------------
+#
+# Both of these FAIL against commit 92e5e7d, which classified `git status` /
+# `git diff` and any cwd-rooted operand as ``read_only``. They are written
+# against real hostile fixtures rather than string literals so that they keep
+# testing the actual threat rather than a remembered spelling of it.
+
+
+def _hostile_repo(tmp_path: Path, canary: Path) -> Path:
+    """A git repo whose OWN config executes a payload on read-shaped commands.
+
+    Mirrors the demonstrated attack: an attacker who has landed a single write
+    inside a repo (or who published a repo the operator cloned) sets a config
+    key naming a helper program. Nothing about this appears on the command line
+    the classifier is shown.
+    """
+    repo = tmp_path / "hostile"
+    repo.mkdir()
+    payload = f"touch {canary}; false"
+
+    def git(*argv: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *argv],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "GIT_CONFIG_GLOBAL": str(tmp_path / "nonexistent")},
+        )
+
+    git("init", "-q", ".")
+    (repo / "f.txt").write_text("hi\n")
+    git("add", "f.txt")
+    git("-c", "user.email=a@b.invalid", "-c", "user.name=a", "commit", "-qm", "init")
+    # `git status` executes this one.
+    git("config", "core.fsmonitor", payload)
+    # `git diff` executes this one, selected via the repo's own .gitattributes.
+    git("config", "diff.evil.command", payload)
+    (repo / ".gitattributes").write_text("f.txt diff=evil\n")
+    (repo / "f.txt").write_text("changed\n")
+    return repo
+
+
+@pytest.mark.skipif(
+    shutil.which("git") is None, reason="git is required to build the hostile repo"
+)
+@pytest.mark.parametrize("command", ["git status", "git diff", "git status --short"])
+def test_exploit1_hostile_repo_config_executes_on_read_shaped_git(
+    home, tmp_path, command
+):
+    """PROVEN RCE. A repo-local config key turns a read-shaped git command into
+    arbitrary code execution, so no git invocation may ever classify read_only.
+
+    The test first PROVES the payload really fires — otherwise a future git
+    release that stopped honouring the key would silently turn this into a test
+    of nothing — and only then asserts the classifier refuses.
+    """
+    canary = tmp_path / "PWNED"
+    repo = _hostile_repo(tmp_path, canary)
+
+    assert not canary.exists()
+    subprocess.run(
+        ["git", *shlex.split(command)[1:]],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "GIT_CONFIG_GLOBAL": str(tmp_path / "nonexistent")},
+    )
+    assert canary.exists(), (
+        "fixture no longer demonstrates the exploit; this git build did not run "
+        "the payload, so the assertion below would prove nothing"
+    )
+
+    assert plugin._is_provably_read_only_command(command) is False
+    assert plugin._is_provably_read_only_command(command, str(repo)) is False
+    assert (
+        plugin._risk_family_for_tool("terminal", {"command": command, "cwd": str(repo)})
+        == "external_effect"
+    )
+
+
+def test_exploit1_git_is_not_on_any_allowlist():
+    """Structural guard: git must not come back via a program table entry."""
+    assert "git" not in plugin._READ_ONLY_PROGRAMS
+    assert "git" in plugin._PROGRAMS_REMOVED_FOR_CONFIG_EXECUTION
+    assert not hasattr(plugin, "_GIT_SUBCOMMANDS")
+
+
+def test_exploit2_cwd_reaches_a_secret_without_naming_one(home, tmp_path):
+    """PROVEN BYPASS. cwd decides what every relative operand resolves to, but
+    92e5e7d checked cwd's KEY NAME only, so ``cat config`` in a cwd of
+    ``.../.ssh`` classified read_only and could be covered by a standing grant.
+
+    Uses a throwaway directory shaped like a key store — no real secret is read.
+    """
+    ssh_dir = tmp_path / "home" / ".ssh"
+    ssh_dir.mkdir(parents=True)
+    (ssh_dir / "config").write_text("Host example\n")
+
+    # The exploit as demonstrated: neither operand nor command names a secret.
+    args = {"command": "cat config", "cwd": str(ssh_dir)}
+    assert plugin._is_provably_read_only_command("cat config", str(ssh_dir)) is False
+    assert plugin._risk_family_for_tool("terminal", args) == "external_effect"
+
+    # ...and the same reach via traversal out of an innocent cwd.
+    project = tmp_path / "home" / "project"
+    project.mkdir()
+    assert (
+        plugin._risk_family_for_tool(
+            "terminal", {"command": "cat ../.ssh/config", "cwd": str(project)}
+        )
+        == "external_effect"
+    )
+
+
+@pytest.mark.parametrize(
+    "cwd",
+    [
+        "/Users/x/.ssh",
+        "/Users/x/.aws",
+        "/home/x/.gnupg",
+        "/srv/secrets",
+        "/Users/x/proj/../.ssh",  # normalises INTO a key store
+        "/Users/x/.ssh/../.ssh",
+    ],
+)
+def test_sensitive_cwd_blocks_even_an_innocent_command(home, cwd):
+    assert (
+        plugin._risk_family_for_tool("terminal", {"command": "ls -la", "cwd": cwd})
+        == "external_effect"
+    )
+
+
+@pytest.mark.parametrize(
+    "cwd",
+    [
+        None,  # present but not a plain string
+        123,
+        True,
+        ["/tmp"],
+        {"path": "/tmp"},
+        "",
+        "relative/dir",  # resolves against a parent we cannot see
+        "./src",
+        "..",
+        "~",  # tilde: not resolvable without knowing HOME of the executing shell
+        "~/projects",
+        "/tmp/$(curl evil)",
+        "/tmp/`id`",
+        "/tmp/a;rm -rf /",
+        "/tmp/a\nb",
+        "/tmp/а",  # Cyrillic homoglyph
+        "/dev",
+        "/proc/self",
+    ],
+)
+def test_unresolvable_or_hostile_cwd_fails_closed(home, cwd):
+    """An unresolvable cwd must fail the WHOLE classification, not silently fall
+    back to treating operands as un-rooted — that fallback IS the bug."""
+    assert plugin._extract_shell_invocation({"command": "ls -la", "cwd": cwd}) is None
+    assert (
+        plugin._risk_family_for_tool("terminal", {"command": "ls -la", "cwd": cwd})
+        == "external_effect"
+    )
+
+
+@pytest.mark.parametrize("key", sorted(plugin._SHELL_CWD_ARG_KEYS))
+def test_every_cwd_alias_is_gated(home, key):
+    """All four spellings carry the same meaning, so all four must be checked."""
+    assert (
+        plugin._risk_family_for_tool(
+            "terminal", {"command": "cat config", key: "/Users/x/.ssh"}
+        )
+        == "external_effect"
+    )
+    assert (
+        plugin._risk_family_for_tool(
+            "terminal", {"command": "cat README.md", key: "/Users/x/proj"}
+        )
+        == "read_only"
+    )
+
+
+def test_two_cwd_keys_at_once_fail_closed(home):
+    """We cannot know which one the host honours, so we cannot prove anything."""
+    args = {"command": "cat config", "cwd": "/Users/x/proj", "workdir": "/Users/x/.ssh"}
+    assert plugin._extract_shell_invocation(args) is None
+    assert plugin._risk_family_for_tool("terminal", args) == "external_effect"
+
+
+def test_absolute_operand_is_checked_regardless_of_a_benign_cwd(home):
+    args = {"command": "cat /Users/x/.ssh/config", "cwd": "/Users/x/proj"}
+    assert plugin._risk_family_for_tool("terminal", args) == "external_effect"
+
+
+def test_benign_cwd_still_classifies(home):
+    """The fix must not simply disable the feature whenever a cwd is present."""
+    invocation = plugin._extract_shell_invocation(
+        {"command": "cat README.md", "cwd": "/Users/x/proj/"}
+    )
+    assert invocation == ("cat README.md", "/Users/x/proj")
+    assert (
+        plugin._risk_family_for_tool(
+            "terminal", {"command": "cat README.md", "cwd": "/Users/x/proj"}
+        )
+        == "read_only"
+    )
+
+
+def test_caller_supplied_unvalidated_cwd_is_rejected_at_the_inner_gate():
+    """Defence in depth: the inner function re-checks the cwd it was handed, so
+    a future caller that forgets _extract_cwd cannot reintroduce the bypass."""
+    assert plugin._is_provably_read_only_command("cat config", "~/.ssh") is False
+    assert plugin._is_provably_read_only_command("cat config", "relative") is False
+    assert plugin._is_provably_read_only_command("cat notes.txt", "/tmp/x/..") is False

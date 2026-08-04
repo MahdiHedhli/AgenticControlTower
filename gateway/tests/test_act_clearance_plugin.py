@@ -238,14 +238,25 @@ def test_gated_tools_are_never_grant_eligible_by_default() -> None:
 def test_provably_read_only_shell_command_is_grant_eligible(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The point of the change: `git status` on a shell tool must classify into a
-    family the tower CAN mint a standing grant for."""
+    """The point of the change: a provably read-only shell command must classify
+    into a family the tower CAN mint a standing grant for.
+
+    `git status` was the original example here and is deliberately no longer one:
+    git executes helpers named by the repository's own config/attributes, which
+    is remote code execution behind a read-shaped command line, so no git
+    invocation classifies any more. See _PROGRAMS_REMOVED_FOR_CONFIG_EXECUTION in
+    the plugin."""
     # Hermetic: never read the developer's real ~/.hermes/act/act.toml or env.
     monkeypatch.setitem(plugin._TOML_CACHE, "loaded", True)
     monkeypatch.setitem(plugin._TOML_CACHE, "data", {})
     for key in list(plugin.os.environ):
         if key.startswith("ACT_CLEARANCE_"):
             monkeypatch.delenv(key, raising=False)
-    family = plugin._risk_family_for_tool("terminal", {"command": "git status"})
+    family = plugin._risk_family_for_tool("terminal", {"command": "ls -la"})
     assert family in LOW_RISK_FAMILIES
     assert family not in GRANT_UNGRANTABLE_RISK_FAMILIES
+
+    assert (
+        plugin._risk_family_for_tool("terminal", {"command": "git status"})
+        in GRANT_UNGRANTABLE_RISK_FAMILIES
+    )

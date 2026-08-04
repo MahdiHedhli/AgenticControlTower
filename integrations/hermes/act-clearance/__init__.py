@@ -43,6 +43,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shlex
 import subprocess
@@ -53,7 +54,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:  # tomllib is stdlib on 3.11+; degrade gracefully on older runtimes.
     import tomllib
@@ -283,7 +284,7 @@ def _poll() -> float:
 #
 # Why this exists: a blanket ``external_effect`` on every gated tool was both
 # dishonest and useless. Dishonest because `delete_file` is not the same risk as
-# `git status`; useless because `external_effect` is in the tower's
+# `cat README.md`; useless because `external_effect` is in the tower's
 # MOBILE_MANDATORY_RISK_FAMILIES, so EVERY clearance this plugin raised was
 # structurally ineligible for a standing grant — the operator could pick "for
 # this session" on the phone and the tower would refuse it
@@ -382,18 +383,23 @@ _SHELL_CLASSIFIABLE_TOOLS = frozenset(
 #: Argument keys that may carry the command string. Exactly one must be present.
 _SHELL_COMMAND_KEYS = ("command", "cmd")
 
-#: Every other key permitted to appear alongside it. An unrecognised key may
-#: change execution semantics (``shell``, ``env``, ``stdin``, ``args``...), and an
-#: unknown key means we cannot claim to know what will run — so its presence
-#: fails closed to the floor.
-_SHELL_BENIGN_ARG_KEYS = frozenset(
+#: Keys that carry the WORKING DIRECTORY the command runs in.
+#:
+#: These are NOT benign companions. cwd fully determines what every relative
+#: operand resolves to, so it is part of the command's meaning: with cwd checked
+#: by key name only, ``{"command": "cat config", "cwd": "/Users/x/.ssh"}`` reads
+#: a private key while naming neither ``.ssh`` nor a key file anywhere the
+#: sensitive-operand markers can see it. Classification therefore resolves every
+#: relative operand against this value and applies the markers to the RESULT, and
+#: to the cwd itself. Anything about the cwd we cannot pin down exactly — a
+#: non-string, a relative path, more than one of these keys at once — fails the
+#: whole classification closed rather than silently reverting to un-rooted
+#: operands. See :func:`_extract_cwd`.
+_SHELL_CWD_ARG_KEYS = ("cwd", "workdir", "working_directory", "directory")
+
+#: Keys that carry no execution semantics at all.
+_SHELL_INERT_ARG_KEYS = frozenset(
     {
-        "command",
-        "cmd",
-        "cwd",
-        "workdir",
-        "working_directory",
-        "directory",
         "timeout",
         "timeout_ms",
         "timeout_seconds",
@@ -401,6 +407,15 @@ _SHELL_BENIGN_ARG_KEYS = frozenset(
         "explanation",
         "session_id",
     }
+)
+
+#: Every key permitted to appear in a classifiable call. An unrecognised key may
+#: change execution semantics (``shell``, ``env``, ``stdin``, ``args``...), and an
+#: unknown key means we cannot claim to know what will run — so its presence
+#: fails closed to the floor.
+_SHELL_BENIGN_ARG_KEYS = (
+    frozenset(_SHELL_COMMAND_KEYS) | frozenset(_SHELL_CWD_ARG_KEYS)
+    | _SHELL_INERT_ARG_KEYS
 )
 
 #: ALLOWLIST of characters a provably-read-only command may contain. Everything
@@ -453,6 +468,16 @@ _SENSITIVE_OPERAND_MARKERS = (
     "api_key",
 )
 
+#: Absolute-path prefixes whose "reads" are not reads.
+#:
+#: Character devices and the pseudo-filesystems are stateful: consuming from a
+#: FIFO or a serial device REMOVES data, ``/dev/random`` drains entropy,
+#: ``cat /dev/urandom`` never returns, and a number of ``/proc`` and ``/sys``
+#: nodes act on access or block indefinitely. ``cat``/``head``/``wc``/``du``
+#: against those is not side-effect-free, so an operand that resolves under one
+#: of these is not classifiable no matter which allowlisted program reads it.
+_NON_INERT_PATH_PREFIXES = ("/dev", "/proc", "/sys")
+
 _NUMERIC_SHORT_FLAG = re.compile(r"-[0-9]{1,6}")
 
 
@@ -476,10 +501,17 @@ def _cmd_spec(
 #: next release of the tool adds — and a single miss is an arbitrary write. An
 #: allowlist is wrong in the safe direction: a flag nobody thought about is
 #: simply not classifiable, and the call falls back to the floor.
+#: A program earns a place here only if it answers NO to the question that
+#: removed ``git`` (see :data:`_PROGRAMS_REMOVED_FOR_CONFIG_EXECUTION`): *can it
+#: execute another program, or honour a config / dotfile / attribute file that an
+#: attacker who has had one prior write could control?*
 _READ_ONLY_PROGRAMS: Dict[str, Dict[str, Any]] = {
     "pwd": _cmd_spec(),
+    # Resolves a name against PATH and stats the candidates; it never runs the
+    # program it finds, and it reads no dotfile in this flag set (`--read-alias`
+    # / `--read-functions` are not allowlisted, and they only parse text piped
+    # in on stdin anyway).
     "which": _cmd_spec(flags=("-a",), operands=True),
-    "file": _cmd_spec(flags=("-b", "-i", "-h", "-L"), operands=True),
     # No flags: macOS `stat -f` takes a format string and GNU `stat -f` reports a
     # filesystem; neither is worth the parsing surface.
     "stat": _cmd_spec(operands=True),
@@ -521,130 +553,80 @@ _READ_ONLY_PROGRAMS: Dict[str, Dict[str, Any]] = {
     ),
 }
 
-#: git is special-cased: argv[1] must be one of these subcommands, and NO
-#: top-level git flag is accepted at all. That single rule kills ``git -c
-#: core.pager=...`` / ``-c alias.x=!sh`` config injection, ``--exec-path``,
-#: ``-C``, ``--git-dir`` and ``--work-tree`` retargeting in one line rather than
-#: leaving them to be individually remembered.
+#: ``git`` IS NOT CLASSIFIABLE — REMOVED, and it must stay removed.
 #:
-#: Residual risk, accepted and documented: git honours the *repository's*
-#: ``.git/config`` (pager, external diff drivers), so running git inside a
-#: hostile repository is not provably side-effect-free no matter what this
-#: classifier does. ``--no-ext-diff`` is allowlisted so a caller can say so, and
-#: git run non-interactively does not spawn a pager. Cloning a hostile repo is
-#: itself a gated action.
-_GIT_SUBCOMMANDS: Dict[str, Dict[str, Any]] = {
-    "status": _cmd_spec(
-        flags=(
-            "-s",
-            "--short",
-            "--porcelain",
-            "-b",
-            "--branch",
-            "--long",
-            "--no-color",
-            "-uno",
-            "-unormal",
-            "-uall",
-            "--untracked-files=no",
-            "--untracked-files=normal",
-            "--untracked-files=all",
-        )
-    ),
-    "log": _cmd_spec(
-        flags=(
-            "--oneline",
-            "--stat",
-            "--numstat",
-            "--shortstat",
-            "--name-only",
-            "--name-status",
-            "--graph",
-            "--decorate",
-            "--no-decorate",
-            "--no-color",
-            "--abbrev-commit",
-            "--no-merges",
-            "--merges",
-            "--first-parent",
-            "--reverse",
-            "--no-ext-diff",
-            "-n",
-            "--date=short",
-            "--date=iso",
-            "--date=relative",
-            "--pretty=oneline",
-            "--pretty=short",
-            "--pretty=medium",
-            "--pretty=full",
-        ),
-        operands=True,
-        numeric_short_flags=True,
-    ),
-    "diff": _cmd_spec(
-        flags=(
-            "--stat",
-            "--numstat",
-            "--shortstat",
-            "--cached",
-            "--staged",
-            "--name-only",
-            "--name-status",
-            "--no-color",
-            "--no-ext-diff",
-            "--check",
-            "-w",
-            "--ignore-all-space",
-        ),
-        operands=True,
-    ),
-    "show": _cmd_spec(
-        flags=(
-            "--stat",
-            "--numstat",
-            "--name-only",
-            "--name-status",
-            "--oneline",
-            "--no-color",
-            "--no-ext-diff",
-            "--pretty=oneline",
-            "--pretty=short",
-        ),
-        operands=True,
-    ),
-    # No operands: `git branch <name>` CREATES a branch, and `-d/-m/-u` are
-    # absent from the flag allowlist.
-    "branch": _cmd_spec(
-        flags=(
-            "-a",
-            "--all",
-            "-r",
-            "--remotes",
-            "-v",
-            "-vv",
-            "--list",
-            "--show-current",
-            "--no-color",
-        )
-    ),
-    "rev-parse": _cmd_spec(
-        flags=(
-            "--abbrev-ref",
-            "--short",
-            "--show-toplevel",
-            "--git-dir",
-            "--is-inside-work-tree",
-            "--verify",
-            "--quiet",
-        ),
-        operands=True,
-    ),
-    "describe": _cmd_spec(
-        flags=("--tags", "--always", "--dirty", "--long"), operands=True
-    ),
-    # No operands: `git remote add|remove|set-url` are all positional.
-    "remote": _cmd_spec(flags=("-v", "--verbose")),
-}
+#: Every ``git`` invocation now falls through to the ``external_effect`` floor
+#: and requires a human tap. This was previously an allowlist of read-shaped
+#: subcommands (``status``/``log``/``diff``/``show``/``branch``/``rev-parse``/
+#: ``describe``/``remote``) with no top-level flags accepted. That was not
+#: enough, and the gap was remote code execution, demonstrated end to end:
+#:
+#:   git -C repo config core.fsmonitor '<payload>'
+#:       -> a later bare `git status` EXECUTES <payload>
+#:   git -C repo config diff.evil.command '<payload>'  + .gitattributes
+#:   'f.txt diff=evil'
+#:       -> a later bare `git diff` EXECUTES <payload>
+#:
+#: The root cause is structural, not a missing entry. git executes helper
+#: programs named by the REPOSITORY's own ``.git/config``, by ``.gitattributes``,
+#: and by files those point at — none of which appear on the command line this
+#: classifier can see. One prior approved write inside a repo, or cloning a
+#: hostile one, is enough to arm it, and the payload then fires on the next
+#: read-shaped command.
+#:
+#: Why the "require hardening flags" alternative was rejected. It would mean
+#: classifying only when the caller passed something like
+#: ``-c core.fsmonitor= -c diff.external= --no-ext-diff``, which is sound ONLY
+#: if the set of config keys git will execute from can be enumerated completely.
+#: It cannot be, for three independent reasons:
+#:
+#:   1. The set is open by construction. External diff and textconv drivers are
+#:      ``diff.<name>.command`` / ``diff.<name>.textconv`` and filters are
+#:      ``filter.<name>.clean`` / ``.smudge`` / ``.process``, where ``<name>`` is
+#:      chosen by the repository's own ``.gitattributes``. There is no finite
+#:      list of key names to neutralise — only a wildcard we would have to
+#:      re-derive from attribute files we have not read.
+#:   2. The known-executing keys are already a long and version-dependent tail:
+#:      ``core.fsmonitor``, ``core.pager`` / ``pager.<cmd>``, ``core.editor``,
+#:      ``sequence.editor``, ``core.sshCommand``, ``core.gitProxy``,
+#:      ``core.hooksPath`` (plus in-repo ``.git/hooks/*``), ``core.askPass``,
+#:      ``core.attributesFile``, ``core.excludesFile``, ``alias.<x>`` with a
+#:      leading ``!``, ``credential.helper``, ``gpg.program`` /
+#:      ``gpg.<fmt>.program``, ``ssh.variant``, ``diff.external``,
+#:      ``interactive.diffFilter``, ``trailer.<t>.command``,
+#:      ``merge.<d>.driver``, ``submodule.<n>.update`` with ``!``,
+#:      ``protocol.<p>.command``, ``uploadpack.packObjectsHook``,
+#:      ``remote.<r>.uploadpack`` / ``receivepack``. Each new git release may add
+#:      one, and this plugin does not ship with git.
+#:   3. THE PLUGIN CLASSIFIES BUT DOES NOT CONTROL EXECUTION. It cannot inject
+#:      hardening flags; it can only hope the caller passed them. Trusting the
+#:      caller's flag list means trusting the attacker who wrote the tool call.
+#:      Worse, accepting ``-c`` in the top-level position at all would reopen
+#:      exactly the ``git -c core.pager=sh`` / ``-c alias.x=!sh`` injection that
+#:      the old "no top-level flags, ever" rule killed in one line.
+#:
+#: An incomplete allowlist here is an RCE, so there is no allowlist.
+#:
+#: COST, stated plainly: ``git status`` and ``git log`` were the operator's
+#: actual day-to-day use of this downgrade, and they are gone. This removes the
+#: feature's main use case rather than shrinking it at the edges. What survives
+#: is the non-git half of :data:`_READ_ONLY_PROGRAMS` (``ls``, ``cat``, ``head``,
+#: ``tail``, ``wc``, ``du``, ``stat``, ``which``, ``pwd``), which is a real but
+#: much smaller convenience. Restoring git would require the tower to EXECUTE the
+#: command itself under a hardened, config-neutralised environment instead of
+#: merely labelling a string someone else will run — that is a different design,
+#: not a bigger table.
+_PROGRAMS_REMOVED_FOR_CONFIG_EXECUTION = frozenset(
+    {
+        # Executes helpers named by repo-local config / attributes. See above.
+        "git",
+        # libmagic honours $MAGIC and ~/.magic; a magic file is attacker-shaped
+        # input under the same "one prior write" precondition as .git/config,
+        # and `file`'s compression handling shells out to external decompressors
+        # on several builds. Marginal value, non-zero and unbounded surface.
+        "file",
+    }
+)
 
 
 def _rank(family: str) -> int:
@@ -657,7 +639,94 @@ def _is_sensitive_operand(token: str) -> bool:
     return any(marker in lowered for marker in _SENSITIVE_OPERAND_MARKERS)
 
 
-def _tokens_match_spec(tokens: List[str], spec: Dict[str, Any]) -> bool:
+def _normalised_abs_path(path: str) -> Optional[str]:
+    """``path`` as a normalised absolute POSIX path, or ``None`` if we cannot be
+    certain what it names.
+
+    Purely lexical on purpose. Resolving symlinks would mean touching the
+    filesystem from inside a classifier — a TOCTOU race (the link can be
+    repointed between the check and the run) and a filesystem read of a path the
+    caller may not be entitled to. Instead, anything that is not already an
+    unambiguous absolute path is refused. ``~`` never reaches here: it is not in
+    :data:`_SAFE_COMMAND_CHARS`, so tilde expansion cannot be smuggled through
+    either the command or the cwd.
+    """
+    if not path.startswith("/"):
+        return None  # relative to something we cannot see
+    collapsed = posixpath.normpath(path)
+    if ".." in collapsed.split("/"):  # belt and braces; normpath clamps at /
+        return None
+    return collapsed
+
+
+def _is_non_inert_path(path: str) -> bool:
+    """Does this normalised absolute path address a device / pseudo-filesystem?"""
+    return any(
+        path == prefix or path.startswith(prefix + "/")
+        for prefix in _NON_INERT_PATH_PREFIXES
+    )
+
+
+def _operand_is_safe(token: str, cwd: Optional[str]) -> bool:
+    """Is this operand safe to read, once resolved against the supplied cwd?
+
+    The RAW token and the RESOLVED path are both checked. Normalisation can only
+    ever delete text (``x/../.ssh/k`` collapses to ``/.ssh/k`` only if rooted;
+    ``a/../b`` loses ``a`` entirely), so checking both sides means a marker
+    cannot be hidden on either side of the transform.
+    """
+    if _is_sensitive_operand(token):
+        return False
+    if token.startswith("/"):
+        # Absolute operand: cwd is irrelevant to it, but it still must resolve.
+        resolved = _normalised_abs_path(token)
+    elif cwd is not None:
+        resolved = _normalised_abs_path(posixpath.join(cwd, token))
+    else:
+        # No cwd was supplied, so this relative operand resolves against the
+        # host's ambient directory, which is not visible from the tool call and
+        # is not attacker-chosen either. The raw-token check above is the whole
+        # proof available; this is the pre-existing behaviour for this case.
+        return True
+    if resolved is None:
+        return False
+    return not _is_sensitive_operand(resolved) and not _is_non_inert_path(resolved)
+
+
+def _extract_cwd(args: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """``(ok, cwd)`` — the working directory these tool args select.
+
+    ``ok`` is ``False`` whenever a working directory is present but cannot be
+    pinned down exactly. That must fail the WHOLE classification closed: falling
+    back to "treat operands as un-rooted" is precisely the bug this exists to
+    fix, because an unresolvable cwd is still a cwd the command will run in.
+    """
+    present = [key for key in _SHELL_CWD_ARG_KEYS if key in args]
+    if not present:
+        return True, None
+    if len(present) > 1:
+        return False, None  # ambiguous: we cannot know which the host honours
+    value = args[present[0]]
+    if not isinstance(value, str):
+        return False, None  # incl. None/dict/list — "present but not a plain string"
+    if not value or len(value) > _MAX_COMMAND_CHARS:
+        return False, None
+    if any(ch not in _SAFE_COMMAND_CHARS for ch in value):
+        # Metacharacters, `~`, tabs/newlines, control chars, non-ASCII homoglyphs.
+        return False, None
+    if _is_sensitive_operand(value):
+        return False, None
+    resolved = _normalised_abs_path(value)
+    if resolved is None:
+        return False, None  # a relative cwd resolves against an unknown parent
+    if _is_sensitive_operand(resolved) or _is_non_inert_path(resolved):
+        return False, None
+    return True, resolved
+
+
+def _tokens_match_spec(
+    tokens: List[str], spec: Dict[str, Any], cwd: Optional[str] = None
+) -> bool:
     operands_only = False
     for token in tokens:
         if not token:  # an explicitly empty quoted argument
@@ -675,13 +744,13 @@ def _tokens_match_spec(tokens: List[str], spec: Dict[str, Any]) -> bool:
             return False
         if not spec["operands"]:
             return False
-        if _is_sensitive_operand(token):
+        if not _operand_is_safe(token, cwd):
             return False
     return True
 
 
-def _is_provably_read_only_command(command: Any) -> bool:
-    """Is this command line PROVABLY free of side effects?
+def _is_provably_read_only_command(command: Any, cwd: Optional[str] = None) -> bool:
+    """Is this command line PROVABLY free of side effects, run in ``cwd``?
 
     Fail-closed by construction: every gate is an allowlist and the function
     returns ``False`` for anything it does not positively recognise. In
@@ -690,6 +759,11 @@ def _is_provably_read_only_command(command: Any) -> bool:
     operators outright — the command is never split on ``;``/``|``/``&&`` and
     re-checked element-wise, which is the usual way this kind of classifier is
     defeated.
+
+    ``cwd`` must be an already-validated normalised absolute path (see
+    :func:`_extract_cwd`) or ``None``. It is not optional information: it decides
+    what every relative operand names, so the sensitive-operand markers are
+    applied to operands RESOLVED against it, not to the text as written.
     """
     if not isinstance(command, str):
         return False
@@ -699,6 +773,8 @@ def _is_provably_read_only_command(command: Any) -> bool:
         return False
     if not command.strip():
         return False
+    if cwd is not None and _normalised_abs_path(cwd) != cwd:
+        return False  # caller passed an unvalidated cwd
     try:
         tokens = shlex.split(command)
     except ValueError:  # unbalanced quoting
@@ -707,21 +783,16 @@ def _is_provably_read_only_command(command: Any) -> bool:
         return False
 
     program, rest = tokens[0], tokens[1:]
-    if program == "git":
-        if not rest or rest[0].startswith("-"):
-            return False  # no top-level git flags, ever
-        spec = _GIT_SUBCOMMANDS.get(rest[0])
-        return spec is not None and _tokens_match_spec(rest[1:], spec)
     spec = _READ_ONLY_PROGRAMS.get(program)
-    return spec is not None and _tokens_match_spec(rest, spec)
+    return spec is not None and _tokens_match_spec(rest, spec, cwd)
 
 
-def _extract_shell_command(args: Any) -> Optional[str]:
-    """The command string these tool args will run, or ``None`` if we cannot say.
+def _extract_shell_invocation(args: Any) -> Optional[Tuple[str, Optional[str]]]:
+    """``(command, cwd)`` for these tool args, or ``None`` if we cannot say.
 
     Reads the same tool-argument mapping that ``_redacted_payload`` fingerprints,
     so classification and the clearance are computed from one source of truth.
-    The extracted string is used for classification ONLY: it is never logged,
+    The extracted values are used for classification ONLY: they are never logged,
     never added to ``payload_redacted``, and never sent to the gateway — the
     redaction invariant (tool name + argument KEYS) is unchanged.
     """
@@ -735,7 +806,10 @@ def _extract_shell_command(args: Any) -> Optional[str]:
     value = args[present[0]]
     if not isinstance(value, str):
         return None
-    return value
+    cwd_ok, cwd = _extract_cwd(args)
+    if not cwd_ok:
+        return None
+    return value, cwd
 
 
 def _unclassified_floor() -> str:
@@ -767,10 +841,11 @@ def _classified_risk_family(tool_name: str, args: Any) -> str:
     baseline = _TOOL_RISK_FAMILIES.get(tool_name) or _unclassified_floor()
     if tool_name not in _SHELL_CLASSIFIABLE_TOOLS:
         return baseline
-    command = _extract_shell_command(args)
-    if command is None:
+    invocation = _extract_shell_invocation(args)
+    if invocation is None:
         return baseline
-    return "read_only" if _is_provably_read_only_command(command) else baseline
+    command, cwd = invocation
+    return "read_only" if _is_provably_read_only_command(command, cwd) else baseline
 
 
 def _risk_family_env_key(tool_name: str) -> str:

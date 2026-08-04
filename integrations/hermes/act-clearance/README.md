@@ -59,19 +59,38 @@ grant-eligible. "Provably" is a fail-closed allowlist, not a filter:
 - an allowlist of characters — any shell metacharacter, escape, newline, control
   character, or non-ASCII codepoint rejects the command outright, so a pipeline
   or `;`-chain can never be classified read-only even if every element is safe;
-- an allowlist of programs (`git`, `ls`, `cat`, `head`, `tail`, `wc`, `du`,
-  `pwd`, `which`, `file`, `stat`), git subcommands (`status`, `log`, `diff`,
-  `branch`, `show`, `rev-parse`, `describe`, `remote`), and **flags per
-  program** — a flag nobody allowlisted is simply not classifiable;
-- no top-level `git` flags at all, which forecloses `-c` config injection,
-  `--exec-path`, `-C` and `--git-dir` retargeting;
+- an allowlist of programs (`ls`, `cat`, `head`, `tail`, `wc`, `du`, `pwd`,
+  `which`, `stat`) and **flags per program** — a flag nobody allowlisted is
+  simply not classifiable;
 - operands that look like credential paths (`.env`, `.ssh`, `id_rsa`, `.pem`,
-  `token`, `secret`, …) fall back to the floor;
+  `token`, `secret`, …) fall back to the floor, and the check is applied to the
+  operand **resolved against the call's `cwd`**, not to the text as written —
+  `{"command": "cat config", "cwd": ".../.ssh"}` names no secret anywhere but
+  reads one, so a `cwd` that cannot be pinned to an exact absolute path (missing
+  is fine; relative, `~`, non-string, or two `cwd`-ish keys at once are not)
+  fails the whole classification closed;
+- operands resolving under `/dev`, `/proc`, or `/sys` fall back to the floor:
+  consuming from a FIFO or character device is a side effect, and several such
+  reads never return;
 - `execute_code` is never classified: no allowlist over source text can prove a
   program read-only.
 
 Anything the classifier does not positively recognise — including an unparsable,
 missing, non-string, or ambiguous command argument — stays at the floor.
+
+**`git` is deliberately NOT classifiable, and neither is `file`.** `git` executes
+helper programs named by the *repository's own* `.git/config` and
+`.gitattributes` — `core.fsmonitor` fires on `git status`, a `diff.<name>.command`
+driver fires on `git diff` — none of which appear on the command line. One prior
+approved write inside a repo, or cloning a hostile one, turns a read-shaped git
+command into arbitrary code execution. Because this plugin only *classifies* and
+never *executes*, it cannot inject hardening flags; and the set of config keys git
+will run a program from is open-ended (driver names come from `.gitattributes`)
+and grows between releases, so no allowlist of them can be proven complete. An
+incomplete one here is an RCE, so `git` falls to `external_effect` and always
+needs a human tap. `file` is out for the same class of reason: libmagic honours
+`$MAGIC` and `~/.magic`. **This is a real cost — `git status` and `git log` were
+the main day-to-day use of the downgrade.**
 
 Overrides (ENV > `act.toml`) may **tighten only**:
 
