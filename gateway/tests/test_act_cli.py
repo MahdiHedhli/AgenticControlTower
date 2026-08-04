@@ -7,6 +7,7 @@ records calls instead of performing them.
 
 from __future__ import annotations
 
+import json
 import stat
 import sys
 from pathlib import Path
@@ -25,6 +26,7 @@ from hermes_gateway.act_cli import (
     generate_plist,
     generate_shim,
     install,
+    plugin_update_status,
     uninstall,
 )
 
@@ -93,10 +95,37 @@ def test_plist_reconstructs_path(home, monkeypatch):
     assert "/opt/homebrew/bin" in xml
 
 
+def test_plist_path_ignores_ambient_process_injections(home, monkeypatch):
+    monkeypatch.setenv("PATH", "/tmp/codex-run-one:/untrusted/bin:/usr/bin")
+    first = generate_plist(interpreter="/some/venv/bin/python")
+    monkeypatch.setenv("PATH", "/tmp/codex-run-two:/different/bin:/usr/bin")
+    second = generate_plist(interpreter="/some/venv/bin/python")
+
+    assert first == second
+    assert "/tmp/codex-run" not in first
+    assert "/untrusted/bin" not in first
+    assert "/different/bin" not in second
+
+
 def test_shim_execs_module(home):
     shim = generate_shim(interpreter="/v/bin/python")
     assert shim.startswith("#!/bin/sh")
     assert 'exec "/v/bin/python" -m hermes_gateway "$@"' in shim
+
+
+def test_dashboard_service_is_loopback_only_and_supervised(home):
+    shim = act_cli.generate_dashboard_shim(Path("/stable/hermes/venv/bin/hermes"))
+    xml = act_cli.generate_dashboard_plist()
+
+    assert 'exec "/stable/hermes/venv/bin/hermes" dashboard' in shim
+    assert "--host 127.0.0.1" in shim
+    assert "--port 9119" in shim
+    assert "--no-open --skip-build" in shim
+    assert "--insecure" not in shim
+    assert "app.act.hermes-dashboard" in xml
+    assert "<key>KeepAlive</key>" in xml
+    assert "hermes-dashboard.out.log" in xml
+    assert "hermes-dashboard.err.log" in xml
 
 
 def test_package_is_runnable_as_module():
@@ -116,10 +145,12 @@ def test_gateway_toml_bakes_safe_overrides(home):
     assert Path(str(act_cli.database_path())).is_absolute()
     assert "8788" in text
     assert "127.0.0.1" in text
-    # Hermes dashboard reverse-proxy target (default loopback :9120).
-    assert 'dashboard_url = "http://127.0.0.1:9120"' in text
-    # Binds all interfaces so the phone reaches it over the tailnet.
-    assert 'bind_host = "0.0.0.0"' in text
+    # Full Hermes dashboard reverse-proxy target (default loopback :9119).
+    assert 'dashboard_url = "http://127.0.0.1:9119"' in text
+    assert "dashboard_legacy_mount_rewrite = false" in text
+    assert "dashboard_session_token_log_path" not in text
+    # The process stays loopback-only; Tailscale Serve provides tailnet TLS.
+    assert 'bind_host = "127.0.0.1"' in text
     # no apns by default
     assert "apns_key_path" not in text
 
@@ -184,9 +215,11 @@ def test_install_records_launchctl_and_writes_artifacts(home):
     assert str(act_cli.shim_path()) in ops.files
     assert str(act_cli.gateway_toml_path()) in ops.files
     assert str(act_cli.act_toml_path()) in ops.files
+    assert ops.modes[str(act_cli.gateway_toml_path())] == 0o600
 
     # shim is executable
     assert ops.modes[str(act_cli.shim_path())] == 0o755
+    assert "<key>Umask</key>" in ops.files[str(act_cli.plist_path())]
 
     # launchctl bootstrap + kickstart recorded against the user domain
     target = act_cli.launchd_service_target()
@@ -197,6 +230,65 @@ def test_install_records_launchctl_and_writes_artifacts(home):
     # bridge enabled: act-clearance added to plugins.enabled
     new_cfg = ops.files[str(cfg)]
     assert "act-clearance" in new_cfg
+
+    # The security hook is deployed and pinned by ACT, not merely enabled.
+    for name in act_cli.PLUGIN_DISTRIBUTION_FILES:
+        installed = act_cli.plugin_install_dir() / name
+        assert ops.files[str(installed)] == (act_cli.plugin_source_dir() / name).read_text()
+        assert ops.modes[str(installed)] == 0o600
+    release = json.loads(ops.files[str(act_cli.plugin_release_path())])
+    assert release["name"] == "act-clearance"
+    assert release["version"] == "0.1.2"
+    assert ops.modes[str(act_cli.plugin_release_path())] == 0o600
+    assert plugin_update_status(ops).ok
+
+
+def test_install_supervises_dashboard_when_hermes_is_installed(home):
+    executable = act_cli.hermes_dashboard_executable()
+    ops = FakeOps(existing={str(executable): "<hermes executable>"})
+
+    install(ops)
+
+    assert str(act_cli.dashboard_shim_path()) in ops.files
+    assert ops.modes[str(act_cli.dashboard_shim_path())] == 0o755
+    assert str(act_cli.dashboard_plist_path()) in ops.files
+    assert (
+        "launchctl",
+        "bootstrap",
+        act_cli.launchd_domain(),
+        str(act_cli.dashboard_plist_path()),
+    ) in ops.calls
+    assert (
+        "launchctl",
+        "kickstart",
+        "-k",
+        act_cli.dashboard_launchd_service_target(),
+    ) in ops.calls
+    assert (
+        "/usr/bin/curl",
+        "--fail",
+        "--silent",
+        "--max-time",
+        "1",
+        "http://127.0.0.1:9119/",
+    ) in ops.calls
+
+
+def test_install_hardens_existing_hermes_dashboard_token_log(home):
+    cfg = _hermes_config_with_plugins(home)
+    token_log = act_cli.hermes_agent_log_path()
+    ops = FakeOps(
+        existing={
+            str(cfg): cfg.read_text(),
+            str(token_log): "dashboard startup record",
+        }
+    )
+
+    install(ops)
+
+    assert ops.modes[str(token_log)] == 0o600
+    gateway = ops.files[str(act_cli.gateway_toml_path())]
+    assert 'dashboard_url = "http://127.0.0.1:9119"' in gateway
 
 
 def test_install_is_idempotent(home):
@@ -212,6 +304,41 @@ def test_install_is_idempotent(home):
     assert str(act_cli.act_toml_path()) in ops.files
 
 
+def test_plugin_check_detects_installed_integrity_drift(home):
+    ops = FakeOps()
+    install(ops)
+    plugin_code = act_cli.plugin_install_dir() / "__init__.py"
+    ops.files[str(plugin_code)] += "\n# unexpected local edit\n"
+
+    report = plugin_update_status(ops)
+
+    assert not report.ok
+    assert report.status == "integrity_problem"
+    assert "integrity drift: __init__.py" in report.text()
+    assert "run `act install`" in report.text()
+
+
+def test_plugin_check_detects_newer_bundled_release(home, tmp_path, monkeypatch):
+    ops = FakeOps()
+    install(ops)
+    newer = tmp_path / "act-clearance"
+    newer.mkdir()
+    for name in act_cli.PLUGIN_DISTRIBUTION_FILES:
+        text = (act_cli.plugin_source_dir() / name).read_text()
+        if name == "plugin.yaml":
+            text = text.replace('version: "0.1.2"', 'version: "0.1.3"')
+        newer.joinpath(name).write_text(text)
+    monkeypatch.setattr(act_cli, "plugin_source_dir", lambda: newer)
+
+    report = plugin_update_status(ops)
+
+    assert not report.ok
+    assert report.status == "update_available"
+    assert report.managed_version == "0.1.2"
+    assert report.bundled_version == "0.1.3"
+    assert "[UPDATE] bundled plugin 0.1.3" in report.text()
+
+
 def test_install_preserves_seed_override_on_existing_toml(home):
     # A pre-existing gateway.toml with a user node_id but a DANGEROUS override
     # must come back with seed_mock_data forced false.
@@ -221,6 +348,80 @@ def test_install_preserves_seed_override_on_existing_toml(home):
     text = ops.files[str(act_cli.gateway_toml_path())]
     assert 'node_id = "custom_node"' in text  # user edit preserved
     assert "seed_mock_data = false" in text  # safe override re-asserted
+
+
+def test_install_preserves_operator_gateway_configuration(home):
+    existing = "\n".join(
+        [
+            'node_id = "custom_node"',
+            'dashboard_url = "http://127.0.0.1:9119/dashboard"',
+            'allowed_hermes_callers = ["hermes.local"]',
+            'bind_host = "0.0.0.0"',
+            "seed_mock_data = true",
+            "",
+        ]
+    )
+    ops = FakeOps(existing={str(act_cli.gateway_toml_path()): existing})
+
+    install(ops)
+
+    text = ops.files[str(act_cli.gateway_toml_path())]
+    assert 'dashboard_url = "http://127.0.0.1:9119/dashboard"' in text
+    assert "dashboard_legacy_mount_rewrite = false" in text
+    assert 'allowed_hermes_callers = ["hermes.local"]' in text
+    assert 'bind_host = "127.0.0.1"' in text
+    assert "seed_mock_data = false" in text
+
+
+def test_pair_command_prints_importable_json(monkeypatch, capsys):
+    bundle = {
+        "pairing_id": "pair_test",
+        "pairing_token": "one-time-secret",
+        "challenge": "challenge",
+        "status": "pending",
+        "node_id": "node_test",
+        "node_fingerprint": "fingerprint",
+        "tower_public_key": "tower-public-key",
+        "clearance_channel": "mobile_signed",
+        "expires_at": "2026-07-16T20:00:00Z",
+    }
+    monkeypatch.setattr(act_cli, "create_mobile_pairing_bundle", lambda: bundle)
+
+    assert act_cli.main(["pair", "--json"]) == 0
+
+    output = capsys.readouterr().out.strip()
+    assert '"pairing_id":"pair_test"' in output
+    assert '"clearance_channel":"mobile_signed"' in output
+
+
+def test_pair_command_prints_qr_without_echoing_secret(monkeypatch, capsys):
+    bundle = {
+        "pairing_id": "pair_test",
+        "pairing_token": "one-time-secret",
+        "challenge": "challenge",
+        "status": "pending",
+        "node_id": "node_test",
+        "node_fingerprint": "fingerprint",
+        "tower_public_key": "tower-public-key",
+        "clearance_channel": "mobile_signed",
+        "expires_at": "2026-07-16T20:00:00Z",
+    }
+    monkeypatch.setattr(act_cli, "create_mobile_pairing_bundle", lambda: bundle)
+    monkeypatch.setattr(act_cli, "render_pairing_qr", lambda _: "<terminal-qr>")
+
+    assert act_cli.main(["pair", "--qr"]) == 0
+
+    output = capsys.readouterr().out
+    assert "<terminal-qr>" in output
+    assert "2026-07-16T20:00:00Z" in output
+    assert "one-time-secret" not in output
+
+
+def test_pair_command_rejects_conflicting_output_formats(monkeypatch):
+    monkeypatch.setattr(act_cli, "create_mobile_pairing_bundle", lambda: {})
+
+    with pytest.raises(SystemExit, match="either --json or --qr"):
+        act_cli.main(["pair", "--json", "--qr"])
 
 
 def test_install_with_apns_writes_secret_0600_and_path_only(home, tmp_path):
@@ -251,6 +452,11 @@ def test_disable_boots_out_and_removes_plugin(home):
     ops = FakeOps(existing={str(cfg): cfg.read_text()})
     disable(ops)
     assert ("launchctl", "bootout", act_cli.launchd_service_target()) in ops.calls
+    assert (
+        "launchctl",
+        "bootout",
+        act_cli.dashboard_launchd_service_target(),
+    ) in ops.calls
     assert "act-clearance" not in ops.files[str(cfg)]
     assert "hermesultracode" in ops.files[str(cfg)]
 
@@ -264,8 +470,15 @@ def test_uninstall_boots_out_and_removes_plist_and_shim(home):
     )
     uninstall(ops)
     assert ("launchctl", "bootout", act_cli.launchd_service_target()) in ops.calls
+    assert (
+        "launchctl",
+        "bootout",
+        act_cli.dashboard_launchd_service_target(),
+    ) in ops.calls
     assert str(act_cli.plist_path()) in ops.removed
     assert str(act_cli.shim_path()) in ops.removed
+    assert str(act_cli.dashboard_plist_path()) in ops.removed
+    assert str(act_cli.dashboard_shim_path()) in ops.removed
     assert ops.rmtrees == []  # no purge
 
 
@@ -286,6 +499,18 @@ def test_doctor_clean_install_is_ok(home):
     report = doctor(ops)
     assert report.ok, report.text()
     assert "seed_mock_data is false" in report.text()
+
+
+def test_doctor_checks_dashboard_supervision_when_hermes_exists(home):
+    executable = act_cli.hermes_dashboard_executable()
+    ops = FakeOps(existing={str(executable): "<hermes executable>"})
+    install(ops)
+
+    report = doctor(ops)
+
+    assert report.ok, report.text()
+    assert "Hermes dashboard executable exists" in report.text()
+    assert "Hermes dashboard plist matches generated definition" in report.text()
 
 
 def test_doctor_flags_seed_mock_data_true(home):
@@ -309,6 +534,18 @@ def test_doctor_flags_missing_interpreter(home, monkeypatch):
     report = doctor(ops)
     assert not report.ok
     assert "interpreter missing" in report.text()
+
+
+def test_doctor_flags_plugin_drift(home):
+    ops = FakeOps()
+    install(ops)
+    plugin_manifest = act_cli.plugin_install_dir() / "plugin.yaml"
+    ops.files[str(plugin_manifest)] = ops.files[str(plugin_manifest)].replace("0.1.2", "9.9.9")
+
+    report = doctor(ops)
+
+    assert not report.ok
+    assert "managed plugin integrity drift: plugin.yaml" in report.text()
 
 
 # --------------------------------------------------------------------------- #
@@ -347,6 +584,16 @@ def test_install_records_venv_create_and_pip_install(home):
     # baked shim points at the ACT-owned venv python.
     assert str(act_cli.venv_python()) in ops.files[str(act_cli.shim_path())]
     assert venv_idx >= 0
+
+
+def test_packaged_install_does_not_recreate_the_running_managed_venv(home, tmp_path, monkeypatch):
+    ops = FakeOps()
+    monkeypatch.setattr(act_cli, "gateway_project_dir", lambda: tmp_path / "installed-wheel")
+    monkeypatch.setattr(sys, "executable", str(act_cli.venv_python()))
+
+    act_cli._provision_venv(ops)
+
+    assert ops.calls == []
 
 
 def test_install_refuses_checkout_interpreter(home, monkeypatch):
