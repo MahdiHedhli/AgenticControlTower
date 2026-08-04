@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -68,7 +69,25 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
     def __init__(self, database_path: str | Path):
         self.database_path = str(database_path)
 
-    def connect(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        """Yield a connection that is committed-or-rolled-back *and closed*.
+
+        Every call site is ``with self.connect() as db:``. When this returned a
+        raw ``sqlite3.Connection`` that read as "closes when the block ends" —
+        but a Connection's context manager is a *transaction* manager, not a
+        closing one: it commits on success, rolls back on exception, and leaves
+        the connection (and its file descriptor) open forever. Nothing here
+        pools or reuses connections, so every request leaked one fd until the
+        process crossed launchd's 256-fd soft limit and every subsequent
+        ``sqlite3.connect`` failed with "unable to open database file" — the
+        gateway's 500s on Approvals/Inventory/Agents/Missions.
+
+        The inner ``with connection:`` is load-bearing and must not be dropped:
+        it is what preserves the commit-on-success / rollback-on-exception
+        semantics that ~200 call sites already depend on. ``finally: close()``
+        is the only new behaviour.
+        """
         if self.database_path != ":memory:":
             Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(
@@ -82,7 +101,11 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
         connection.execute(
             f"PRAGMA busy_timeout = {int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000)}"
         )
-        return connection
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def initialize(self) -> None:
         with self.connect() as db:

@@ -45,7 +45,9 @@ KNOWN GAPS blocks on ``_ensure_local_node`` and ``SQLiteStore.initialize``:
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -201,17 +203,20 @@ def test_boot_attempts_no_row_write_at_all(tmp_path: Path, monkeypatch: Any) -> 
     attempted: list[tuple[int, Any, Any]] = []
     original_connect = SQLiteStore.connect
 
-    def traced_connect(self: SQLiteStore) -> sqlite3.Connection:
-        connection = original_connect(self)
+    # ``connect`` is a context manager (it closes the connection on exit), so the
+    # tracer wraps the managed block rather than a bare Connection.
+    @contextlib.contextmanager
+    def traced_connect(self: SQLiteStore) -> Iterator[sqlite3.Connection]:
+        with original_connect(self) as connection:
 
-        def authorizer(action: int, arg1: Any, arg2: Any, *_rest: Any) -> int:
-            # sqlite_master rows are the CREATE ... IF NOT EXISTS statements above.
-            if action in ROW_WRITE_ACTIONS and arg1 != "sqlite_master":
-                attempted.append((action, arg1, arg2))
-            return sqlite3.SQLITE_OK
+            def authorizer(action: int, arg1: Any, arg2: Any, *_rest: Any) -> int:
+                # sqlite_master rows are the CREATE ... IF NOT EXISTS statements above.
+                if action in ROW_WRITE_ACTIONS and arg1 != "sqlite_master":
+                    attempted.append((action, arg1, arg2))
+                return sqlite3.SQLITE_OK
 
-        connection.set_authorizer(authorizer)
-        return connection
+            connection.set_authorizer(authorizer)
+            yield connection
 
     monkeypatch.setattr(SQLiteStore, "connect", traced_connect)
     before = change_counter(settings.database_path)

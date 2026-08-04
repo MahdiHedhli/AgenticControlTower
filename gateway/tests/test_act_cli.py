@@ -8,6 +8,7 @@ records calls instead of performing them.
 from __future__ import annotations
 
 import json
+import plistlib
 import re
 import stat
 import sys
@@ -56,6 +57,17 @@ def test_plist_has_hardened_launchd_keys(home):
     # loopback config carried via ACT_GATEWAY_CONFIG, log paths present
     assert "ACT_GATEWAY_CONFIG" in xml
     assert "gateway.out.log" in xml and "gateway.err.log" in xml
+
+
+def test_plist_raises_the_file_descriptor_soft_limit(home):
+    """launchd's default 256-fd soft limit is what turned an fd leak into 500s.
+
+    The leak is fixed at ``SQLiteStore.connect``; this is the headroom half, and
+    it must be *parseable* by launchd, not merely present as text.
+    """
+    xml = generate_plist(interpreter="/usr/bin/python3")
+    parsed = plistlib.loads(xml.encode())
+    assert parsed["SoftResourceLimits"]["NumberOfFiles"] == 8192
 
 
 def _section(xml: str, key: str) -> str:

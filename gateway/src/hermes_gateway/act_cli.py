@@ -428,6 +428,18 @@ def generate_plist(
     <key>KeepAlive</key>
     <true/>
 
+    <!-- launchd hands an agent a 256-fd soft limit. A gateway that serves a
+         phone, a TUI relay and a websocket fan-out lives close to that ceiling
+         even without a leak, and crossing it turns every SQLite open into
+         "unable to open database file" — i.e. 500s instead of a clean error.
+         Headroom, not a leak fix: the fd leak itself is closed in
+         SQLiteStore.connect. -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
+    </dict>
+
     <!-- Gateway logs may contain request metadata. Owner-only on creation. -->
     <key>Umask</key>
     <integer>63</integer>
