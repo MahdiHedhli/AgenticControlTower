@@ -261,7 +261,13 @@ class CompletePairingResponse(BaseModel):
 
 class RefreshTokenRequest(StrictModel):
     refresh_token: str
-    signed_nonce: str
+    # Accepted for compatibility, never read. Device-key possession at refresh is
+    # proven by the X-HMCP-* request signature, which covers this body and carries
+    # its own replay nonce recorded in `request_nonces` — a body nonce nothing
+    # verifies proves nothing on top of that. Requiring it only broke the one
+    # client that has to call this: the mobile app sends `refresh_token` alone,
+    # got 422, and could never re-authenticate its expired event stream.
+    signed_nonce: str | None = None
 
 
 class Agent(BaseModel):

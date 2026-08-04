@@ -2419,12 +2419,16 @@ components:
       type: object
       required:
       - refresh_token
-      - signed_nonce
       properties:
         refresh_token:
           type: string
         signed_nonce:
           type: string
+          nullable: true
+          description: >-
+            Accepted but never verified. Device-key possession at refresh is
+            proven by the X-HMCP-* request signature, which covers this body and
+            carries its own replay nonce.
     AuthTokenSet:
       type: object
       required:
