@@ -8,6 +8,12 @@ abstract class SecureKeyStore {
   Future<String?> readDeviceId();
   Future<String?> readAccessToken();
   Future<String?> readRefreshToken();
+
+  /// When the stored access token expires, as UTC, or null if unknown — an
+  /// install that paired before the expiry was persisted, or a gateway that
+  /// omitted it. The runtime then refreshes reactively instead of ahead.
+  Future<DateTime?> readAccessTokenExpiry();
+
   Future<String?> readDevicePrivateKey();
   Future<String?> readDevicePublicKey();
   Future<String> storageWarning();
@@ -33,6 +39,7 @@ abstract class SecureKeyStore {
     required String deviceId,
     required String accessToken,
     required String refreshToken,
+    required DateTime? accessTokenExpiresAt,
   });
   Future<void> clear();
 }
@@ -61,6 +68,10 @@ class PlatformAwareSecureKeyStore implements SecureKeyStore {
 
   @override
   Future<String?> readRefreshToken() => _read(_refreshTokenKey);
+
+  @override
+  Future<DateTime?> readAccessTokenExpiry() async =>
+      _parseExpiry(await _read(_accessTokenExpiresAtKey));
 
   @override
   Future<String> storageWarning() async {
@@ -126,14 +137,26 @@ class PlatformAwareSecureKeyStore implements SecureKeyStore {
     required String deviceId,
     required String accessToken,
     required String refreshToken,
+    required DateTime? accessTokenExpiresAt,
   }) async {
     await _fallback.saveDeviceSession(
       deviceId: deviceId,
       accessToken: accessToken,
       refreshToken: refreshToken,
+      accessTokenExpiresAt: accessTokenExpiresAt,
     );
     await _write(_accessTokenKey, accessToken);
     await _write(_refreshTokenKey, refreshToken);
+    // A stale expiry is worse than none: it would schedule a refresh for a
+    // token that is already gone, or skip one that is about to expire.
+    if (accessTokenExpiresAt == null) {
+      await _delete(_accessTokenExpiresAtKey);
+    } else {
+      await _write(
+        _accessTokenExpiresAtKey,
+        accessTokenExpiresAt.toUtc().toIso8601String(),
+      );
+    }
   }
 
   @override
@@ -145,6 +168,7 @@ class PlatformAwareSecureKeyStore implements SecureKeyStore {
       return;
     }
     await _secureStorage.delete(key: _accessTokenKey);
+    await _secureStorage.delete(key: _accessTokenExpiresAtKey);
     await _secureStorage.delete(key: _refreshTokenKey);
     await _secureStorage.delete(key: _devicePrivateKeyKey);
     await _secureStorage.delete(key: _devicePublicKeyKey);
@@ -172,6 +196,18 @@ class PlatformAwareSecureKeyStore implements SecureKeyStore {
       await _secureStorage.write(key: key, value: value);
     } on Object {
       // SharedPreferences remains the explicit development fallback.
+    }
+  }
+
+  Future<void> _delete(String key) async {
+    await _fallback.preferences.remove(key);
+    if (_useFallback) {
+      return;
+    }
+    try {
+      await _secureStorage.delete(key: key);
+    } on Object {
+      // best-effort
     }
   }
 }
@@ -209,6 +245,10 @@ class SharedPreferencesSecureKeyStore implements SecureKeyStore {
       preferences.getString(_refreshTokenKey);
 
   @override
+  Future<DateTime?> readAccessTokenExpiry() async =>
+      _parseExpiry(preferences.getString(_accessTokenExpiresAtKey));
+
+  @override
   Future<void> saveDeviceKeyPair({
     required String privateKey,
     required String publicKey,
@@ -242,16 +282,26 @@ class SharedPreferencesSecureKeyStore implements SecureKeyStore {
     required String deviceId,
     required String accessToken,
     required String refreshToken,
+    required DateTime? accessTokenExpiresAt,
   }) async {
     await preferences.setString(_deviceIdKey, deviceId);
     await preferences.setString(_accessTokenKey, accessToken);
     await preferences.setString(_refreshTokenKey, refreshToken);
+    if (accessTokenExpiresAt == null) {
+      await preferences.remove(_accessTokenExpiresAtKey);
+    } else {
+      await preferences.setString(
+        _accessTokenExpiresAtKey,
+        accessTokenExpiresAt.toUtc().toIso8601String(),
+      );
+    }
   }
 
   @override
   Future<void> clear() async {
     await preferences.remove(_deviceIdKey);
     await preferences.remove(_accessTokenKey);
+    await preferences.remove(_accessTokenExpiresAtKey);
     await preferences.remove(_refreshTokenKey);
     await preferences.remove(_devicePrivateKeyKey);
     await preferences.remove(_devicePublicKeyKey);
@@ -263,6 +313,7 @@ class SharedPreferencesSecureKeyStore implements SecureKeyStore {
 class InMemorySecureKeyStore implements SecureKeyStore {
   String? _deviceId;
   String? _accessToken;
+  DateTime? _accessTokenExpiresAt;
   String? _refreshToken;
   String? _devicePrivateKey;
   String? _devicePublicKey;
@@ -290,6 +341,9 @@ class InMemorySecureKeyStore implements SecureKeyStore {
 
   @override
   Future<String?> readRefreshToken() async => _refreshToken;
+
+  @override
+  Future<DateTime?> readAccessTokenExpiry() async => _accessTokenExpiresAt;
 
   @override
   Future<void> saveDeviceKeyPair({
@@ -323,9 +377,11 @@ class InMemorySecureKeyStore implements SecureKeyStore {
     required String deviceId,
     required String accessToken,
     required String refreshToken,
+    required DateTime? accessTokenExpiresAt,
   }) async {
     _deviceId = deviceId;
     _accessToken = accessToken;
+    _accessTokenExpiresAt = accessTokenExpiresAt?.toUtc();
     _refreshToken = refreshToken;
   }
 
@@ -333,6 +389,7 @@ class InMemorySecureKeyStore implements SecureKeyStore {
   Future<void> clear() async {
     _deviceId = null;
     _accessToken = null;
+    _accessTokenExpiresAt = null;
     _refreshToken = null;
     _devicePrivateKey = null;
     _devicePublicKey = null;
@@ -341,8 +398,14 @@ class InMemorySecureKeyStore implements SecureKeyStore {
   }
 }
 
+/// A malformed or absent stored expiry reads as "unknown", which downgrades to
+/// reactive refresh rather than failing the whole session read.
+DateTime? _parseExpiry(String? value) =>
+    value == null ? null : DateTime.tryParse(value)?.toUtc();
+
 const _deviceIdKey = 'hmcp.device.id';
 const _accessTokenKey = 'hmcp.device.access_token';
+const _accessTokenExpiresAtKey = 'hmcp.device.access_token_expires_at';
 const _refreshTokenKey = 'hmcp.device.refresh_token';
 const _devicePrivateKeyKey = 'hmcp.device.private_key';
 const _devicePublicKeyKey = 'hmcp.device.public_key';

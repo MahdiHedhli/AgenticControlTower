@@ -36,12 +36,18 @@ class PairingCompletionModel {
     required this.deviceId,
     required this.accessToken,
     required this.refreshToken,
+    required this.accessTokenExpiresAt,
   });
 
   final GatewayNode node;
   final String deviceId;
   final String accessToken;
   final String refreshToken;
+
+  /// When [accessToken] stops being accepted by the event stream. Null only
+  /// against a gateway that omits it; the runtime then falls back to
+  /// refreshing reactively once the stream upgrade is refused.
+  final DateTime? accessTokenExpiresAt;
 
   factory PairingCompletionModel.fromJson(Map<String, dynamic> json) {
     final device = Map<String, dynamic>.from(json['device'] as Map);
@@ -52,8 +58,19 @@ class PairingCompletionModel {
       deviceId: device['device_id'] as String,
       accessToken: tokens['access_token'] as String,
       refreshToken: tokens['refresh_token'] as String,
+      accessTokenExpiresAt: parseTokenExpiry(tokens['expires_at']),
     );
   }
+}
+
+/// Read an `expires_at` from a token payload as UTC, tolerating a gateway that
+/// omits or malforms it — a session that cannot be scheduled is still usable,
+/// and the reactive refresh remains the backstop.
+DateTime? parseTokenExpiry(Object? value) {
+  if (value is! String) {
+    return null;
+  }
+  return DateTime.tryParse(value)?.toUtc();
 }
 
 class GatewayNode {

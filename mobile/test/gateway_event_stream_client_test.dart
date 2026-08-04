@@ -8,10 +8,10 @@ void main() {
   test('stream uri uses websocket scheme and access token', () {
     final client = GatewayEventStreamClient(
       config: GatewayConfig.fromInput('http://127.0.0.1:8787/v1'),
-      accessToken: 'access-test',
+      accessToken: () => 'access-test',
     );
 
-    final uri = client.streamUri(after: 'cursor-1');
+    final uri = client.streamUri(accessToken: 'access-test', after: 'cursor-1');
 
     expect(uri.scheme, 'ws');
     expect(uri.path, '/v1/events/stream');
@@ -34,7 +34,7 @@ void main() {
     var connectCount = 0;
     final client = GatewayEventStreamClient(
       config: GatewayConfig.fromInput('http://127.0.0.1:8787/v1'),
-      accessToken: 'access-test',
+      accessToken: () => 'access-test',
       initialBackoff: Duration.zero,
       maxReconnects: 1,
       socketConnector: (uri) {
@@ -59,22 +59,130 @@ void main() {
 
   test('surfaces connection errors via onConnectError (for token refresh)',
       () async {
-    final errors = <Object>[];
+    final errors = <GatewayStreamConnectError>[];
     final client = GatewayEventStreamClient(
       config: GatewayConfig.fromInput('http://127.0.0.1:8787/v1'),
-      accessToken: 'stale-token',
+      accessToken: () => 'stale-token',
       initialBackoff: Duration.zero,
       maxReconnects: 0,
       onConnectError: errors.add,
       socketConnector: (uri) => Stream<dynamic>.error(
-        StateError('WebSocket handshake failed: 403 Forbidden'),
+        const GatewayStreamUpgradeException('refused', statusCode: 403),
       ),
     );
 
     await client.connect().toList();
 
     expect(errors, isNotEmpty);
-    expect(errors.first.toString(), contains('403'));
+    expect(errors.first.statusCode, 403);
+    expect(errors.first.isAuthFailure, isTrue);
+  });
+
+  test('a refused upgrade is an auth failure by status, not by message',
+      () async {
+    // Regression: `_onStreamConnectError` matched "403"/"forbidden" against
+    // the error string. The real error for a refused upgrade is
+    // "Connection to '...' was not upgraded to websocket" — the status appears
+    // nowhere in it, because `package:web_socket` drops
+    // `WebSocketException.httpStatusCode` on the way out. So the refresh never
+    // fired and the stream reconnected forever with a dead token, leaving the
+    // dashboard on "Live stream connecting".
+    const refused = GatewayStreamUpgradeException(
+      "Connection to 'ws://127.0.0.1:8787/v1/events/stream' was not upgraded "
+      'to websocket',
+      statusCode: 403,
+    );
+
+    expect(refused.toString(), isNot(contains('Forbidden')));
+    expect(GatewayStreamConnectError.from(refused).isAuthFailure, isTrue);
+  });
+
+  test('refreshes the token and reconnects when the upgrade is refused',
+      () async {
+    var token = 'expired-token';
+    final tokensTried = <String?>[];
+    var refreshes = 0;
+
+    final client = GatewayEventStreamClient(
+      config: GatewayConfig.fromInput('http://127.0.0.1:8787/v1'),
+      accessToken: () => token,
+      initialBackoff: Duration.zero,
+      maxReconnects: 3,
+      onAuthFailure: () async {
+        refreshes += 1;
+        token = 'fresh-token';
+        return true;
+      },
+      socketConnector: (uri) {
+        final tried = uri.queryParameters['access_token'];
+        tokensTried.add(tried);
+        if (tried != 'fresh-token') {
+          return Stream<dynamic>.error(
+            const GatewayStreamUpgradeException('refused', statusCode: 403),
+          );
+        }
+        return Stream<dynamic>.value(jsonEncode(_eventJson(cursor: 'c1')));
+      },
+    );
+
+    final events = await client.connect().take(1).toList();
+
+    expect(refreshes, 1);
+    expect(tokensTried, ['expired-token', 'fresh-token']);
+    expect(events.single.cursor, 'c1');
+  });
+
+  test('does not re-authenticate more than once per backoff window', () async {
+    // A token the gateway keeps rejecting must not spin the reconnect loop
+    // refreshing on every attempt.
+    var refreshes = 0;
+    var connects = 0;
+
+    final client = GatewayEventStreamClient(
+      config: GatewayConfig.fromInput('http://127.0.0.1:8787/v1'),
+      accessToken: () => 'rejected-token',
+      initialBackoff: Duration.zero,
+      maxReconnects: 4,
+      onAuthFailure: () async {
+        refreshes += 1;
+        return true;
+      },
+      socketConnector: (uri) {
+        connects += 1;
+        return Stream<dynamic>.error(
+          const GatewayStreamUpgradeException('refused', statusCode: 403),
+        );
+      },
+    );
+
+    await client.connect().toList();
+
+    // One immediate retry per backoff window, never two in a row.
+    expect(refreshes, lessThan(connects));
+  });
+
+  test('a missing access token is treated as an auth failure', () async {
+    var refreshes = 0;
+    String? token;
+
+    final client = GatewayEventStreamClient(
+      config: GatewayConfig.fromInput('http://127.0.0.1:8787/v1'),
+      accessToken: () => token,
+      initialBackoff: Duration.zero,
+      maxReconnects: 2,
+      onAuthFailure: () async {
+        refreshes += 1;
+        token = 'fresh-token';
+        return true;
+      },
+      socketConnector: (uri) =>
+          Stream<dynamic>.value(jsonEncode(_eventJson(cursor: 'c1'))),
+    );
+
+    final events = await client.connect().take(1).toList();
+
+    expect(refreshes, 1);
+    expect(events.single.cursor, 'c1');
   });
 
   test('cancel completes promptly while stuck in the reconnect loop', () async {
@@ -85,14 +193,14 @@ void main() {
     var connects = 0;
     final client = GatewayEventStreamClient(
       config: GatewayConfig.fromInput('http://127.0.0.1:8787/v1'),
-      accessToken: 'revoked-token',
+      accessToken: () => 'revoked-token',
       // Long backoff so the loop is asleep when we cancel — the exact state
       // the operator hits.
       initialBackoff: const Duration(minutes: 5),
       socketConnector: (uri) {
         connects += 1;
         return Stream<dynamic>.error(
-          StateError('WebSocket handshake failed: 403 Forbidden'),
+          const GatewayStreamUpgradeException('refused', statusCode: 403),
         );
       },
     );

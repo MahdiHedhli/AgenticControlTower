@@ -1,12 +1,27 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:web_socket_channel/web_socket_channel.dart';
-
 import '../config/gateway_config.dart';
 import '../models/core_models.dart';
+import 'gateway_socket_connector.dart';
+import 'gateway_stream_errors.dart';
+
+export 'gateway_stream_errors.dart';
 
 typedef GatewayEventSocketConnector = Stream<dynamic> Function(Uri uri);
+
+/// Supplies the access token for the next connection attempt.
+///
+/// Read per attempt rather than captured once: the paired-device access token
+/// has a 15 minute TTL, so a stream that outlives one token has to reconnect
+/// with the token the runtime holds *now*, not the one it held at construction.
+typedef GatewayAccessTokenProvider = FutureOr<String?> Function();
+
+/// Re-authenticates after the gateway refuses the upgrade with 401/403.
+///
+/// Returns true when a fresh access token is available, which reconnects
+/// immediately instead of waiting out a backoff window.
+typedef GatewayStreamReauthenticator = Future<bool> Function();
 
 class GatewayEventStreamClient {
   const GatewayEventStreamClient({
@@ -17,21 +32,26 @@ class GatewayEventStreamClient {
     this.maxBackoff = const Duration(seconds: 20),
     this.maxReconnects,
     this.onConnectError,
+    this.onAuthFailure,
   }) : _socketConnector = socketConnector;
 
   final GatewayConfig config;
-  final String accessToken;
+  final GatewayAccessTokenProvider accessToken;
   final GatewayEventSocketConnector? _socketConnector;
   final Duration initialBackoff;
   final Duration maxBackoff;
   final int? maxReconnects;
 
-  /// Called on each failed connection attempt with the raw error. Lets the
-  /// caller distinguish an auth failure (expired access token -> HTTP 403/401 in
-  /// the error) from a transient network drop and refresh the token if needed.
-  final void Function(Object error)? onConnectError;
+  /// Called on each failed connection attempt, with the HTTP status of the
+  /// refused upgrade when the platform reports one.
+  final void Function(GatewayStreamConnectError error)? onConnectError;
 
-  Uri streamUri({String? after}) {
+  /// Called when a failed attempt was an auth rejection. Refresh the access
+  /// token here; returning true retries at once with whatever
+  /// [accessToken] now yields.
+  final GatewayStreamReauthenticator? onAuthFailure;
+
+  Uri streamUri({required String accessToken, String? after}) {
     final httpUri = config.resolve('/events/stream', {
       'access_token': accessToken,
       'after': after,
@@ -61,30 +81,59 @@ class GatewayEventStreamClient {
     Future<void> run() async {
       var cursor = after;
       var reconnects = 0;
+      // At most one immediate re-auth retry per backoff window, so a token the
+      // gateway keeps rejecting cannot spin this loop.
+      var reauthenticated = false;
+      var retryNow = false;
       while (!cancelled &&
           (maxReconnects == null || reconnects <= maxReconnects!)) {
+        retryNow = false;
         try {
-          await for (final raw in _connectRaw(streamUri(after: cursor))) {
+          final token = await accessToken();
+          if (cancelled) {
+            break;
+          }
+          if (token == null || token.isEmpty) {
+            throw const GatewayStreamUpgradeException(
+              'no access token for the event stream',
+              statusCode: 401,
+            );
+          }
+          await for (final raw
+              in _connectRaw(streamUri(accessToken: token, after: cursor))) {
             if (cancelled) {
               break;
             }
             final event = parseGatewayEvent(raw);
             cursor = event.cursor;
             reconnects = 0;
+            reauthenticated = false;
             controller.add(event);
           }
         } on Object catch (error) {
           // The caller observes liveness through missing events and the next
           // successful event. Requests remain fail-closed because approvals
-          // still require signed HTTP decisions. Surface the error so the
-          // caller can refresh an expired access token and reconnect.
+          // still require signed HTTP decisions.
           if (!cancelled) {
-            onConnectError?.call(error);
+            final failure = GatewayStreamConnectError.from(error);
+            onConnectError?.call(failure);
+            final reauthenticate = onAuthFailure;
+            if (failure.isAuthFailure &&
+                !reauthenticated &&
+                reauthenticate != null) {
+              reauthenticated = true;
+              retryNow = await reauthenticate();
+            }
           }
         }
 
         if (cancelled) {
           break;
+        }
+        if (retryNow) {
+          // Credentials just changed. Reconnect now rather than leaving the
+          // operator on a stale dashboard for a failure already fixed.
+          continue;
         }
         reconnects += 1;
         if (maxReconnects != null && reconnects > maxReconnects!) {
@@ -96,6 +145,7 @@ class GatewayEventStreamClient {
           sleep.future,
         ]);
         wake = null;
+        reauthenticated = false;
       }
       await controller.close();
     }
@@ -118,7 +168,7 @@ class GatewayEventStreamClient {
     if (connector != null) {
       return connector(uri);
     }
-    return WebSocketChannel.connect(uri).stream;
+    return connectGatewayWebSocket(uri);
   }
 
   Duration _backoffFor(int attempt) {

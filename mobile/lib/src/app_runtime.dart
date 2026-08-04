@@ -41,6 +41,8 @@ class HermesAppRuntime extends ChangeNotifier {
     PushTokenChannel pushToken = const PushTokenChannel(),
     Duration pushTokenTimeout = pushTokenRequestTimeout,
     Duration bootTimeout = defaultBootTimeout,
+    Duration accessTokenRefreshSkew = defaultAccessTokenRefreshSkew,
+    Duration accessTokenRefreshRetry = defaultAccessTokenRefreshRetry,
     GatewayEventSocketConnector? socketConnector,
   })  : _configStore = configStore,
         _keyStore = keyStore,
@@ -48,6 +50,8 @@ class HermesAppRuntime extends ChangeNotifier {
         _pushToken = pushToken,
         _pushTokenTimeout = pushTokenTimeout,
         _bootTimeout = bootTimeout,
+        _accessTokenRefreshSkew = accessTokenRefreshSkew,
+        _accessTokenRefreshRetry = accessTokenRefreshRetry,
         _socketConnector = socketConnector;
 
   /// Hard bound on everything that runs before `runApp()`. Local setup
@@ -66,12 +70,26 @@ class HermesAppRuntime extends ChangeNotifier {
   /// notification prompt, the token callback may simply never arrive.
   static const Duration pushTokenRequestTimeout = Duration(seconds: 10);
 
+  /// How far ahead of expiry the access token is refreshed.
+  ///
+  /// The gateway issues access tokens with a 15 minute TTL and the event stream
+  /// is their only consumer, so without this the live stream drops on a 403
+  /// every 15 minutes and recovers only after a reconnect. Wide enough to
+  /// absorb a slow or briefly-offline refresh, far short of the TTL so a token
+  /// is never rotated more than once per window.
+  static const Duration defaultAccessTokenRefreshSkew = Duration(minutes: 2);
+
+  /// Retry cadence when a scheduled refresh fails and the token is still live.
+  static const Duration defaultAccessTokenRefreshRetry = Duration(seconds: 45);
+
   final GatewayConfigStore _configStore;
   final SecureKeyStore _keyStore;
   final SecureEnclaveChannel _enclave;
   final PushTokenChannel _pushToken;
   final Duration _pushTokenTimeout;
   final Duration _bootTimeout;
+  final Duration _accessTokenRefreshSkew;
+  final Duration _accessTokenRefreshRetry;
   final GatewayEventSocketConnector? _socketConnector;
   String? _apnsToken;
   bool _pushHandlerInstalled = false;
@@ -100,7 +118,9 @@ class HermesAppRuntime extends ChangeNotifier {
   GatewayEvent? _lastEvent;
   final List<GatewayEvent> _recentEvents = [];
   StreamSubscription<GatewayEvent>? _eventSubscription;
-  bool _refreshingToken = false;
+  DateTime? _accessTokenExpiresAt;
+  Timer? _accessTokenRefreshTimer;
+  Future<bool>? _refreshInFlight;
   PairingSessionModel? _lastPairing;
 
   /// Build the runtime for `main()`. Everything awaited here is local and
@@ -233,6 +253,10 @@ class HermesAppRuntime extends ChangeNotifier {
     _config = await _configStore.read();
     _deviceId = await _keyStore.readDeviceId();
     _accessToken = await _keyStore.readAccessToken();
+    // Read only. Arming the refresh timer here would let a token that expired
+    // while the app was closed fire a network call before the first frame.
+    // [startBackgroundBootstrap] schedules it once the UI is up.
+    _accessTokenExpiresAt = await _keyStore.readAccessTokenExpiry();
     _refreshToken = await _keyStore.readRefreshToken();
     _privateKey = await _keyStore.readDevicePrivateKey();
     _publicKey = await _keyStore.readDevicePublicKey();
@@ -244,6 +268,7 @@ class HermesAppRuntime extends ChangeNotifier {
       await _keyStore.clear();
       _deviceId = null;
       _accessToken = null;
+      _accessTokenExpiresAt = null;
       _refreshToken = null;
       _privateKey = null;
       _publicKey = null;
@@ -277,6 +302,7 @@ class HermesAppRuntime extends ChangeNotifier {
     if (!(isPaired && _accessToken != null)) {
       return;
     }
+    _scheduleAccessTokenRefresh();
     await _startEventStream();
     notifyListeners();
     await _registerPushToken();
@@ -392,11 +418,14 @@ class HermesAppRuntime extends ChangeNotifier {
       deviceId: completion.deviceId,
       accessToken: completion.accessToken,
       refreshToken: completion.refreshToken,
+      accessTokenExpiresAt: completion.accessTokenExpiresAt,
     );
     _deviceId = completion.deviceId;
     _accessToken = completion.accessToken;
+    _accessTokenExpiresAt = completion.accessTokenExpiresAt;
     _refreshToken = completion.refreshToken;
     _towerPublicKeyB64 = towerKeyB64;
+    _scheduleAccessTokenRefresh();
     _clearanceKeyProtection = await _resolveProtection();
     _lastPairing = null;
     _connectionStatus = 'Paired with ${completion.node.displayName}';
@@ -528,10 +557,12 @@ class HermesAppRuntime extends ChangeNotifier {
 
   Future<void> clearPairing() async {
     await _stopEventStream();
+    _cancelAccessTokenRefresh();
     await _enclave.clearKey();
     await _keyStore.clear();
     _deviceId = null;
     _accessToken = null;
+    _accessTokenExpiresAt = null;
     _refreshToken = null;
     _privateKey = null;
     _publicKey = null;
@@ -630,6 +661,7 @@ class HermesAppRuntime extends ChangeNotifier {
 
   @override
   void dispose() {
+    _cancelAccessTokenRefresh();
     _eventSubscription?.cancel();
     super.dispose();
   }
@@ -646,9 +678,14 @@ class HermesAppRuntime extends ChangeNotifier {
     _eventStreamConnected = false;
     _eventSubscription = GatewayEventStreamClient(
       config: _config,
-      accessToken: token,
+      // Read live, and refresh first if the token is at its expiry. The client
+      // reconnects for as long as it is listened to; the token it started with
+      // expires after 15 minutes, and a reconnect after a suspend can outlive
+      // the scheduled refresh by any amount.
+      accessToken: _accessTokenForStream,
       socketConnector: _socketConnector,
       onConnectError: _onStreamConnectError,
+      onAuthFailure: _refreshAccessTokenForStream,
     ).connect(after: _lastEventCursor).listen(
       _handleGatewayEvent,
       onError: (Object error) {
@@ -670,34 +707,115 @@ class HermesAppRuntime extends ChangeNotifier {
     await _startEventStream();
   }
 
-  /// The paired-device access token has a short TTL; when it expires the event
-  /// stream gets HTTP 403 and stops delivering. Detect that and refresh the
-  /// token (signed) then reconnect, instead of looping forever on a dead token.
-  void _onStreamConnectError(Object error) {
-    final text = error.toString().toLowerCase();
-    final looksLikeAuth = text.contains('403') ||
-        text.contains('401') ||
-        text.contains('forbidden') ||
-        text.contains('unauthor');
-    if (looksLikeAuth) {
-      unawaited(_refreshTokenAndRestartStream());
-    }
+  /// Report why an attempt failed. The stream client owns the retry.
+  void _onStreamConnectError(GatewayStreamConnectError error) {
+    final detail = operatorErrorMessage(error.error, context: 'eventStream');
+    _eventStreamConnected = false;
+    _eventStreamStatus = error.isAuthFailure
+        ? 'Live stream re-authenticating'
+        : 'Live stream reconnecting. $detail';
+    notifyListeners();
   }
 
-  Future<void> _refreshTokenAndRestartStream() async {
-    if (_refreshingToken) {
+  /// Whether the stored access token is at or past its refresh point.
+  ///
+  /// A null expiry means unknown — an install paired before the expiry was
+  /// persisted, or a gateway that omitted it — and reads as "not due" so those
+  /// sessions fall back to refreshing reactively rather than on every attempt.
+  bool get _accessTokenIsDue {
+    final expiry = _accessTokenExpiresAt;
+    if (expiry == null) {
+      return false;
+    }
+    return !DateTime.now()
+        .toUtc()
+        .isBefore(expiry.subtract(_accessTokenRefreshSkew));
+  }
+
+  /// The token for the stream's next connection attempt, refreshed first if it
+  /// is at its expiry.
+  ///
+  /// The scheduled refresh covers a connection that simply stays open. This
+  /// covers everything else: iOS suspends timers in the background, so a
+  /// reconnect on resume can arrive long after the scheduled refresh was due.
+  Future<String?> _accessTokenForStream() async {
+    if (_accessTokenIsDue) {
+      await _refreshAccessTokenOnce();
+    }
+    return _accessToken;
+  }
+
+  /// Refresh the access token after the gateway refused the stream upgrade.
+  ///
+  /// The paired-device access token has a 15 minute TTL and the event stream is
+  /// its only consumer — signed HTTP requests authenticate with the device key
+  /// and never expire, which is why every REST call kept returning 200 while
+  /// the WebSocket upgrade 403'd indefinitely. Returns true when a fresh token
+  /// is in hand, which reconnects the stream immediately.
+  Future<bool> _refreshAccessTokenForStream() async {
+    final refreshed = await _refreshAccessTokenOnce();
+    // A refresh the gateway rejects means the pairing itself is gone. Say so
+    // rather than leaving the dashboard on "Live stream connecting" forever.
+    _eventStreamStatus = refreshed
+        ? 'Live stream re-authenticating'
+        : 'Live stream unauthorized — pair this device again';
+    notifyListeners();
+    return refreshed;
+  }
+
+  /// Refresh, coalescing concurrent callers onto one request.
+  ///
+  /// Every refresh rotates the refresh token, so two in flight at once would
+  /// race to invalidate each other's. The proactive timer, the pre-connect
+  /// freshness check and the post-403 recovery can all fire together.
+  Future<bool> _refreshAccessTokenOnce() {
+    return _refreshInFlight ??=
+        refreshAccessToken().whenComplete(() => _refreshInFlight = null);
+  }
+
+  /// Arm the pre-expiry refresh for the current token. Never call before the
+  /// first frame: a token that expired while the app was closed schedules a
+  /// zero-delay refresh, which is network work.
+  void _scheduleAccessTokenRefresh() {
+    _accessTokenRefreshTimer?.cancel();
+    _accessTokenRefreshTimer = null;
+    final expiry = _accessTokenExpiresAt;
+    if (expiry == null || !isPaired) {
       return;
     }
-    _refreshingToken = true;
-    try {
-      _eventStreamStatus = 'Live stream re-authenticating';
-      notifyListeners();
-      if (await refreshAccessToken()) {
-        await _restartEventStream();
-      }
-    } finally {
-      _refreshingToken = false;
+    final due =
+        expiry.subtract(_accessTokenRefreshSkew).difference(DateTime.now().toUtc());
+    _accessTokenRefreshTimer = Timer(
+      due.isNegative ? Duration.zero : due,
+      () => unawaited(_refreshAccessTokenAhead()),
+    );
+  }
+
+  void _cancelAccessTokenRefresh() {
+    _accessTokenRefreshTimer?.cancel();
+    _accessTokenRefreshTimer = null;
+  }
+
+  Future<void> _refreshAccessTokenAhead() async {
+    _accessTokenRefreshTimer = null;
+    if (!isPaired) {
+      return;
     }
+    if (await _refreshAccessTokenOnce()) {
+      // refreshAccessToken re-arms for the new token.
+      return;
+    }
+    // Offline, or the gateway is down. Keep trying only while the current token
+    // is still alive; past expiry there is nothing left to get ahead of and the
+    // stream's own 403 recovery takes over.
+    final expiry = _accessTokenExpiresAt;
+    if (expiry == null || !DateTime.now().toUtc().isBefore(expiry)) {
+      return;
+    }
+    _accessTokenRefreshTimer = Timer(
+      _accessTokenRefreshRetry,
+      () => unawaited(_refreshAccessTokenAhead()),
+    );
   }
 
   /// Exchange the refresh token for a fresh access token (signed request).
@@ -720,11 +838,14 @@ class HermesAppRuntime extends ChangeNotifier {
       }
       _accessToken = newAccess;
       _refreshToken = newRefresh;
+      _accessTokenExpiresAt = parseTokenExpiry(response['expires_at']);
       await _keyStore.saveDeviceSession(
         deviceId: deviceId,
         accessToken: newAccess,
         refreshToken: newRefresh,
+        accessTokenExpiresAt: _accessTokenExpiresAt,
       );
+      _scheduleAccessTokenRefresh();
       return true;
     } on Object {
       return false;
