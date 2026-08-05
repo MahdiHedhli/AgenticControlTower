@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
@@ -56,7 +57,7 @@ String _describe(Object error) {
     };
   }
   if (error is GatewayApiException) {
-    return _gatewayReason(error.statusCode);
+    return _gatewayReason(error.statusCode, error.body);
   }
   if (error is TimeoutException) {
     return 'The control tower took too long to respond.';
@@ -93,7 +94,33 @@ String _nativeReason(PlatformException error) {
   return '';
 }
 
-String _gatewayReason(int statusCode) {
+/// The tower's machine-readable conflict codes, mapped to what actually
+/// happened to the operator.
+///
+/// Every 409 used to render as "That decision was already recorded". That is
+/// false for most of them and dangerous for one: an operator who taps Deny on a
+/// clearance a standing grant already approved was told their decision landed,
+/// and walked away believing they had stopped something that in fact ran. The
+/// tower now names the outcome; this is where the operator reads it.
+const Map<String, String> _conflictReasons = {
+  'approval_already_approved':
+      'This was already APPROVED — by a standing grant or another device. '
+          'Your decision was not recorded. If it should not have run, revoke '
+          'the grant and stop the agent.',
+  'approval_already_denied': 'This was already denied. Your decision was not '
+      'recorded, but the outcome matches.',
+  'approval_already_expired': 'This request expired before you answered, so '
+      'nothing was approved. Ask the agent to request again.',
+  'approval_expired': 'This request expired just as you answered, so nothing '
+      'was approved. Ask the agent to request again.',
+  'approval_cancelled': 'The agent withdrew this request, so there was nothing '
+      'to decide.',
+  'approval_consumed': 'This was already approved and carried out by the '
+      'agent. Your decision was not recorded.',
+  'request_replayed': 'That request was sent twice. Try again.',
+};
+
+String _gatewayReason(int statusCode, String body) {
   if (statusCode == 401 || statusCode == 403) {
     return 'The control tower refused this request. Pair this device again.';
   }
@@ -101,7 +128,16 @@ String _gatewayReason(int statusCode) {
     return 'The control tower no longer has that record.';
   }
   if (statusCode == 409) {
-    return 'That decision was already recorded.';
+    final code = _conflictCode(body);
+    final reason = _conflictReasons[code];
+    if (reason != null) {
+      return reason;
+    }
+    // An older tower, or a conflict this build does not know. Say only what is
+    // certainly true rather than guessing which outcome occurred -- the old
+    // blanket sentence was wrong far more often than it was right.
+    return 'The control tower could not accept that decision because the '
+        'request is no longer open. Refresh to see its current state.';
   }
   if (statusCode == 429) {
     return 'Too many requests — try again in a moment.';
@@ -124,4 +160,29 @@ bool _looksLikeNetwork(String detail) {
     'Software caused connection abort',
   ];
   return markers.any(detail.contains);
+}
+
+/// Pull the tower's conflict code out of the response body.
+///
+/// GatewayApiException.body was previously discarded entirely, which is why one
+/// sentence had to cover six different outcomes. Parsing is deliberately
+/// defensive: an unparseable body falls through to the honest generic message
+/// rather than asserting something that may be false.
+String? _conflictCode(String body) {
+  if (body.isEmpty) {
+    return null;
+  }
+  try {
+    final decoded = jsonDecode(body);
+    if (decoded is Map<String, dynamic>) {
+      final detail = decoded['detail'];
+      if (detail is Map<String, dynamic>) {
+        final error = detail['error'];
+        return error is String ? error : null;
+      }
+    }
+  } on FormatException {
+    return null;
+  }
+  return null;
 }

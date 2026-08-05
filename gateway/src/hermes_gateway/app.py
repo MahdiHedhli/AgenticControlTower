@@ -3075,6 +3075,63 @@ def _expire_pending_approvals(store: SQLiteStore) -> None:
             )
 
 
+#: One machine-readable code per distinct reason a clearance will not accept a
+#: decision. These used to be ONE string -- "approval is not pending" -- for six
+#: different things, and the phone rendered every 409 as "That decision was
+#: already recorded". That sentence is false for most of them: an expired
+#: clearance recorded no decision at all, a cancelled one was withdrawn by the
+#: agent, a consumed one was already carried out. It is worst for `approved`: an
+#: operator who taps Deny on a clearance a standing grant already approved was
+#: told their decision was recorded, and walked away believing they had stopped
+#: something that in fact ran.
+#:
+#: The state travels in the body so a client never parses prose, and
+#: decided_by/decided_at answer the question the operator actually has next --
+#: who resolved this, and when.
+APPROVAL_CONFLICT_CODES: dict[str, str] = {
+    "approved": "approval_already_approved",
+    "denied": "approval_already_denied",
+    "expired": "approval_already_expired",
+    "cancelled": "approval_cancelled",
+    # Two-phase consume (BrowserBridge seam): approved AND taken by the runtime.
+    "reserved": "approval_consumed",
+    "committed": "approval_consumed",
+}
+
+APPROVAL_CONFLICT_MESSAGES: dict[str, str] = {
+    "approval_already_approved": "approval was already approved",
+    "approval_already_denied": "approval was already denied",
+    "approval_already_expired": "approval expired before this decision",
+    "approval_cancelled": "approval was cancelled before this decision",
+    "approval_consumed": "approval was already consumed by the runtime",
+    "approval_expired": "approval expired before this decision",
+    "approval_not_pending": "approval is not pending",
+}
+
+
+def _approval_conflict(
+    approval: dict[str, Any],
+    *,
+    code: str,
+    state: str,
+    attempted_state: str,
+) -> HTTPException:
+    """A 409 that says which of the conflicting outcomes actually happened."""
+    return HTTPException(
+        status.HTTP_409_CONFLICT,
+        detail={
+            "error": code,
+            "message": APPROVAL_CONFLICT_MESSAGES.get(code, "approval is not pending"),
+            "approval_id": approval["approval_id"],
+            "state": state,
+            "attempted_state": attempted_state,
+            "decided_at": approval.get("decided_at"),
+            "decided_by": approval.get("approved_by"),
+            "expires_at": approval.get("expires_at"),
+        },
+    )
+
+
 def _transition_approval(
     *,
     store: SQLiteStore,
@@ -3092,7 +3149,13 @@ def _transition_approval(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "approval not found") from exc
 
     if approval["state"] != "pending":
-        raise HTTPException(status.HTTP_409_CONFLICT, "approval is not pending")
+        current_state = approval["state"]
+        raise _approval_conflict(
+            approval,
+            code=APPROVAL_CONFLICT_CODES.get(current_state, "approval_not_pending"),
+            state=current_state,
+            attempted_state=target_state,
+        )
 
     channel = principal.clearance_channel
     if target_state == "approved":
@@ -3137,7 +3200,17 @@ def _transition_approval(
             event_type="approval.resolved",
             payload={"approval_id": approval_id, "state": "expired"},
         )
-        raise HTTPException(status.HTTP_409_CONFLICT, "approval expired")
+        # Distinct from `approval_already_expired`: the clearance was still
+        # pending when this request arrived and THIS request is what closed it.
+        # No decision was recorded either way, but only this code means "you
+        # were racing the clock", which the operator can act on by asking the
+        # agent to request again.
+        raise _approval_conflict(
+            approval,
+            code="approval_expired",
+            state="expired",
+            attempted_state=target_state,
+        )
 
     device_channel: str | None = None
     try:
@@ -3205,7 +3278,18 @@ def _transition_approval(
     # write approval state without passing through here at all, so they take the
     # same claim. Guarding only this surface relocates the window.
     if not store.claim_approval_transition(approval_id, target_state):
-        raise HTTPException(status.HTTP_409_CONFLICT, "approval is not pending")
+        # Lost the race. Re-read so the body names the state that actually won
+        # rather than the stale one this request started from -- the operator
+        # who lost a decision race is the one most likely to be misled about
+        # what happened.
+        current = store.get_approval(approval_id)
+        current_state = current["state"]
+        raise _approval_conflict(
+            current,
+            code=APPROVAL_CONFLICT_CODES.get(current_state, "approval_not_pending"),
+            state=current_state,
+            attempted_state=target_state,
+        )
 
     # This runs BEFORE resolve_approval, which is the whole of the fix for the
     # surfaces 5bd73792 did not reach. Only the grant outcome can say which

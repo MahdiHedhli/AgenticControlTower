@@ -270,7 +270,12 @@ class TestSinglePhaseResolve:
             device_id=paired["device"]["device_id"],
         )
         assert second.status_code == 409
-        assert "not pending" in second.json()["detail"]
+        # The detail is now a structured object, not prose: an operator who
+        # taps Deny on an already-approved clearance must be told it was
+        # APPROVED, not the ambiguous "already recorded".
+        detail = second.json()["detail"]
+        assert detail["error"] == "approval_already_approved"
+        assert detail["state"] == "approved"
 
 
 class TestInterventionPlaceholder:

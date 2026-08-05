@@ -210,7 +210,17 @@ async def verify_signed_request(
             device_id=device_id,
             nonce=nonce,
         )
-        raise HTTPException(status.HTTP_409_CONFLICT, "replayed request nonce")
+        # Also a 409, and it used to be indistinguishable from an approval
+        # conflict at the client: the phone said "That decision was already
+        # recorded" for a request that never reached approval logic at all. A
+        # replay is retryable with a fresh nonce; an approval conflict is not.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "error": "request_replayed",
+                "message": "replayed request nonce",
+            },
+        )
 
     return VerifiedDevice(
         device_id=device["device_id"],

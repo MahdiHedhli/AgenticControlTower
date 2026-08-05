@@ -81,7 +81,10 @@ def test_nonce_replay_rejected(client: TestClient) -> None:
 
     assert first.status_code == 200
     assert second.status_code == 409
-    assert second.json()["detail"] == "replayed request nonce"
+    detail = second.json()["detail"]
+    # A replay is retryable with a fresh nonce; an approval conflict is not.
+    # Both are 409, so the client can only tell them apart by this code.
+    assert detail["error"] == "request_replayed"
 
 
 def test_body_tampering_rejected(client: TestClient) -> None:

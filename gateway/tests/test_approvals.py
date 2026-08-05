@@ -214,7 +214,10 @@ def test_invalid_transition_rejected(client: TestClient) -> None:
     )
 
     assert second.status_code == 409
-    assert second.json()["detail"] == "approval is not pending"
+    detail = second.json()["detail"]
+    assert detail["error"] == "approval_already_approved"
+    assert detail["state"] == "approved"
+    assert detail["attempted_state"] == "denied"
 
 
 def test_expired_approval_cannot_be_approved(client: TestClient) -> None:
@@ -234,7 +237,10 @@ def test_expired_approval_cannot_be_approved(client: TestClient) -> None:
     )
 
     assert response.status_code == 409
-    assert response.json()["detail"] == "approval expired"
+    detail = response.json()["detail"]
+    # Distinct from approval_already_expired: THIS request closed the window.
+    assert detail["error"] == "approval_expired"
+    assert detail["state"] == "expired"
     assert approval_event_exists(client, paired, approval["approval_id"], "expired")
 
 
