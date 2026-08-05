@@ -1445,6 +1445,115 @@ def test_grant_whose_granting_device_was_deleted_fails_closed(
     assert refusals[0]["payload_redacted"]["reason"] == "grant_channel_authority_unresolved"
 
 
+def test_revoked_device_grants_of_every_scope_fail_closed(client: TestClient) -> None:
+    """KNOWN GAP 1 regression, across ALL grantable scopes at once: one device
+    mints session + agent + permanent grants, the device is revoked, and every
+    next matching request must go back to ``pending`` with a refusal audited.
+
+    The gate itself never reads ``scope`` — what differs per scope is the grant
+    *matching* (session pins session_id + params_fingerprint; agent and
+    permanent deliberately do not), so each scope reaches the gate through its
+    own match path. The agent-scope request is made from a brand-new session
+    because that was the verified live bypass: an agent grant consumed in a
+    session that did not exist when the device was unpaired.
+
+    Revocation is ``store.revoke_device`` — the status flip alone, no cascade —
+    so the grant rows stay active and the read-side liveness gate, not the
+    cascade-write, is what refuses (the DELETE route's cascade is covered in
+    ``test_grant_device_revocation.py``)."""
+    granting = pair_device(client)
+    auditor = pair_device(client)
+
+    session_seed = create_approval(
+        client, action_id="act_3scope_s1", requested_tool="git_status"
+    )
+    decide(client, granting, session_seed, scope="session")
+    agent_seed = create_approval(
+        client,
+        action_id="act_3scope_a1",
+        requested_tool="git_log",
+        payload_redacted={"command": "git log -1"},
+    )
+    decide(client, granting, agent_seed, scope="agent")
+    permanent_seed = create_approval(
+        client,
+        action_id="act_3scope_p1",
+        requested_tool="ls_repo",
+        payload_redacted={"command": "ls"},
+    )
+    decide(client, granting, permanent_seed, scope="permanent")
+
+    # Sanity: all three scopes auto-approve while the device is active.
+    assert (
+        create_approval(client, action_id="act_3scope_s2", requested_tool="git_status")[
+            "state"
+        ]
+        == "approved"
+    )
+    assert (
+        create_approval(
+            client,
+            action_id="act_3scope_a2",
+            requested_tool="git_log",
+            session_id="sess_other",
+            payload_redacted={"command": "git log -5"},
+        )["state"]
+        == "approved"
+    )
+    assert (
+        create_approval(
+            client,
+            action_id="act_3scope_p2",
+            requested_tool="ls_repo",
+            agent_id="agent_other",
+            session_id="sess_other",
+            payload_redacted={"command": "ls -la"},
+        )["state"]
+        == "approved"
+    )
+
+    assert client.app.state.store.revoke_device(granting["device"]["device_id"])
+    active = [g for g in list_grants(client, auditor) if g["state"] == "active"]
+    assert len(active) == 3, (
+        "precondition: all three grant rows must survive the status flip so the "
+        "read-side gate, not the cascade, is what refuses"
+    )
+
+    session_after = create_approval(
+        client, action_id="act_3scope_s3", requested_tool="git_status"
+    )
+    agent_after = create_approval(
+        client,
+        action_id="act_3scope_a3",
+        requested_tool="git_log",
+        session_id="sess_born_after_revocation",
+        payload_redacted={"command": "git log --stat"},
+    )
+    permanent_after = create_approval(
+        client,
+        action_id="act_3scope_p3",
+        requested_tool="ls_repo",
+        agent_id="agent_other",
+        session_id="sess_born_after_revocation",
+        payload_redacted={"command": "ls -R"},
+    )
+    for approval in (session_after, agent_after, permanent_after):
+        assert approval["state"] == "pending", (
+            f"BYPASS: revoked device's grant still auto-approved "
+            f"{approval['requested_tool']}: {approval['state']}"
+        )
+        assert approval.get("approved_by") != "standing_grant"
+
+    refusals = audit_events(client, auditor, "approval_auto_satisfy_refused")
+    assert len(refusals) == 3
+    assert {r["payload_redacted"]["reason"] for r in refusals} == {"grant_device_revoked"}
+    assert {r["payload_redacted"]["requested_tool"] for r in refusals} == {
+        "git_status",
+        "git_log",
+        "ls_repo",
+    }
+
+
 def test_grant_with_no_granting_device_recorded_fails_closed(client: TestClient) -> None:
     """A row with no ``granted_by_device_id`` records no human authority at all —
     it can only have arrived by predating the feature or by a hand-edited
@@ -1482,3 +1591,127 @@ def test_the_policy_half_alone_cannot_see_a_local_terminal_only_family(
         is None
     )
     assert required_channels_for_request(risk_family="routine", settings=settings) is None
+
+
+# --- panic dominance over standing authority ---------------------------------
+#
+# Cancelling a session's live clearances is only half an emergency stop. Grants
+# are consumed at approval CREATION time, so a grant that survives the panic
+# re-clears the agent's very next tool call with human_approved=False: the stop
+# cancels everything in flight and then waves through everything after it.
+
+
+def panic(
+    client: TestClient,
+    paired: dict,
+    *,
+    session_id: str = "sess_mock",
+    tag: str = "1",
+) -> dict:
+    response = signed_request(
+        client,
+        "POST",
+        f"/v1/sessions/{session_id}/interventions",
+        private_key=paired["private_key"],
+        device_id=paired["device"]["device_id"],
+        json_body={
+            "intervention_id": f"int_panic_{session_id}_{tag}",
+            "type": "emergency_stop",
+            "reason": "operator panic",
+            "signed_payload": {"type": "emergency_stop"},
+            "signature": "hmcp-device-request-signature",
+        },
+    )
+    assert response.status_code in (200, 201), response.text
+    return response.json()
+
+
+def test_panic_revokes_a_session_grant_and_stops_auto_approval(
+    client: TestClient,
+) -> None:
+    """The regression test proper: fails before the fix, passes after.
+
+    Before the fix the panic path touched approval_requests only, so the grant
+    stayed 'active' and the post-panic request came back approved by
+    'standing_grant' with no human in the loop.
+    """
+    paired = pair_device(client)
+    first = create_approval(client, action_id="act_panic_1", requested_tool="git_status")
+    decide(client, paired, first, scope="session")
+
+    # Positive control: the grant really is live before the panic. Without this
+    # the test could pass simply because grants never worked.
+    second = create_approval(client, action_id="act_panic_2", requested_tool="git_status")
+    assert second["state"] == "approved"
+    assert second["decision_scope"] == "session"
+
+    panic(client, paired, tag="stop")
+
+    third = create_approval(client, action_id="act_panic_3", requested_tool="git_status")
+    assert third["state"] != "approved", (
+        "a standing grant survived the emergency stop and cleared the next "
+        "request -- the panic cancelled everything in flight and then waved "
+        "through everything after it"
+    )
+    assert third.get("approved_by") != "standing_grant"
+
+
+def test_panic_revokes_agent_and_permanent_grants_too(client: TestClient) -> None:
+    """'agent' and 'permanent' ignore session_id, so they outlive a session-only
+    sweep and would keep clearing the panicked session until their TTL."""
+    for scope, action in (("agent", "act_panic_agent"), ("permanent", "act_panic_perm")):
+        paired = pair_device(client)
+        first = create_approval(
+            client, action_id=f"{action}_1", requested_tool="git_status"
+        )
+        decide(client, paired, first, scope=scope)
+
+        panic(client, paired, tag=scope)
+
+        after = create_approval(
+            client, action_id=f"{action}_2", requested_tool="git_status"
+        )
+        assert after["state"] != "approved", f"{scope} grant survived the panic"
+
+
+def test_panic_audits_each_revoked_grant(client: TestClient) -> None:
+    """The audit log must name which authority the panic withdrew, not just a
+    count -- mirroring the device-deletion cascade."""
+    paired = pair_device(client)
+    first = create_approval(client, action_id="act_panic_audit", requested_tool="git_status")
+    decide(client, paired, first, scope="session")
+
+    panic(client, paired, tag="audit")
+
+    events = audit_events(client, paired, "capability_grant_revoked")
+    causes = [e.get("payload_redacted", {}).get("cause") for e in events]
+    assert "intervention:emergency_stop" in causes, (
+        f"no capability_grant_revoked event names the panic; got {causes}"
+    )
+
+
+def test_non_emergency_intervention_leaves_grants_alone(client: TestClient) -> None:
+    """Negative control. A 'pause' is not a panic; sweeping grants there would
+    make every pause cost the operator a re-approval."""
+    paired = pair_device(client)
+    first = create_approval(client, action_id="act_pause_1", requested_tool="git_status")
+    decide(client, paired, first, scope="session")
+
+    response = signed_request(
+        client,
+        "POST",
+        "/v1/sessions/sess_mock/interventions",
+        private_key=paired["private_key"],
+        device_id=paired["device"]["device_id"],
+        json_body={
+            "intervention_id": "int_pause_1",
+            "type": "pause",
+            "reason": "not a panic",
+            "signed_payload": {"type": "pause"},
+            "signature": "hmcp-device-request-signature",
+        },
+    )
+    assert response.status_code in (200, 201), response.text
+
+    after = create_approval(client, action_id="act_pause_2", requested_tool="git_status")
+    assert after["state"] == "approved", "a pause must not withdraw standing authority"

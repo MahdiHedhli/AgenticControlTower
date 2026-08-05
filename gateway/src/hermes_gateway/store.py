@@ -2537,6 +2537,87 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
             )
         return self.get_approval_grant(grant_id)
 
+    def revoke_grants_for_panic(
+        self,
+        *,
+        node_id: str,
+        session_id: str,
+        agent_ids: Iterable[str | None],
+        revoked_by: str,
+    ) -> list[dict[str, Any]]:
+        """Panic dominance for STANDING authority -- the half
+        :meth:`bulk_invalidate_approvals` cannot reach.
+
+        Cancelling a session's live clearances is not an emergency stop while a
+        standing grant survives. Grants are consumed at approval *creation*
+        time, not at decision time, so the agent's very next request is
+        auto-satisfied by ``grants.standing_grant_for_request`` and comes back
+        ``approved`` / ``approved_by='standing_grant'`` with no human in the
+        loop. Panic must therefore withdraw every grant that could clear a
+        subsequent request in the panicked session:
+
+        * ``session``   -- this session's own grants;
+        * ``agent``     -- keyed on the agent, ignores ``session_id``;
+        * ``permanent`` -- node+tool wide, ignores agent AND session.
+
+        The last two reach beyond the panicked session by construction, and that
+        is deliberate: a grant that can clear a request in the panicked session
+        must not survive the panic. Over-revocation costs a re-prompt;
+        under-revocation defeats the emergency stop.
+
+        BEGIN IMMEDIATE is load-bearing exactly as in ``append_audit_event``:
+        without it the SELECT runs in autocommit and only the UPDATE opens a
+        transaction, leaving a window in which a request racing the panic can
+        match a row this call is about to revoke -- and *that* request would be
+        cleared by authority the operator has already withdrawn.
+
+        Expired-but-still-``active`` rows are swept too. They are already dead
+        to :meth:`find_matching_grant`, but leaving them ``active`` would make
+        ``GET /v1/approval-grants`` misreport what the panic withdrew.
+
+        Returns the revoked rows so the caller can audit one
+        ``capability_grant_revoked`` per grant, matching the device-deletion
+        cascade in ``routers/identity.py``.
+        """
+        agents = [agent for agent in dict.fromkeys(agent_ids) if agent]
+        revoked_at = utc_iso()
+        # A scope this code does not know is deliberately NOT swept:
+        # find_matching_grant refuses to match it either, so it cannot clear a
+        # request. Widening this blindly would revoke authority nothing honours.
+        where = (
+            "state = 'active' AND node_id = ? AND ("
+            "scope = 'permanent'"
+            " OR (scope = 'session' AND session_id = ?)"
+        )
+        args: list[Any] = [node_id, session_id]
+        if agents:
+            placeholders = ", ".join("?" for _ in agents)
+            where += f" OR (scope = 'agent' AND agent_id IN ({placeholders}))"
+            args.extend(agents)
+        where += ")"
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = [
+                dict(row)
+                for row in db.execute(
+                    f"SELECT * FROM approval_grants WHERE {where}", tuple(args)
+                ).fetchall()
+            ]
+            if rows:
+                db.execute(
+                    f"""
+                    UPDATE approval_grants
+                    SET state = 'revoked', revoked_at = ?, revoked_by = ?
+                    WHERE {where}
+                    """,
+                    (revoked_at, revoked_by, *args),
+                )
+        for row in rows:
+            row["state"] = "revoked"
+            row["revoked_at"] = revoked_at
+            row["revoked_by"] = revoked_by
+        return rows
+
     def find_matching_grant(
         self,
         *,

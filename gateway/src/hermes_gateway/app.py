@@ -1484,10 +1484,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "cancel_task",
         }
         invalidated: list[str] = []
+        revoked_grants: list[dict[str, Any]] = []
         if payload.type in emergency_types:
             invalidated = store.bulk_invalidate_approvals(
                 session_id=session_id, reason=f"intervention:{payload.type}"
             )
+            # Invalidating live clearances is only HALF of panic dominance.
+            # Standing grants are consumed at approval CREATION time, so a
+            # surviving grant re-clears the agent's very next tool call with
+            # approved_by='standing_grant' and human_approved=False -- the
+            # emergency stop would cancel everything in flight and then wave
+            # through everything after it. Withdraw that authority too.
+            revoked_grants = store.revoke_grants_for_panic(
+                node_id=node_id,
+                session_id=session_id,
+                agent_ids=[agent_id],
+                revoked_by=f"intervention:{payload.type}",
+            )
+            for grant in revoked_grants:
+                # One event per grant, mirroring the device-deletion cascade in
+                # routers/identity.py, so the audit log says which authority the
+                # panic withdrew rather than only how many.
+                store.append_audit_event(
+                    event_type="capability_grant_revoked",
+                    actor_type="device",
+                    actor_id=device.device_id,
+                    node_id=node_id,
+                    session_id=session_id,
+                    agent_id=grant.get("agent_id"),
+                    request_id=_request_id(request),
+                    payload_redacted={
+                        "grant_id": grant.get("grant_id"),
+                        "scope": grant.get("scope"),
+                        "revoked_by": grant.get("revoked_by"),
+                        "cause": f"intervention:{payload.type}",
+                    },
+                )
             resulting_state = "approvals_invalidated"
         else:
             resulting_state = "queued"
@@ -1503,6 +1535,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "type": payload.type,
                 "reason": payload.reason,
                 "invalidated_count": len(invalidated),
+                "revoked_grant_count": len(revoked_grants),
             },
         )
         return InterventionResponse(
