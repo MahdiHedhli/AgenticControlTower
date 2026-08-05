@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -11,6 +12,15 @@ from ..local_binding import HermesLocalCaller
 from ..schemas import MobileNotifyRequest, Notification, OperatorSession
 from ..signing import VerifiedDevice
 from ..store import SQLiteStore
+
+# How often a connected stream re-reads the event table for anything written
+# since the last frame it sent. This is the "live" in Live.
+EVENT_STREAM_POLL_SECONDS = 1.0
+# Quiet-period heartbeat, so a client can tell "nothing is happening" from "the
+# socket is dead". Reset by any real event.
+EVENT_STREAM_HEARTBEAT_SECONDS = 30.0
+# Backlog handed to a client that opens the stream without a cursor.
+EVENT_STREAM_BACKLOG_LIMIT = 100
 
 
 def register_observability_routes(
@@ -102,7 +112,12 @@ def register_observability_routes(
         limit: int = 500,
         _device: VerifiedDevice = signed_device_dependency,
     ) -> dict[str, Any]:
-        events = store.list_events_after(after=after, limit=limit)
+        # Without a cursor this asked for events *after sequence 0*, i.e. the
+        # oldest `limit` rows in the table -- the archive, not the present.
+        if after:
+            events = store.list_events_after(after=after, limit=limit)
+        else:
+            events = store.list_recent_events(limit=limit)
         return {"events": events, "next_cursor": events[-1]["cursor"] if events else after}
 
     @app.websocket("/v1/events/stream")
@@ -112,36 +127,73 @@ def register_observability_routes(
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
         after = websocket.query_params.get("after")
-        heartbeat = store.create_event(
+        connected = store.create_event(
             node_id=settings.node_id,
             event_type="system.health",
             payload={"status": "healthy", "reason": "websocket_connected"},
         )
         await websocket.accept()
-        events = store.list_events_after(after=after)
-        if not events:
-            events = [heartbeat]
+        # A client with no cursor is opening a LIVE view, not requesting the
+        # archive. list_events_after(None) starts at sequence 0, so a cold
+        # launch replayed the oldest events in the database -- months of them --
+        # and, because the loop below never tailed, it stayed there for the life
+        # of the connection.
+        if after:
+            backlog = store.list_events_after(after=after)
+        else:
+            backlog = store.list_recent_events(limit=EVENT_STREAM_BACKLOG_LIMIT)
+        # Every frame this socket sends advances `cursor`, so nothing is sent
+        # twice and nothing between frames is skipped.
+        cursor = after or connected["cursor"]
         try:
-            for event in events:
+            for event in backlog:
+                cursor = event["cursor"]
                 await websocket.send_json(event)
-            while True:
-                try:
-                    message = await asyncio.wait_for(websocket.receive_text(), timeout=30)
-                except TimeoutError:
-                    event = store.create_event(
-                        node_id=settings.node_id,
-                        event_type="system.health",
-                        payload={"status": "healthy", "reason": "heartbeat"},
+            # Follow the store. The previous loop's only writes were events it
+            # minted itself -- a heartbeat on each 30s timeout and a pong on a
+            # client ping -- and it never re-read event_envelopes. Anything
+            # recorded AFTER the connect (approval.requested, agent.status,
+            # notification.created) never reached a connected client at all, so
+            # "Live" only ever showed heartbeats.
+            #
+            # receive_text() runs as its own task instead of being re-awaited
+            # under a per-poll wait_for, because cancelling a half-completed
+            # receive once a second is how a client frame gets dropped.
+            receiver = asyncio.create_task(websocket.receive_text())
+            next_heartbeat = time.monotonic() + EVENT_STREAM_HEARTBEAT_SECONDS
+            try:
+                while True:
+                    done, _ = await asyncio.wait(
+                        {receiver}, timeout=EVENT_STREAM_POLL_SECONDS
                     )
-                    await websocket.send_json(event)
-                    continue
-                if message == "ping":
-                    await websocket.send_json(
+                    if receiver in done:
+                        # Raises WebSocketDisconnect when the client hangs up.
+                        message = receiver.result()
+                        receiver = asyncio.create_task(websocket.receive_text())
+                        if message == "ping":
+                            store.create_event(
+                                node_id=settings.node_id,
+                                event_type="system.health",
+                                payload={"status": "healthy", "reason": "pong"},
+                            )
+                    elif time.monotonic() >= next_heartbeat:
                         store.create_event(
                             node_id=settings.node_id,
                             event_type="system.health",
-                            payload={"status": "healthy", "reason": "pong"},
+                            payload={"status": "healthy", "reason": "heartbeat"},
                         )
-                    )
+                    # Heartbeats and pongs are WRITTEN, never sent directly:
+                    # they leave through the same cursor-advancing tail as every
+                    # other event, so they cannot be delivered twice.
+                    pending = store.list_events_after(after=cursor)
+                    for event in pending:
+                        cursor = event["cursor"]
+                        await websocket.send_json(event)
+                    if pending:
+                        next_heartbeat = (
+                            time.monotonic() + EVENT_STREAM_HEARTBEAT_SECONDS
+                        )
+            finally:
+                receiver.cancel()
         except WebSocketDisconnect:
             return

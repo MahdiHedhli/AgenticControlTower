@@ -196,6 +196,28 @@ class ObservabilityStoreMixin:
             ).fetchall()
         return [self._event_from_row(row) for row in rows]
 
+    def list_recent_events(self, limit: int = 100) -> list[dict[str, Any]]:
+        """The newest ``limit`` events, returned oldest-first.
+
+        ``list_events_after(None)`` resolves to ``sequence > 0``, which is the
+        *start* of history, so every caller without a cursor yet -- a cold app
+        launch, a fresh websocket -- was served the OLDEST rows in the table.
+        That is the "Live tab replays June" symptom. Live views want this end.
+        """
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT * FROM (
+                    SELECT * FROM event_envelopes
+                    ORDER BY sequence DESC
+                    LIMIT ?
+                )
+                ORDER BY sequence ASC
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._event_from_row(row) for row in rows]
+
     def event_count(self) -> int:
         with self.connect() as db:
             row = db.execute("SELECT COUNT(*) AS count FROM event_envelopes").fetchone()
