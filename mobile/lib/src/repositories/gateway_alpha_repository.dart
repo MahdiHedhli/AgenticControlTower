@@ -53,12 +53,15 @@ class GatewayAlphaRepository implements AlphaRepository {
         snapshot.pendingApprovals.map(_approvalFromGateway).toList();
     // Real agent questions (TUA) replace the notification-derived assistance
     // rows so each carries its true requestId for the answer flow.
+    final approvalIdsByActionId =
+        _approvalIdsByActionId(snapshot.pendingApprovals);
     final notifications = [
       ...snapshot.notifications
           .where((notification) =>
               _kindFromNotification(notification.category) !=
               InboxKind.assistance)
-          .map(_inboxFromNotification),
+          .map((notification) =>
+              _inboxFromNotification(notification, approvalIdsByActionId)),
       ...assistance,
     ];
     final missions =
@@ -168,13 +171,15 @@ class GatewayAlphaRepository implements AlphaRepository {
     final approvals = await approvalsRepository.listPending();
     final notifications = await notificationsRepository.listRecent();
     final assistance = await _loadOpenAssistanceInbox();
+    final approvalIdsByActionId = _approvalIdsByActionId(approvals);
     return [
       ...approvals.map(_inboxFromApproval),
       ...notifications
           .where((notification) =>
               _kindFromNotification(notification.category) !=
               InboxKind.assistance)
-          .map(_inboxFromNotification),
+          .map((notification) =>
+              _inboxFromNotification(notification, approvalIdsByActionId)),
       ...assistance,
     ];
   }
@@ -378,6 +383,11 @@ MissionSummary _missionFromGateway(MissionRecord mission) {
 InboxItem _inboxFromApproval(ApprovalRequestModel approval) {
   return InboxItem(
     id: approval.approvalId,
+    // An approval-derived row's id already IS an approval id, but state it
+    // explicitly so _openItem can follow one field for every row instead of
+    // branching on where the row came from -- the branch is what let the
+    // notification case slip through with a ntf_ id.
+    approvalId: approval.approvalId,
     kind: InboxKind.approval,
     title: 'Approval required',
     subtitle: approval.summary,
@@ -388,9 +398,26 @@ InboxItem _inboxFromApproval(ApprovalRequestModel approval) {
   );
 }
 
-InboxItem _inboxFromNotification(NotificationRecord notification) {
+/// Correlate notifications to the approvals they announce.
+///
+/// `store.create_notification` and `store.create_approval` write the SAME
+/// `action_id`, which is the tower's only link between the two rows. A
+/// notification id is not an approval id.
+Map<String, String> _approvalIdsByActionId(List<ApprovalRequestModel> approvals) {
+  return {
+    for (final approval in approvals) approval.actionId: approval.approvalId,
+  };
+}
+
+InboxItem _inboxFromNotification(
+  NotificationRecord notification,
+  Map<String, String> approvalIdsByActionId,
+) {
+  final actionId = notification.actionId;
   return InboxItem(
     id: notification.notificationId,
+    approvalId:
+        actionId == null ? null : approvalIdsByActionId[actionId],
     kind: _kindFromNotification(notification.category),
     title: notification.title ?? notification.category,
     subtitle: notification.body ?? notification.state,

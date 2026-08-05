@@ -255,14 +255,18 @@ class _InboxRow extends StatelessWidget {
 }
 
 void _openItem(BuildContext context, InboxItem item) {
-  if (item.kind == InboxKind.approval) {
-    Navigator.of(context)
-        .pushNamed(HermesRoutes.approvalDetail, arguments: item.id);
-    return;
-  }
-  if (item.kind == InboxKind.security) {
-    Navigator.of(context)
-        .pushNamed(HermesRoutes.approvalDetail, arguments: item.id);
+  if (item.kind == InboxKind.approval || item.kind == InboxKind.security) {
+    // Follow approvalId, NEVER item.id. For a notification-derived row item.id
+    // is a `ntf_...` and GET /v1/approvals/{ntf_...} answers 404, which showed
+    // the operator a load-failure panel on a real, current alert. A null
+    // approvalId means there is genuinely nothing to open -- every live
+    // security_alert has no action -- so the row stays put rather than opening
+    // a screen that can only fail.
+    final approvalId = item.approvalId;
+    if (approvalId != null) {
+      Navigator.of(context)
+          .pushNamed(HermesRoutes.approvalDetail, arguments: approvalId);
+    }
     return;
   }
   if (item.kind == InboxKind.assistance) {

@@ -116,6 +116,7 @@ class InboxItem {
     required this.timeLabel,
     required this.unread,
     required this.priority,
+    this.approvalId,
   });
 
   final String id;
@@ -126,6 +127,16 @@ class InboxItem {
   final String timeLabel;
   final bool unread;
   final String priority;
+
+  /// The approval this row can open, when the tower says there is one.
+  ///
+  /// Deliberately NOT [id]. An approval-derived row's [id] *is* its approval
+  /// id, but a notification-derived row's [id] is a `ntf_...` that
+  /// `/v1/approvals/{id}` answers 404 for -- the bug this field exists to make
+  /// unrepresentable. Null means "there is nothing to open", which is the true
+  /// state of every live `security_alert` record; callers must not push the
+  /// approval detail route for it.
+  final String? approvalId;
 }
 
 class ActivityEvent {

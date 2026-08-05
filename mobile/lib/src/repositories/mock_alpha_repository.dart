@@ -356,6 +356,7 @@ const _approvals = [
 const _inbox = [
   InboxItem(
     id: 'appr-shell',
+    approvalId: 'appr-shell',
     kind: InboxKind.approval,
     title: 'Approval required',
     subtitle: 'Run migration cleanup command',
@@ -396,6 +397,7 @@ const _inbox = [
   ),
   InboxItem(
     id: 'appr-browser',
+    approvalId: 'appr-browser',
     kind: InboxKind.approval,
     title: 'Browser submit blocked',
     subtitle: 'Vendor feedback form needs review.',

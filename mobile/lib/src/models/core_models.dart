@@ -196,6 +196,7 @@ class NotificationRecord {
     this.body,
     this.agentId,
     this.sessionId,
+    this.actionId,
   });
 
   final String notificationId;
@@ -208,6 +209,16 @@ class NotificationRecord {
   final String? agentId;
   final String? sessionId;
 
+  /// The tower's correlation key back to the action this record is *about*.
+  ///
+  /// An `approval_required` notification and the approval row it announces are
+  /// written with the same `action_id` (`store.create_notification` /
+  /// `store.create_approval`). [notificationId] is NOT an approval id and
+  /// `/v1/approvals/{notification_id}` answers 404, so this is the only field a
+  /// screen may follow to an approval. Null for records that announce no action
+  /// at all -- every live `security_alert` row has it null.
+  final String? actionId;
+
   factory NotificationRecord.fromJson(Map<String, dynamic> json) {
     return NotificationRecord(
       notificationId: json['notification_id'] as String,
@@ -219,6 +230,7 @@ class NotificationRecord {
       body: json['body_safe'] as String?,
       agentId: json['agent_id'] as String?,
       sessionId: json['session_id'] as String?,
+      actionId: json['action_id'] as String?,
     );
   }
 }
