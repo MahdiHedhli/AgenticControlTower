@@ -1325,14 +1325,111 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
         approval_id: str,
         metadata: dict[str, Any],
     ) -> dict[str, Any]:
-        approval = self.get_approval(approval_id)
-        merged = (approval.get("decision_metadata") or {}) | metadata
+        # Read-merge-write MUST be one transaction. This used to read via
+        # self.get_approval() -- its own connection, SELECT in autocommit --
+        # and write on a second connection, so two concurrent stampers each
+        # merged into the metadata they read and the loser's keys vanished.
+        # This column carries the one-time consumption markers, so a lost merge
+        # is a lost "already spent".
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT decision_metadata_json FROM approval_requests WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(approval_id)
+            # `or {}` AFTER the loads, not only inside it: a stored literal
+            # "null" parses to None and `None | metadata` is a TypeError.
+            # get_approval() normalized that for free; the raw column does not.
+            existing = json.loads(row["decision_metadata_json"] or "{}") or {}
+            merged = existing | metadata
+            # "Spent" is encoded as a NON-EMPTY consumption marker, so allowing a
+            # truthy marker to be overwritten with a falsy one would hand a
+            # one-time clearance back for a second use. The guard lives here, at
+            # the single write, rather than in an audit of every call site that
+            # stamps a ref -- one of which stamps a value derived from a request
+            # field and could legitimately be empty.
+            for key in self.CONSUMPTION_MARKER_KEYS:
+                if existing.get(key) and not merged.get(key):
+                    merged[key] = existing[key]
             db.execute(
                 "UPDATE approval_requests SET decision_metadata_json = ? WHERE approval_id = ?",
                 (json.dumps(merged), approval_id),
             )
         return self.get_approval(approval_id)
+
+    #: decision_metadata keys that mark a clearance as already spent.
+    CONSUMPTION_MARKER_KEYS: tuple[str, ...] = ("handoff_consumed_by", "tui_consumed_by")
+
+    def consume_approval_once(
+        self,
+        approval_id: str,
+        marker: dict[str, Any],
+    ) -> bool:
+        """Atomically claim an approved clearance for its ONE permitted use.
+
+        Returns True if this caller won the claim, False if it was already
+        spent. Raises KeyError when the approval does not exist.
+
+        Checking "not consumed" and writing the marker MUST be one transaction.
+        They were split: the check read the row through ``get_approval()`` in
+        autocommit inside ``_require_bound_clearance``, and the marker was
+        written much later, AFTER the effect -- ``handoff.engage()``, and
+        ``await tui_manager.create_runtime(...)``. Two engagements presenting the
+        same clearance both read it unconsumed and both ran, so ONE human
+        approval authorized TWO high-risk sessions.
+
+        ``BEGIN IMMEDIATE`` takes the write lock before the read, and it is a
+        file lock, so this holds across processes and not merely across this
+        process's threads.
+
+        The marker written here must be TRUTHY: "spent" is encoded as a
+        non-empty value under one of :attr:`CONSUMPTION_MARKER_KEYS`, so a falsy
+        value would silently un-spend the clearance.
+        """
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT decision_metadata_json FROM approval_requests WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(approval_id)
+            metadata = json.loads(row["decision_metadata_json"] or "{}") or {}
+            if any(metadata.get(key) for key in self.CONSUMPTION_MARKER_KEYS):
+                return False
+            db.execute(
+                "UPDATE approval_requests SET decision_metadata_json = ? WHERE approval_id = ?",
+                (json.dumps(metadata | marker), approval_id),
+            )
+        return True
+
+    def claim_approval_transition(self, approval_id: str, target_state: str) -> bool:
+        """Atomically move an approval out of ``pending``; False if the race was lost.
+
+        A single guarded UPDATE is atomic on its own -- sqlite3 implicitly
+        BEGINs before DML -- so no explicit BEGIN IMMEDIATE is needed. What was
+        missing is that every decision path checked the state with a SELECT on
+        one connection and then wrote, unguarded, on another. Both racers passed
+        the check: both minted a standing grant, and approve racing deny/cancel
+        left the row decided against while the approve path's grant still stood.
+
+        EVERY surface that resolves a pending approval must take this claim
+        first -- the decision endpoints, the expiry sweep, the runtime cancel
+        and the runtime expiry sweep. Guarding only some of them does not narrow
+        the window, it relocates it.
+        """
+        with self.connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE approval_requests SET state = ?
+                WHERE approval_id = ? AND state = 'pending'
+                """,
+                (target_state, approval_id),
+            )
+            claimed = cursor.rowcount == 1
+        return claimed
 
     def _approval_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
         approval = dict(row)

@@ -49,6 +49,42 @@ def engage_handoff(
             actor_id=actor_id,
             params_fingerprint=params_fingerprint,
         )
+        # Spend the clearance BEFORE the effect, atomically. The "not_consumed"
+        # check inside _require_bound_clearance is a fast pre-check that keeps
+        # the ordinary rejection message; it CANNOT be the gate, because it ran
+        # on its own connection and the marker used to be written only after
+        # engage() returned. Two engagements presenting the same clearance both
+        # read it unconsumed and both ran: one human approval, two high-risk
+        # sessions. The claim below is the gate.
+        #
+        # It stamps the request id, not the engaged ref, because the engaged ref
+        # does not exist yet -- the invariant every reader relies on is
+        # "handoff_consumed_by is non-empty => spent" -- and the real ref is
+        # stamped over it once engage() succeeds. If engage() then fails the
+        # clearance stays spent: a one-time authorization that half-ran must
+        # require a fresh human decision, not become silently reusable.
+        if not store.consume_approval_once(
+            clearance["approval_id"],
+            {
+                "handoff_consumed_by": f"claim:{request_id}",
+                "handoff_consumed_at": utc_iso(),
+                "handoff_kind": handoff_kind,
+            },
+        ):
+            _reject(
+                store=store,
+                request_id=request_id,
+                actor_type=actor_type,
+                actor_id=actor_id,
+                node_id=node_id,
+                agent_id=agent_id,
+                work_ref=work_ref,
+                handoff_kind=handoff_kind,
+                handoff_ref=handoff_ref,
+                risk_family=normalized_risk_family,
+                clearance_ref=clearance_ref,
+                reason="not_consumed",
+            )
 
     engaged = engage()
     engaged_ref = _engaged_ref(handoff_kind=handoff_kind, record=engaged) or handoff_ref
@@ -56,7 +92,13 @@ def engage_handoff(
         store.update_approval_decision_metadata(
             clearance["approval_id"],
             {
-                "handoff_consumed_by": engaged_ref,
+                # Never widen the marker back to a falsy value: "spent" is
+                # encoded as a non-empty handoff_consumed_by, so overwriting the
+                # claim with an empty engaged_ref would hand the clearance back
+                # for a second use. Every caller today passes a non-empty
+                # handoff_ref, which is exactly why the guard belongs at the
+                # write rather than in an audit of five call sites.
+                "handoff_consumed_by": engaged_ref or f"claim:{request_id}",
                 "handoff_consumed_at": utc_iso(),
                 "handoff_kind": handoff_kind,
             },

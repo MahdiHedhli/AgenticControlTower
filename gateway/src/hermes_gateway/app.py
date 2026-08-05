@@ -43,6 +43,7 @@ from .grants import (
     record_auto_satisfy_refusal,
     standing_grant_for_request,
 )
+from .handoff import _reject as _reject_handoff
 from .handoff import _require_bound_clearance
 from .handoff import engage_handoff as _engage_handoff
 from .ids import new_id
@@ -114,7 +115,14 @@ from .schemas import (
     VoiceMessage,
     VoiceSession,
 )
-from .security import expires_in, has_secret_text, new_token, now_utc, parse_utc
+from .security import (
+    expires_in,
+    has_secret_text,
+    new_token,
+    now_utc,
+    parse_utc,
+    utc_iso,
+)
 from .signing import VerifiedDevice, verify_signed_request
 from .store import DEFAULT_NODE_CAPABILITIES, SQLiteStore
 from .tui import (
@@ -3037,6 +3045,10 @@ def _expire_pairing_if_needed(store: SQLiteStore, pairing: dict[str, Any]) -> di
 def _expire_pending_approvals(store: SQLiteStore) -> None:
     for approval in store.list_approvals(state="pending"):
         if parse_utc(approval["expires_at"]) <= now_utc():
+            # This sweep runs on every GET /v1/approvals/{id}. Without the claim
+            # it can stomp a final state a decision wrote microseconds earlier.
+            if not store.claim_approval_transition(approval["approval_id"], "expired"):
+                continue
             store.resolve_approval(
                 approval["approval_id"],
                 "expired",
@@ -3180,6 +3192,21 @@ def _transition_approval(
     # explicit, hard-expiring, revocable grant instead of leaving
     # decision_scope as a write nothing ever reads.
     #
+    # Claim the pending->decided transition BEFORE any privilege-escalating
+    # write. The `approval["state"] != "pending"` check ~110 lines up ran on its
+    # own connection and resolve_approval's UPDATE below is unguarded, so two
+    # concurrent decisions on one approval both passed and both wrote: two
+    # standing grants from one approval, or -- approve racing deny/cancel -- a
+    # decided-against row whose approve-path grant survives it. Placed after the
+    # channel and expiry gates so a rejected decision still leaves the row
+    # pending, and before mint_grant_for_decision so the loser mints nothing.
+    #
+    # NOT sufficient alone: the runtime cancel and the runtime expiry sweep
+    # write approval state without passing through here at all, so they take the
+    # same claim. Guarding only this surface relocates the window.
+    if not store.claim_approval_transition(approval_id, target_state):
+        raise HTTPException(status.HTTP_409_CONFLICT, "approval is not pending")
+
     # This runs BEFORE resolve_approval, which is the whole of the fix for the
     # surfaces 5bd73792 did not reach. Only the grant outcome can say which
     # scope was applied, so nothing written before it can be honest about the
@@ -3391,7 +3418,7 @@ def _require_tui_start_clearance(
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     if risk_family in LOW_RISK_FAMILIES:
         return None, {"eligibility_result": "not_required"}
-    return _require_bound_clearance(
+    clearance, clearance_metadata = _require_bound_clearance(
         store=store,
         handoff_kind="tui_start",
         handoff_ref="new",
@@ -3405,6 +3432,34 @@ def _require_tui_start_clearance(
         actor_id=device.device_id,
         params_fingerprint=params_fingerprint,
     )
+    # Spend it HERE, not after the PTY is spawned. create_tui_session is an
+    # `async def` and `await tui_manager.create_runtime(...)` sits between the
+    # check above and the marker write that used to follow it, so the event loop
+    # hands a second request presenting the same clearance a window that is
+    # scheduled rather than merely possible. The real session_id is stamped over
+    # the `claim:` value once the runtime exists.
+    if clearance is not None and not store.consume_approval_once(
+        clearance["approval_id"],
+        {
+            "tui_consumed_by": f"claim:{request_id}",
+            "tui_consumed_at": utc_iso(),
+        },
+    ):
+        _reject_handoff(
+            store=store,
+            request_id=request_id,
+            actor_type="device",
+            actor_id=device.device_id,
+            node_id=node_id,
+            agent_id=agent_id,
+            work_ref=work_ref,
+            handoff_kind="tui_start",
+            handoff_ref="new",
+            risk_family=risk_family,
+            clearance_ref=clearance_ref,
+            reason="not_consumed",
+        )
+    return clearance, clearance_metadata
 
 
 # Relay (agent terminal mirror) sessions are node-owned and read-only; any paired

@@ -791,7 +791,15 @@ class HermesRuntimeAdapter:
             approval = self.store.get_approval(approval_id)
         except KeyError as exc:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "approval not found") from exc
-        if approval["state"] == "pending":
+        # The state read above is on its own connection; the claim is what
+        # makes the transition exclusive. The `== "pending"` half stays as a
+        # cheap pre-check so the ordinary no-op path does not take the write
+        # lock. Without this, a device approve that claimed pending->approved
+        # and minted a standing grant can still be overwritten to `cancelled`
+        # here -- leaving standing authority behind a cancelled decision.
+        if approval["state"] == "pending" and self.store.claim_approval_transition(
+            approval_id, "cancelled"
+        ):
             self.store.resolve_approval(
                 approval_id,
                 "cancelled",
@@ -832,6 +840,13 @@ class HermesRuntimeAdapter:
     def expire_pending_approvals(self) -> None:
         for approval in self.store.list_approvals(state="pending"):
             if parse_utc(approval["expires_at"]) > now_utc():
+                continue
+            # Same claim as app._expire_pending_approvals. This sweep runs on
+            # every runtime result poll; fixing only the app.py copy would leave
+            # a byte-identical defect live on this path.
+            if not self.store.claim_approval_transition(
+                approval["approval_id"], "expired"
+            ):
                 continue
             self.store.resolve_approval(
                 approval["approval_id"],
