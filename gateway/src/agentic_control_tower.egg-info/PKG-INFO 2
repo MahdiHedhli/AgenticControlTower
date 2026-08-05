@@ -1,0 +1,74 @@
+Metadata-Version: 2.4
+Name: agentic-control-tower
+Version: 0.1.0
+Summary: Agentic Control Tower gateway
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: cryptography>=46.0.0
+Requires-Dist: fastapi>=0.136.0
+Requires-Dist: httpx[http2]>=0.28.0
+Requires-Dist: pydantic>=2.13.0
+Requires-Dist: uvicorn[standard]>=0.38.0
+Requires-Dist: websockets>=15.0
+
+# Agentic Control Tower Gateway
+
+Self-hosted gateway for Agentic Control Tower.
+
+This service is intentionally self-hosted and local-first:
+
+- FastAPI gateway skeleton
+- SQLite local persistence
+- Device pairing with expiring pairing tokens
+- Device public-key registration model
+- WebSocket event stream with persisted cursor backfill
+- `mobile_notify` endpoint with durable notification and audit records
+- Fail-closed clearance decision skeleton
+- RuntimeAdapter seam with Hermes as adapter #1
+- Development-only TUI PTY prototype, disabled by default
+
+Run locally:
+
+```bash
+uv run --project gateway uvicorn hermes_gateway.app:create_app --factory --reload
+```
+
+Run tests:
+
+```bash
+uv run --project gateway pytest
+uv run --project gateway ruff check
+```
+
+The default bind should remain local or private-network only. Do not expose this
+gateway on the public internet.
+
+Hermes-local adapter calls should use loopback by default:
+
+```python
+from hermes_gateway.hermes_adapter import HermesToolAdapter
+
+adapter = HermesToolAdapter(gateway_base_url="http://127.0.0.1:8787/v1")
+```
+
+If Hermes and the tower gateway are intentionally split across private infrastructure,
+set `HERMES_ALLOWED_HERMES_CALLERS` or `HERMES_GATEWAY_ALLOWED_HERMES_CALLERS`
+to exact allowed caller addresses.
+
+Run the E2E smoke path:
+
+```bash
+uv run --project gateway python gateway/scripts/e2e_smoke.py
+```
+
+Enable the local TUI PTY prototype only in a disposable development context:
+
+```bash
+HERMES_TUI_ENABLE_LOCAL_PTY=1 \
+HERMES_TUI_ALLOWED_COMMANDS=/bin/cat,/bin/sh \
+HERMES_TUI_DEFAULT_COMMAND=/bin/cat \
+uv run --project gateway uvicorn hermes_gateway.app:create_app --factory
+```
+
+The PTY runner requires signed paired-device REST controls and rejects
+non-allowlisted commands or working directories outside the configured root.

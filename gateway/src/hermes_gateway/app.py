@@ -3797,11 +3797,29 @@ def _request_id(request: Request) -> str:
     return request.headers.get("X-Request-Id") or new_id("req")
 
 
-def _websocket_token(websocket: WebSocket) -> str | None:
+def _websocket_token(websocket: WebSocket) -> tuple[str | None, str]:
+    """Resolve the caller's access token for a WebSocket upgrade.
+
+    Returns ``(token, source)`` with source in {"header", "query", "none"}.
+
+    The header WINS. It used to lose: a query-borne token is part of the HTTP
+    request target, which uvicorn logs in full on every upgrade -- on the
+    ``uvicorn.error`` logger, which the LaunchAgent points at gateway.err.log --
+    so 15 minute paired-device tokens accumulated there in plaintext, outliving
+    their own TTL by however long the log is kept. Measured on the live host: 42
+    of 147 upgrade lines carried one.
+
+    The caller needs the source, not just the token, both to gate the deprecated
+    form and to say so out loud when it is used.
+    """
+    header = websocket.headers.get("Authorization") or websocket.headers.get(
+        "authorization"
+    )
+    if header and header.lower().startswith("bearer "):
+        candidate = header.split(" ", 1)[1].strip()
+        if candidate:
+            return candidate, "header"
     query_token = websocket.query_params.get("access_token")
     if query_token:
-        return query_token
-    header = websocket.headers.get("Authorization") or websocket.headers.get("authorization")
-    if header and header.lower().startswith("bearer "):
-        return header.split(" ", 1)[1]
-    return None
+        return query_token, "query"
+    return None, "none"

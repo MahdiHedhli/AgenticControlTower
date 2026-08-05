@@ -2,13 +2,42 @@ from __future__ import annotations
 
 import dataclasses
 import fcntl
+import logging
 import os
+import re
 import sys
 from pathlib import Path
 
 import uvicorn
 
 from .config import Settings
+
+
+class _RedactUrlCredentials(logging.Filter):
+    """Strip credential-bearing query params out of uvicorn's request lines.
+
+    uvicorn logs the raw request target for every WebSocket upgrade -- accepted,
+    403 and other -- all on the ``uvicorn.error`` logger, which the LaunchAgent
+    points at gateway.err.log. Any client that still puts a token in the query
+    string writes it to disk in plaintext, where it long outlives its own TTL.
+
+    Redacting at the SINK is the only mitigation that covers clients we have not
+    shipped, and the only one that covers the TUI relay's ``attach_token`` at
+    all -- that one is latent today (0 occurrences) precisely because nothing
+    exercises it yet, which is not a guarantee.
+    """
+
+    _PATTERN = re.compile(r"((?:access_token|attach_token|token)=)[^\s\"&]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                self._PATTERN.sub(r"\1<redacted>", arg) if isinstance(arg, str) else arg
+                for arg in record.args
+            )
+        if isinstance(record.msg, str):
+            record.msg = self._PATTERN.sub(r"\1<redacted>", record.msg)
+        return True
 
 # Loopback-only prod/bridge contract. Overridable via env, but never 0.0.0.0
 # by default and never auto-falling-back to another port.
@@ -113,6 +142,14 @@ def main() -> None:
     # deployment); else the loopback default. Every endpoint is device-auth gated.
     host = os.getenv("HERMES_GATEWAY_HOST") or settings.bind_host or DEFAULT_HOST
     port = int(os.getenv("HERMES_GATEWAY_PORT", str(DEFAULT_PORT)))
+
+    # Installed BEFORE uvicorn.run so no request line can be emitted
+    # unfiltered. uvicorn.run -> Config.__init__ -> configure_logging() runs
+    # dictConfig, which removes handlers from the named loggers but leaves
+    # filters in place.
+    redactor = _RedactUrlCredentials()
+    for logger_name in ("uvicorn.error", "uvicorn.access"):
+        logging.getLogger(logger_name).addFilter(redactor)
 
     uvicorn.run(
         create_app(settings),

@@ -8,7 +8,9 @@ import 'gateway_stream_errors.dart';
 
 export 'gateway_stream_errors.dart';
 
-typedef GatewayEventSocketConnector = Stream<dynamic> Function(Uri uri);
+typedef GatewayEventSocketConnector = Stream<dynamic> Function(
+  GatewayStreamRequest request,
+);
 
 /// Supplies the access token for the next connection attempt.
 ///
@@ -51,9 +53,11 @@ class GatewayEventStreamClient {
   /// [accessToken] now yields.
   final GatewayStreamReauthenticator? onAuthFailure;
 
-  Uri streamUri({required String accessToken, String? after}) {
+  /// The stream URL. Deliberately carries NO credential: the token travels in
+  /// the Authorization header (see [GatewayStreamRequest]) because uvicorn logs
+  /// the full request target for every upgrade.
+  Uri streamUri({String? after}) {
     final httpUri = config.resolve('/events/stream', {
-      'access_token': accessToken,
       'after': after,
     });
     final scheme = switch (httpUri.scheme) {
@@ -100,7 +104,10 @@ class GatewayEventStreamClient {
             );
           }
           await for (final raw
-              in _connectRaw(streamUri(accessToken: token, after: cursor))) {
+              in _connectRaw(GatewayStreamRequest(
+            uri: streamUri(after: cursor),
+            accessToken: token,
+          ))) {
             if (cancelled) {
               break;
             }
@@ -175,17 +182,17 @@ class GatewayEventStreamClient {
     return controller.stream;
   }
 
-  Stream<dynamic> _connectRaw(Uri uri) {
+  Stream<dynamic> _connectRaw(GatewayStreamRequest request) {
     final connector = _socketConnector;
     if (connector != null) {
-      return connector(uri);
+      return connector(request);
     }
     // The `WebSocketChannel.ready` unhandled-rejection guard that used to live
     // here moved into the connectors: the io connector no longer uses
     // `WebSocketChannel` at all (it opens `dart:io`'s socket so a refused
     // upgrade keeps its HTTP status), and the web connector claims `ready`
     // itself. See `gateway_socket_connector_web.dart`.
-    return connectGatewayWebSocket(uri);
+    return connectGatewayWebSocket(request);
   }
 
   Duration _backoffFor(int attempt) {

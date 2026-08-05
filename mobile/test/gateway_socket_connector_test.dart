@@ -22,8 +22,10 @@ void main() {
     }));
 
     final error = await connectGatewayWebSocket(
-      Uri.parse('ws://127.0.0.1:${server.port}/v1/events/stream'
-          '?access_token=expired'),
+      GatewayStreamRequest(
+        uri: Uri.parse('ws://127.0.0.1:${server.port}/v1/events/stream'),
+        accessToken: 'expired',
+      ),
     ).first.then<Object?>((_) => null, onError: (Object e) => e);
 
     expect(error, isA<GatewayStreamUpgradeException>());
@@ -42,8 +44,10 @@ void main() {
     }));
 
     final error = await connectGatewayWebSocket(
-      Uri.parse('ws://127.0.0.1:${server.port}/v1/events/stream'
-          '?access_token=super-secret-token'),
+      GatewayStreamRequest(
+        uri: Uri.parse('ws://127.0.0.1:${server.port}/v1/events/stream'),
+        accessToken: 'super-secret-token',
+      ),
     ).first.then<Object?>((_) => null, onError: (Object e) => e);
 
     expect(error.toString(), isNot(contains('super-secret-token')));
@@ -58,8 +62,10 @@ void main() {
     }));
 
     final raw = await connectGatewayWebSocket(
-      Uri.parse('ws://127.0.0.1:${server.port}/v1/events/stream'
-          '?access_token=valid'),
+      GatewayStreamRequest(
+        uri: Uri.parse('ws://127.0.0.1:${server.port}/v1/events/stream'),
+        accessToken: 'valid',
+      ),
     ).first;
 
     expect(jsonDecode(raw as String), containsPair('cursor', 'evt_1'));
@@ -74,8 +80,10 @@ void main() {
     unawaited(server.forEach((request) {}));
 
     final subscription = connectGatewayWebSocket(
-      Uri.parse('ws://127.0.0.1:${server.port}/v1/events/stream'
-          '?access_token=valid'),
+      GatewayStreamRequest(
+        uri: Uri.parse('ws://127.0.0.1:${server.port}/v1/events/stream'),
+        accessToken: 'valid',
+      ),
     ).listen((_) {});
 
     await subscription.cancel().timeout(

@@ -1,0 +1,4 @@
+[console_scripts]
+act = hermes_gateway.act_cli:main
+hermes-mobile-gateway = hermes_gateway.main:main
+tower = hermes_gateway.main:main

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Callable
 from typing import Any
@@ -15,6 +16,8 @@ from ..store import SQLiteStore
 
 # How often a connected stream re-reads the event table for anything written
 # since the last frame it sent. This is the "live" in Live.
+_logger = logging.getLogger(__name__)
+
 EVENT_STREAM_POLL_SECONDS = 1.0
 # Quiet-period heartbeat, so a client can tell "nothing is happening" from "the
 # socket is dead". Reset by any real event.
@@ -32,7 +35,7 @@ def register_observability_routes(
     hermes_local_dependency: Any,
     create_mobile_notification: Callable[..., Notification],
     request_id: Callable[[Request], str],
-    websocket_token: Callable[[WebSocket], str | None],
+    websocket_token: Callable[[WebSocket], tuple[str | None, str]],
 ) -> None:
     @app.post(
         "/v1/notifications/mobile_notify",
@@ -122,10 +125,27 @@ def register_observability_routes(
 
     @app.websocket("/v1/events/stream")
     async def event_stream(websocket: WebSocket) -> None:
-        token = websocket_token(websocket)
-        if not token or store.verify_access_token(token) is None:
+        token, source = websocket_token(websocket)
+        if source == "query" and not settings.ws_allow_query_token:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
+        if not token or store.verify_access_token(token) is None:
+            # Refuse the *upgrade* -- never accept() first. Starlette forbids
+            # receive() before accept(), so an in-band rejection could only be a
+            # close frame, which the client cannot tell from an ordinary
+            # disconnect: it would never set isAuthFailure, never call
+            # onAuthFailure, and would park the phone on "Live stream
+            # connecting" forever. Keep the 403.
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        if source == "query":
+            _logger.warning(
+                "deprecated: access token supplied in the /v1/events/stream query "
+                "string by %s; it is written to the access log in plaintext. "
+                "Update the client to send `Authorization: Bearer`. Set "
+                "ACT_WS_ALLOW_QUERY_TOKEN=0 to refuse this form.",
+                websocket.client.host if websocket.client else "unknown",
+            )
         after = websocket.query_params.get("after")
         connected = store.create_event(
             node_id=settings.node_id,

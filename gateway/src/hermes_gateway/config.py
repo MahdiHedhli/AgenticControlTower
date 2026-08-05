@@ -78,6 +78,19 @@ class Settings:
     # deployments so the fleet shows only real (bridge-fed) agents.
     seed_mock_data: bool = True
 
+    # WebSocket auth transport for /v1/events/stream.
+    #
+    # The token travels in `Authorization: Bearer`. `?access_token=` is the
+    # legacy form: uvicorn logs the full request target for every upgrade, so a
+    # query-borne token is written verbatim to ~/.hermes/act/logs/gateway.err.log
+    # in plaintext, where it outlives its own 15 minute TTL by however long the
+    # log is kept.
+    #
+    # Left enabled so a phone build older than the header-sending one keeps
+    # streaming; every use is logged as deprecated. Flip to false once the logs
+    # show no deprecation warnings.
+    ws_allow_query_token: bool = True
+
     @property
     def push_configured(self) -> bool:
         return bool(self.apns_key_path and self.apns_key_id and self.apns_team_id)
@@ -160,6 +173,9 @@ class Settings:
             apns_topic=os.getenv("APNS_TOPIC", cls.apns_topic),
             apns_environment=os.getenv("APNS_ENVIRONMENT", cls.apns_environment),
             seed_mock_data=_bool_env("ACT_SEED_MOCK_DATA", cls.seed_mock_data),
+            ws_allow_query_token=_bool_env(
+                "ACT_WS_ALLOW_QUERY_TOKEN", cls.ws_allow_query_token
+            ),
             standing_grants_enabled=_bool_env(
                 "ACT_STANDING_GRANTS_ENABLED", cls.standing_grants_enabled
             ),

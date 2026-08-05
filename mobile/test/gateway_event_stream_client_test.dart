@@ -11,11 +11,15 @@ void main() {
       accessToken: () => 'access-test',
     );
 
-    final uri = client.streamUri(accessToken: 'access-test', after: 'cursor-1');
+    final uri = client.streamUri(after: 'cursor-1');
 
     expect(uri.scheme, 'ws');
     expect(uri.path, '/v1/events/stream');
-    expect(uri.queryParameters['access_token'], 'access-test');
+    // The credential must NOT be in the URL: uvicorn logs the full request
+    // target for every upgrade, so a query-borne token lands in
+    // gateway.err.log in plaintext and outlives its own 15 minute TTL.
+    expect(uri.queryParameters.containsKey('access_token'), isFalse);
+    expect(uri.toString(), isNot(contains('access-test')));
     expect(uri.queryParameters['after'], 'cursor-1');
   });
 
@@ -37,8 +41,8 @@ void main() {
       accessToken: () => 'access-test',
       initialBackoff: Duration.zero,
       maxReconnects: 1,
-      socketConnector: (uri) {
-        seenUris.add(uri);
+      socketConnector: (request) {
+        seenUris.add(request.uri);
         connectCount += 1;
         if (connectCount == 1) {
           return Stream<dynamic>.value(
@@ -113,8 +117,8 @@ void main() {
         token = 'fresh-token';
         return true;
       },
-      socketConnector: (uri) {
-        final tried = uri.queryParameters['access_token'];
+      socketConnector: (request) {
+        final tried = request.accessToken;
         tokensTried.add(tried);
         if (tried != 'fresh-token') {
           return Stream<dynamic>.error(
