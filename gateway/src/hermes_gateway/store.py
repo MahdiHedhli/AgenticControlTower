@@ -2537,12 +2537,38 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
             )
         return self.get_approval_grant(grant_id)
 
+    #: The grants an emergency intervention on ``session_id`` must withdraw.
+    #:
+    #: Derived from :meth:`find_matching_grant` by asking the only question that
+    #: matters -- "could this row clear a *subsequent* request in the panicked
+    #: session?" -- under the assumption that everything the matcher keys on
+    #: EXCEPT ``session_id`` is chosen by the caller that creates the request:
+    #:
+    #: * ``node_id``  -- ``app._create_approval_request`` takes it from
+    #:   ``payload.node_id or settings.node_id``, so the REQUESTER picks it, and
+    #:   ``mint_grant_for_decision`` stamps the grant with the approval's value.
+    #:   Filtering the sweep on the gateway's own node lets a request declaring
+    #:   any other node keep matching a grant the panic skipped.
+    #: * ``agent_id`` -- likewise ``payload.agent_id``, and an ``agent``-scope
+    #:   grant ignores ``session_id`` entirely. Narrowing the sweep to the agent
+    #:   the intervention resolved lets a request labelled with any other agent
+    #:   keep matching.
+    #:
+    #: Both are why this predicate keys on NOTHING but scope and session: those
+    #: are the only inputs the panic itself controls. An earlier version of this
+    #: sweep filtered on node_id and agent_id and had two proven bypasses --
+    #: strictly narrower than the node-agnostic ``bulk_invalidate_approvals`` it
+    #: sits beside, i.e. fail-open in the one place that must fail closed.
+    #:
+    #: Rows with a scope this code does not know are swept as well: a matcher
+    #: extended with a new scope must not silently fall out of the panic's
+    #: reach, and the cost of sweeping an unmatched row is a row already dead.
+    _PANIC_GRANT_PREDICATE = "state = 'active' AND (scope != 'session' OR session_id = ?)"
+
     def revoke_grants_for_panic(
         self,
         *,
-        node_id: str,
         session_id: str,
-        agent_ids: Iterable[str | None],
         revoked_by: str,
     ) -> list[dict[str, Any]]:
         """Panic dominance for STANDING authority -- the half
@@ -2550,57 +2576,42 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
 
         Cancelling a session's live clearances is not an emergency stop while a
         standing grant survives. Grants are consumed at approval *creation*
-        time, not at decision time, so the agent's very next request is
-        auto-satisfied by ``grants.standing_grant_for_request`` and comes back
-        ``approved`` / ``approved_by='standing_grant'`` with no human in the
-        loop. Panic must therefore withdraw every grant that could clear a
-        subsequent request in the panicked session:
+        time, so the agent's very next request is auto-satisfied by
+        ``grants.standing_grant_for_request`` and comes back ``approved`` /
+        ``approved_by='standing_grant'`` with no human in the loop.
 
-        * ``session``   -- this session's own grants;
-        * ``agent``     -- keyed on the agent, ignores ``session_id``;
-        * ``permanent`` -- node+tool wide, ignores agent AND session.
+        So this withdraws every active grant EXCEPT a ``session``-scope grant
+        belonging to a *different* session -- the one kind
+        :meth:`find_matching_grant` provably cannot return for a request in this
+        session. See :attr:`_PANIC_GRANT_PREDICATE` for why ``node_id`` and
+        ``agent_id`` are deliberately absent.
 
-        The last two reach beyond the panicked session by construction, and that
-        is deliberate: a grant that can clear a request in the panicked session
-        must not survive the panic. Over-revocation costs a re-prompt;
-        under-revocation defeats the emergency stop.
+        That reaches beyond the panicked session, deliberately: a grant that can
+        clear a request in the panicked session must not survive the panic.
+        Over-revocation costs a re-prompt; under-revocation defeats the stop.
 
-        BEGIN IMMEDIATE is load-bearing exactly as in ``append_audit_event``:
-        without it the SELECT runs in autocommit and only the UPDATE opens a
-        transaction, leaving a window in which a request racing the panic can
-        match a row this call is about to revoke -- and *that* request would be
-        cleared by authority the operator has already withdrawn.
+        ``BEGIN IMMEDIATE`` takes the write lock before the SELECT, so the rows
+        returned are exactly the rows the UPDATE revokes even with a second
+        gateway process on the same file -- the same discipline
+        :meth:`append_audit_event` uses, and for the same reason: a read that
+        informs a write must not run in autocommit.
 
-        Expired-but-still-``active`` rows are swept too. They are already dead
-        to :meth:`find_matching_grant`, but leaving them ``active`` would make
+        Expired-but-still-``active`` rows are swept too. They are already dead to
+        :meth:`find_matching_grant`, but leaving them ``active`` would make
         ``GET /v1/approval-grants`` misreport what the panic withdrew.
 
         Returns the revoked rows so the caller can audit one
         ``capability_grant_revoked`` per grant, matching the device-deletion
         cascade in ``routers/identity.py``.
         """
-        agents = [agent for agent in dict.fromkeys(agent_ids) if agent]
         revoked_at = utc_iso()
-        # A scope this code does not know is deliberately NOT swept:
-        # find_matching_grant refuses to match it either, so it cannot clear a
-        # request. Widening this blindly would revoke authority nothing honours.
-        where = (
-            "state = 'active' AND node_id = ? AND ("
-            "scope = 'permanent'"
-            " OR (scope = 'session' AND session_id = ?)"
-        )
-        args: list[Any] = [node_id, session_id]
-        if agents:
-            placeholders = ", ".join("?" for _ in agents)
-            where += f" OR (scope = 'agent' AND agent_id IN ({placeholders}))"
-            args.extend(agents)
-        where += ")"
+        where = self._PANIC_GRANT_PREDICATE
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             rows = [
                 dict(row)
                 for row in db.execute(
-                    f"SELECT * FROM approval_grants WHERE {where}", tuple(args)
+                    f"SELECT * FROM approval_grants WHERE {where}", (session_id,)
                 ).fetchall()
             ]
             if rows:
@@ -2610,7 +2621,7 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
                     SET state = 'revoked', revoked_at = ?, revoked_by = ?
                     WHERE {where}
                     """,
-                    (revoked_at, revoked_by, *args),
+                    (revoked_at, revoked_by, session_id),
                 )
         for row in rows:
             row["state"] = "revoked"

@@ -1715,3 +1715,64 @@ def test_non_emergency_intervention_leaves_grants_alone(client: TestClient) -> N
 
     after = create_approval(client, action_id="act_pause_2", requested_tool="git_status")
     assert after["state"] == "approved", "a pause must not withdraw standing authority"
+
+
+def test_panic_sweeps_grants_minted_under_another_node(client: TestClient) -> None:
+    """node_id is chosen by whoever creates the approval, not by the panic.
+
+    An earlier sweep filtered on the gateway's own node_id. Because
+    `_create_approval_request` takes `payload.node_id or settings.node_id` and
+    `mint_grant_for_decision` stamps the grant with the approval's value, a
+    grant minted under any other declared node was skipped -- and the next
+    request declaring that same node matched it again.
+    """
+    paired = pair_device(client)
+    body = {
+        "action_id": "act_node_1",
+        "agent_id": "agent_mock",
+        "session_id": "sess_mock",
+        "node_id": "node_other",
+        "requested_tool": "git_status",
+        "risk_level": "medium",
+        "risk_family": GRANTABLE_RISK_FAMILY,
+        "summary": "Run a command",
+        "full_payload_redacted": {"command": "redacted"},
+        "resource_scope": "repo",
+        "expires_at": "2099-01-01T00:00:00Z",
+    }
+    created = client.post("/v1/approvals", json=body)
+    if created.status_code != 201:
+        import pytest
+
+        pytest.skip(f"gateway rejects caller-declared node_id: {created.status_code}")
+    decide(client, paired, created.json(), scope="session")
+
+    panic(client, paired, tag="node")
+
+    after = client.post("/v1/approvals", json={**body, "action_id": "act_node_2"})
+    assert after.status_code == 201, after.text
+    assert after.json()["state"] != "approved", (
+        "NODE-ID BYPASS: a grant minted under another declared node survived "
+        "the panic and cleared the next request"
+    )
+
+
+def test_panic_sweeps_agent_scope_grants_for_other_agents(client: TestClient) -> None:
+    """agent_id is caller-supplied too, and an agent-scope grant ignores
+    session_id -- so narrowing the sweep to the agent the intervention resolved
+    left a grant minted for any third agent alive and matching."""
+    paired = pair_device(client)
+    first = create_approval(
+        client, action_id="act_oa_1", agent_id="agent_other", requested_tool="git_status"
+    )
+    decide(client, paired, first, scope="agent")
+
+    panic(client, paired, tag="otheragent")
+
+    after = create_approval(
+        client, action_id="act_oa_2", agent_id="agent_other", requested_tool="git_status"
+    )
+    assert after["state"] != "approved", (
+        "AGENT-ID BYPASS: an agent-scope grant minted for a different agent "
+        "survived the panic"
+    )

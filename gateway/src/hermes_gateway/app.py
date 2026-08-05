@@ -1495,10 +1495,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # approved_by='standing_grant' and human_approved=False -- the
             # emergency stop would cancel everything in flight and then wave
             # through everything after it. Withdraw that authority too.
+            # Keyed on session_id ALONE. node_id and agent_id are both chosen by
+            # whoever creates the approval, so filtering the sweep on either one
+            # lets a request restate it and keep matching a grant the panic
+            # skipped -- both were proven reachable. session is the only match
+            # key the requester cannot restate.
             revoked_grants = store.revoke_grants_for_panic(
-                node_id=node_id,
                 session_id=session_id,
-                agent_ids=[agent_id],
                 revoked_by=f"intervention:{payload.type}",
             )
             for grant in revoked_grants:
