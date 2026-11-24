@@ -1757,11 +1757,29 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
         return {"attach_token": token, "expires_at": expires_at}
 
     def verify_tui_attach_token(self, token: str) -> dict[str, Any] | None:
+        """Spend a TUI attach token: the first verify wins, every later one fails.
+
+        ``used_at`` used to be stamped here but never read, so a token stayed
+        valid for its whole TTL and could re-open the terminal stream any number
+        of times. A spent token now fails exactly as an unknown, revoked or
+        expired one does -- ``None`` -- so a replayer learns nothing a guesser
+        would not.
+
+        The check and the stamp are one write transaction on one connection:
+        ``BEGIN IMMEDIATE`` takes the write lock before the read (a file lock,
+        so it holds across processes), and the stamp is itself guarded on
+        ``used_at IS NULL`` with a rowcount check. Two attaches racing on one
+        token therefore admit exactly one. Expiry stays a parsed-datetime
+        comparison rather than SQL text comparison, because ``utc_iso`` drops
+        the microseconds field when it is zero and the strings are not
+        fixed-width.
+        """
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute(
                 """
                 SELECT * FROM tui_attach_tokens
-                WHERE token_hash = ? AND revoked_at IS NULL
+                WHERE token_hash = ? AND revoked_at IS NULL AND used_at IS NULL
                 """,
                 (hash_token(token),),
             ).fetchone()
@@ -1770,10 +1788,17 @@ class SQLiteStore(IdentityStoreMixin, ObservabilityStoreMixin):
             token_row = dict(row)
             if parse_utc(token_row["expires_at"]) <= now_utc():
                 return None
-            db.execute(
-                "UPDATE tui_attach_tokens SET used_at = ? WHERE token_hash = ?",
-                (utc_iso(), token_row["token_hash"]),
+            used_at = utc_iso()
+            cursor = db.execute(
+                """
+                UPDATE tui_attach_tokens SET used_at = ?
+                WHERE token_hash = ? AND revoked_at IS NULL AND used_at IS NULL
+                """,
+                (used_at, token_row["token_hash"]),
             )
+            if cursor.rowcount != 1:
+                return None
+            token_row["used_at"] = used_at
         return token_row
 
     def create_assistance_request(self, request: dict[str, Any]) -> dict[str, Any]:

@@ -461,6 +461,38 @@ def test_tui_wrong_device_attach_token_rejected(tui_client: TestClient) -> None:
     _signed_close_tui(tui_client, second, second_session["session_id"])
 
 
+def test_tui_attach_token_cannot_be_replayed(tui_client: TestClient) -> None:
+    _grant_tui_capability(tui_client)
+    paired = _pair_tui_device(tui_client)
+    session = _signed_create_tui(tui_client, paired).json()
+    stream = f"/v1/tui/sessions/{session['session_id']}/stream"
+    attach_token = _signed_create_attach_token(
+        tui_client,
+        paired,
+        session["session_id"],
+    )["attach_token"]
+
+    # First attach is admitted; leaving the block detaches without closing.
+    with tui_client.websocket_connect(f"{stream}?attach_token={attach_token}") as ws:
+        assert ws.receive_json()["type"] == "state"
+
+    # The same token again is refused.
+    with pytest.raises(WebSocketDisconnect):
+        with tui_client.websocket_connect(f"{stream}?attach_token={attach_token}"):
+            pass
+
+    # ...and it is the token that was refused, not the session: a fresh token
+    # for the same still-running session attaches.
+    fresh_token = _signed_create_attach_token(
+        tui_client,
+        paired,
+        session["session_id"],
+    )["attach_token"]
+    with tui_client.websocket_connect(f"{stream}?attach_token={fresh_token}") as ws:
+        assert ws.receive_json()["type"] == "state"
+        ws.send_json({"type": "close"})
+
+
 def test_tui_paste_metadata_audited(tui_client: TestClient) -> None:
     _grant_tui_capability(tui_client)
     paired = _pair_tui_device(tui_client)
