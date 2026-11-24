@@ -1776,3 +1776,77 @@ def test_panic_sweeps_agent_scope_grants_for_other_agents(client: TestClient) ->
         "AGENT-ID BYPASS: an agent-scope grant minted for a different agent "
         "survived the panic"
     )
+
+
+def test_request_landing_mid_panic_is_not_approved_by_a_grant_the_panic_revokes(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """The panic's two sweeps are separate transactions, so a request can land
+    between them. It is only caught if the grants are revoked FIRST: the
+    request then misses the dead grant, is created 'pending', and the clearance
+    sweep that follows cancels it. In the opposite order the clearance sweep has
+    already run, the still-active grant auto-satisfies the request into
+    'approved', and nothing after that ever cancels it.
+
+    The probe lands a real request right after whichever sweep runs first, so it
+    asserts the outcome rather than which method is called when.
+    """
+    paired = pair_device(client)
+    store = client.app.state.store
+    first = create_approval(client, action_id="act_mid_1", requested_tool="git_status")
+    decide(client, paired, first, scope="session")
+
+    # Positive control: the grant is live before the panic, so a request in the
+    # window that comes out un-approved is the panic's doing, not a dead grant.
+    second = create_approval(client, action_id="act_mid_2", requested_tool="git_status")
+    assert second["state"] == "approved"
+    assert store.get_approval(second["approval_id"])["approved_by"] == "standing_grant"
+
+    timeline: list[str] = []
+    landed: list[dict] = []
+
+    def land_a_request_after(name: str, original: Any) -> Any:
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            result = original(*args, **kwargs)
+            timeline.append(name)
+            if not landed:
+                landed.append(
+                    create_approval(
+                        client, action_id="act_mid_racer", requested_tool="git_status"
+                    )
+                )
+            return result
+
+        return wrapper
+
+    for name in ("revoke_grants_for_panic", "bulk_invalidate_approvals"):
+        monkeypatch.setattr(store, name, land_a_request_after(name, getattr(store, name)))
+
+    original_audit = store.append_audit_event
+
+    def record_grant_revoked_audit(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("event_type") == "capability_grant_revoked":
+            timeline.append("capability_grant_revoked")
+        return original_audit(*args, **kwargs)
+
+    monkeypatch.setattr(store, "append_audit_event", record_grant_revoked_audit)
+
+    panic(client, paired, tag="midpanic")
+
+    assert sorted(set(timeline) - {"capability_grant_revoked"}) == [
+        "bulk_invalidate_approvals",
+        "revoke_grants_for_panic",
+    ], f"the panic no longer runs both sweeps, so this probe is blind: {timeline}"
+    racer = store.get_approval(landed[0]["approval_id"])
+    assert (racer["state"], racer["approved_by"]) != ("approved", "standing_grant"), (
+        "a request that landed between the panic's two sweeps was auto-approved "
+        "by the standing grant the panic was about to revoke, and the panic "
+        f"never cancelled it (sweep order: {timeline})"
+    )
+    assert racer["state"] == "cancelled", racer
+
+    # Each per-grant audit write is its own hash-chained transaction; they belong
+    # after both sweeps, not on the emergency stop's path between them.
+    assert timeline.index("capability_grant_revoked") > timeline.index(
+        "bulk_invalidate_approvals"
+    ), timeline

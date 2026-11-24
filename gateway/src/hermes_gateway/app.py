@@ -1494,9 +1494,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         invalidated: list[str] = []
         revoked_grants: list[dict[str, Any]] = []
         if payload.type in emergency_types:
-            invalidated = store.bulk_invalidate_approvals(
-                session_id=session_id, reason=f"intervention:{payload.type}"
-            )
             # Invalidating live clearances is only HALF of panic dominance.
             # Standing grants are consumed at approval CREATION time, so a
             # surviving grant re-clears the agent's very next tool call with
@@ -1508,9 +1505,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # lets a request restate it and keep matching a grant the panic
             # skipped -- both were proven reachable. session is the only match
             # key the requester cannot restate.
+            #
+            # The ORDER is load-bearing: revoke grants, THEN invalidate
+            # clearances, THEN audit. The two sweeps are separate transactions,
+            # so a request can land between them. With grants revoked first it
+            # misses them, is created 'pending', and the invalidate below
+            # cancels it. Swapped, the invalidate has already run, a still-live
+            # grant auto-satisfies the request into 'approved', and nothing
+            # afterwards ever cancels it. The per-grant audit writes go last so
+            # they never delay the cancel.
             revoked_grants = store.revoke_grants_for_panic(
                 session_id=session_id,
                 revoked_by=f"intervention:{payload.type}",
+            )
+            invalidated = store.bulk_invalidate_approvals(
+                session_id=session_id, reason=f"intervention:{payload.type}"
             )
             for grant in revoked_grants:
                 # One event per grant, mirroring the device-deletion cascade in
